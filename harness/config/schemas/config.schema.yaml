@@ -1,0 +1,13 @@
+type: object
+required:
+  - project
+  - storage
+properties:
+  project:
+    type: object
+  storage:
+    type: object
+  execution:
+    type: object
+  security:
+    type: object
