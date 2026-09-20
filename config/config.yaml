@@ -1,0 +1,24 @@
+project:
+  name: developer-harness
+  specification_dir: .
+  workspace_dir: .
+
+storage:
+  database: state/harness.sqlite
+
+secrets:
+  provider: keychain_then_environment
+  names:
+    codex_api_key: CODEX_API_KEY
+    qdrant_api_key: QDRANT_API_KEY
+    kanban_api_token: KANBAN_API_TOKEN
+
+execution:
+  dry_run: true
+  max_retries: 2
+
+security:
+  require_approval_for:
+    - shell_command
+    - file_delete
+    - network_access

@@ -1,0 +1,64 @@
+# Python cache and build output
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.local.yml
+*.local.json
+
+# SQLite runtime databases and temporary files
+state/*.sqlite
+state/*.sqlite3
+state/*.db
+state/*.sqlite-*
+*.sqlite-journal
+*.db-shm
+*.db-wal
+
+# Runtime output
+logs/*
+!logs/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+state/runs/*
+!state/runs/.gitkeep
+
+# Test and coverage output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Tool and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated reports and temporary files
+*.tmp
+*.temp
+*.bak
+*.log
