@@ -1,4 +1,4 @@
-# Developer Harness
+# MD Harness
 
 Ein Python-Harness, das Markdown-Dateien als Spezifikation und SQLite als zentrale Aufgaben- und Zustandsdatenbank verwendet.
 

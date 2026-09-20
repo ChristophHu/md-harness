@@ -1,7 +1,14 @@
 project:
-  name: developer-harness
+  name: md-harness
   specification_dir: .
   workspace_dir: .
+
+git:
+  repository_name: md-harness
+  repository_url: https://github.com/ChristophHu/md-harness
+  auto_commit: true
+  commit_message_prefix: "harness"
+  auto_push: false
 
 storage:
   database: state/harness.sqlite

@@ -1,1 +1,1 @@
-"""Persistence layer for the developer harness."""
+"""Persistence layer for MD Harness."""

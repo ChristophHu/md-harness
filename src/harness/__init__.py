@@ -1,3 +1,3 @@
-"""Markdown-driven developer harness."""
+"""Markdown-driven MD Harness."""
 
 __version__ = "0.1.0"
