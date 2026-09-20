@@ -2,6 +2,10 @@
 
 from pathlib import Path
 import sqlite3
+from contextlib import contextmanager
+from collections.abc import Iterator
+
+CURRENT_SCHEMA_VERSION = 1
 
 
 SCHEMA = """
@@ -70,6 +74,19 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     checksum TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
+AFTER UPDATE OF title, description, task_type, status, priority ON tasks
+FOR EACH ROW
+BEGIN
+    UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;
 """
 
 
@@ -79,6 +96,7 @@ def initialize_database(database_path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as connection:
         connection.executescript(SCHEMA)
+        connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
     return path
 
 
@@ -88,3 +106,47 @@ def connect(database_path: str | Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.row_factory = sqlite3.Row
     return connection
+
+
+@contextmanager
+def transaction(database_path: str | Path) -> Iterator[sqlite3.Connection]:
+    """Open a transaction and roll it back when an error occurs."""
+    connection = connect(database_path)
+    try:
+        yield connection
+        connection.commit()
+    except sqlite3.Error:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def healthcheck(database_path: str | Path) -> bool:
+    """Return whether the database is accessible and internally usable."""
+    try:
+        with connect(database_path) as connection:
+            return connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    except sqlite3.Error:
+        return False
+
+
+def schema_version(database_path: str | Path) -> int:
+    with connect(database_path) as connection:
+        return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def backup_database(database_path: str | Path, destination: str | Path) -> Path:
+    target = Path(destination).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with connect(database_path) as source, sqlite3.connect(target) as backup:
+        source.backup(backup)
+    return target
+
+
+def restore_database(backup_path: str | Path, database_path: str | Path) -> Path:
+    target = Path(database_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(backup_path) as source, sqlite3.connect(target) as restored:
+        source.backup(restored)
+    return target
