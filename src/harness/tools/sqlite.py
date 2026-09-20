@@ -9,7 +9,7 @@ from pathlib import Path
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
-from harness.storage.database import SCHEMA
+from harness.storage.database import SCHEMA_PATH
 from harness.tools.base import PermissionLevel, Tool, ToolDefinition, ToolParameter
 
 
@@ -67,11 +67,11 @@ class SQLiteTool(Tool):
         connection.row_factory = sqlite3.Row
         return connection
 
-    def initialize(self, schema: str = SCHEMA) -> None:
+    def initialize(self, schema: str | None = None) -> None:
         """Create the database and apply an idempotent schema script."""
         try:
             with self.connect() as connection:
-                connection.executescript(schema)
+                connection.executescript(schema or SCHEMA_PATH.read_text(encoding="utf-8"))
         except sqlite3.Error as error:
             raise SQLiteError("could not initialize database") from error
 
