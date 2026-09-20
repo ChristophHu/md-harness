@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
 ]
 
 [project.scripts]
@@ -25,3 +26,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = [
+    "--cov=src/harness",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]

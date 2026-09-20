@@ -13,6 +13,17 @@ git:
 storage:
   database: state/harness.sqlite
 
+knowledge:
+  sources:
+    - type: local_markdown
+      name: obsidian-vault
+      path: ~/md-harness-vault
+      enabled: true
+      read_only: true
+  indexing:
+    sqlite: true
+    qdrant: false
+
 secrets:
   provider: keychain_then_environment
   names:
