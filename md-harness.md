@@ -138,6 +138,21 @@ Aufgabenbeschreibungen können zusätzlich im Vault unter `tasks/` liegen. Der o
 
 Nicht in Qdrant gehören typischerweise Secrets, rohe Konfigurationswerte, Logs, kurzlebige Laufzeitdaten und binäre Artefakte.
 
+### Übersichtsdateien und Verlinkungen
+
+Jeder Ordner im Vault soll eine eigene Übersichtsdatei enthalten. Die Datei soll denselben Namen wie der Ordner tragen, beispielsweise `rules/rules.md` oder `decisions/decisions.md`. Sie beschreibt kurz die Bedeutung des Ordners und listet seine wesentlichen Dateien und Unterordner auf.
+
+Zusätzlich sollen die oben genannten fachlichen Verlinkungen in Obsidian genutzt werden. Beziehungen zwischen Regeln, Workflows, Entscheidungen, Aufgaben, Agenten und Architektur sollen mit Wiki-Links wie `[[rules-testing]]` oder `[[decision-001-task-engine]]` dargestellt werden.
+
+Die Verantwortlichkeiten bleiben getrennt:
+
+- Ordnerstruktur: technische Klassifikation
+- Frontmatter: maschinenlesbare Metadaten
+- Übersichtsdateien: Orientierung und Navigation
+- Obsidian-Links: fachliche Beziehungen zwischen Dokumenten
+
+Das Harness darf nicht von Obsidian-Links abhängig sein. Für die maschinelle Verarbeitung bleiben Dateipfade und Frontmatter maßgeblich.
+
 Der Vault-Pfad wird in der Harness-Konfiguration hinterlegt:
 
 ```yaml
@@ -149,6 +164,55 @@ knowledge:
       enabled: true
       read_only: true
 ```
+
+## Tests und Coverage
+
+Jede neue Implementierung und jede relevante Änderung an bestehendem Code ist durch passende automatisierte Tests zu begleiten. Eine Implementierung gilt erst dann als abgeschlossen, wenn die zugehörigen Tests erfolgreich ausgeführt wurden.
+
+Für das Projekt wird eine Testcoverage von mindestens 90 % angestrebt. Die Coverage wird bei jedem normalen Testlauf automatisch mit `pytest-cov` erzeugt.
+
+Der Standard-Testlauf lautet:
+
+```bash
+uv run pytest
+```
+
+Dabei werden:
+
+- alle Tests unter `tests/` ausgeführt
+- die Coverage für `src/harness` ermittelt
+- nicht getestete Zeilen im Terminal angezeigt
+- ein HTML-Bericht unter `htmlcov/index.html` erzeugt
+
+Ein gezielter Testlauf für einzelne Dateien ist ebenfalls möglich:
+
+```bash
+uv run pytest tests/unit/test_secrets.py tests/unit/test_rotation.py
+```
+
+Nicht sinnvoll messbare Bereiche, beispielsweise reine Paketinitialisierung oder Integrationscode für externe Dienste, dürfen begründet ausgeschlossen werden. Die Begründung muss dokumentiert werden.
+
+## Gitflow
+
+Für die Entwicklung ist Gitflow verbindlich zu verwenden. Die Branches und ihre Rollen sind:
+
+- `main` oder `master`: stabile, produktionsreife Versionen
+- `develop`: Integrationsbasis für die nächste Version
+- `feature/<name>`: einzelne Features, abgezweigt von `develop`
+- `release/<version>`: Stabilisierung und Vorbereitung eines Releases
+- `hotfix/<version>-<name>`: dringende Korrekturen ausgehend vom stabilen Branch
+
+Die vorgesehenen Zusammenführungen sind:
+
+```text
+feature/*  → develop
+release/*  → main/master
+release/*  → develop
+hotfix/*   → main/master
+hotfix/*   → develop
+```
+
+Release- und Hotfix-Branches müssen nach dem Merge in den stabilen Branch auch nach `develop` zurückgeführt werden. Releases erhalten einen Versions-Tag wie `v1.0.0`. Der konkrete stabile Branch (`main` oder `master`) muss in der Projektkonfiguration eindeutig festgelegt sein.
 
 ## Konfiguration
 
