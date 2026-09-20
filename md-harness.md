@@ -192,6 +192,32 @@ uv run pytest tests/unit/test_secrets.py tests/unit/test_rotation.py
 
 Nicht sinnvoll messbare Bereiche, beispielsweise reine Paketinitialisierung oder Integrationscode für externe Dienste, dürfen begründet ausgeschlossen werden. Die Begründung muss dokumentiert werden.
 
+## Storage und SQLite
+
+Die Storage-Schicht befindet sich unter `src/harness/storage/`. SQLite ist die operative Quelle für Projekte, Aufgaben, Status, Abhängigkeiten, Akzeptanzkriterien, Agentenversuche, Ereignisse und Artefakte. Die produktive Datenbank liegt unter:
+
+```text
+state/harness.sqlite
+```
+
+Die Struktur ist von der Python-Logik getrennt:
+
+- `schema.sql`: vollständiges Initialschema mit Tabellen, Indizes und Triggern
+- `migrations/`: versionierte SQL-Änderungen im Format `NNN_name.sql`
+- `database.py`: Verbindungen, Migrationen, Transaktionen, Schema-Version, Healthcheck, Backup und Wiederherstellung
+- `project_store.py`: Projektzugriff
+- `task_store.py`: Aufgaben- und Statuslogik
+- `event_store.py`: Ereignisprotokollierung
+- `artifact_store.py`: Artefaktverwaltung
+
+Die Store-Klassen kapseln SQL und stellen der Engine fachliche Funktionen bereit. Der Aufgabenstatus wird über zulässige Zustandsübergänge geprüft. Änderungen an `tasks` aktualisieren `updated_at` automatisch; häufige Abfragen werden durch SQLite-Indizes unterstützt.
+
+Neue Datenbanken werden aus `schema.sql` aufgebaut. Anschließend werden offene Migrationen ausgeführt und in `PRAGMA user_version` versioniert. Bestehende Migrationen werden nicht verändert; jede Schemaänderung erhält eine neue Migrationsdatei.
+
+Die Datenbank wird nicht als Wissensquelle verwendet. Der Obsidian-Vault enthält Regeln, Entscheidungen und Dokumentation; SQLite enthält den operativen Prozesszustand. Reproduzierbare SQLite-Testdaten liegen unter `tests/fixtures/sqlite_seed.sql`.
+
+Für die Storage-Schicht gilt ebenfalls die Testregel: Jede Änderung wird durch Tests begleitet. Der Standardlauf ist `uv run pytest`; die aktuelle Gesamt- und Storage-Coverage beträgt 100 %.
+
 ## Gitflow
 
 Für die Entwicklung ist Gitflow verbindlich zu verwenden. Die Branches und ihre Rollen sind:
