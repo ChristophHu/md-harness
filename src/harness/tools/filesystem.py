@@ -5,6 +5,9 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from harness.tools.base import PermissionLevel, Tool, ToolDefinition, ToolParameter
 
 
 class FilesystemError(RuntimeError):
@@ -12,15 +15,51 @@ class FilesystemError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class FilesystemTool:
+class FilesystemTool(Tool):
     """Perform filesystem operations below one explicitly allowed root."""
 
     root: Path
     allow_delete: bool = False
 
+    definition = ToolDefinition(
+        name="filesystem",
+        description="Controlled file and directory operations inside a workspace.",
+        permission=PermissionLevel.WRITE,
+        parameters=(
+            ToolParameter("operation", "string"),
+            ToolParameter("path", "path"),
+            ToolParameter("content", "string", required=False),
+            ToolParameter("destination", "path", required=False),
+            ToolParameter("recursive", "boolean", required=False),
+            ToolParameter("parents", "boolean", required=False),
+        ),
+    )
+
     def __post_init__(self) -> None:
+        Tool.__init__(self)
         object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def execute(self, **arguments: Any) -> Any:
+        operation = arguments.pop("operation")
+        path = arguments.pop("path", ".")
+        if operation == "read":
+            return self.read_text(path, **arguments)
+        if operation == "write":
+            return self.write_text(path, arguments.pop("content"), **arguments)
+        if operation == "mkdir":
+            return self.mkdir(path, parents=arguments.get("parents", True))
+        if operation == "list":
+            return self.list(path, recursive=arguments.get("recursive", False))
+        if operation == "copy":
+            return self.copy(path, arguments.pop("destination"))
+        if operation == "move":
+            return self.move(path, arguments.pop("destination"))
+        if operation == "delete":
+            return self.delete(path, recursive=arguments.get("recursive", False))
+        if operation == "exists":
+            return self.exists(path)
+        raise FilesystemError(f"unsupported operation: {operation}")
 
     def resolve(self, path: str | Path = ".") -> Path:
         """Resolve a path and reject paths outside the configured root."""
@@ -124,4 +163,3 @@ class FilesystemTool:
                 target.unlink()
         except OSError as error:
             raise FilesystemError(f"could not delete: {path}") from error
-

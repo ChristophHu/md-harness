@@ -6,6 +6,9 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
+from typing import Any
+
+from harness.tools.base import PermissionLevel, Tool, ToolDefinition, ToolParameter
 
 
 class GitError(RuntimeError):
@@ -13,11 +16,38 @@ class GitError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class GitRepository:
+class GitRepository(Tool):
     """Repository adapter used by the harness."""
 
     path: Path
     name: str
+
+    definition = ToolDefinition(
+        name="git",
+        description="Controlled Git repository operations.",
+        permission=PermissionLevel.NETWORK,
+        parameters=(
+            ToolParameter("operation", "string"),
+            ToolParameter("message", "string", required=False),
+            ToolParameter("paths", "list[path]", required=False),
+            ToolParameter("remote", "string", required=False),
+            ToolParameter("branch", "string", required=False),
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        Tool.__init__(self)
+        object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
+
+    def execute(self, **arguments: Any) -> Any:
+        operation = arguments.pop("operation")
+        if operation == "status": return self.status()
+        if operation == "add": return self.add(arguments.get("paths"))
+        if operation == "commit": return self.commit(arguments.pop("message"))
+        if operation == "pull": return self.pull(arguments.get("remote", "origin"), arguments.get("branch"))
+        if operation == "push": return self.push(arguments.get("remote", "origin"), arguments.get("branch"))
+        if operation == "log": return self.log()
+        raise GitError(f"unsupported operation: {operation}")
 
     def _run(self, *args: str) -> str:
         result = subprocess.run(

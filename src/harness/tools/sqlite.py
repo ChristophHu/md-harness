@@ -7,8 +7,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterator, Mapping, Sequence
+from typing import Any
 
 from harness.storage.database import SCHEMA
+from harness.tools.base import PermissionLevel, Tool, ToolDefinition, ToolParameter
 
 
 class SQLiteError(RuntimeError):
@@ -16,16 +18,46 @@ class SQLiteError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class SQLiteTool:
+class SQLiteTool(Tool):
     """Provide parameterized SQLite operations for one database file."""
 
     path: Path
     timeout: float = 5.0
 
+    definition = ToolDefinition(
+        name="sqlite",
+        description="Controlled SQLite queries, statements and transactions.",
+        permission=PermissionLevel.WRITE,
+        parameters=(
+            ToolParameter("operation", "string"),
+            ToolParameter("sql", "string", required=False),
+            ToolParameter("parameters", "object", required=False),
+            ToolParameter("table", "string", required=False),
+        ),
+    )
+
     def __post_init__(self) -> None:
+        Tool.__init__(self)
         object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
         if self.timeout <= 0:
             raise ValueError("timeout must be positive")
+
+    def execute(self, operation: str, parameters: Sequence[object] | Mapping[str, object] = (), **arguments: Any) -> Any:
+        if operation not in {"initialize", "execute", "fetch_one", "fetch_all", "table_exists", "vacuum"} and not arguments:
+            return self.execute_sql(operation, parameters)
+        sql = arguments.pop("sql", None)
+        if operation == "initialize": return self.initialize()
+        if operation == "execute": return self.execute_sql(sql, arguments.pop("parameters", parameters))
+        if operation == "fetch_one": return self.fetch_one(sql, parameters)
+        if operation == "fetch_all": return self.fetch_all(sql, parameters)
+        if operation == "table_exists": return self.table_exists(arguments.pop("table"))
+        if operation == "vacuum": return self.vacuum()
+        raise SQLiteError(f"unsupported operation: {operation}")
+
+    def execute_sql(self, sql: str | None, parameters: Sequence[object] | Mapping[str, object] = ()) -> int:
+        if not sql:
+            raise SQLiteError("sql is required")
+        return self.execute_statement(sql, parameters)
 
     def connect(self) -> sqlite3.Connection:
         """Open a configured row-based connection."""
@@ -56,7 +88,7 @@ class SQLiteTool:
         finally:
             connection.close()
 
-    def execute(
+    def execute_statement(
         self,
         sql: str,
         parameters: Sequence[object] | Mapping[str, object] = (),
