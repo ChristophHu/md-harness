@@ -40,6 +40,22 @@ def test_database_transaction_health_version_and_backup(tmp_path):
     assert healthcheck(restored)
 
 
+def test_transaction_rolls_back_on_sqlite_error(tmp_path):
+    path = db(tmp_path)
+    with pytest.raises(sqlite3.Error):
+        with transaction(path) as connection:
+            connection.execute("INSERT INTO projects (name, path) VALUES ('temporary', '/tmp')")
+            connection.execute("INSERT INTO missing_table VALUES (1)")
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+
+
+def test_healthcheck_returns_false_for_invalid_database_path(tmp_path):
+    invalid_path = tmp_path / "database-directory"
+    invalid_path.mkdir()
+    assert healthcheck(invalid_path) is False
+
+
 def test_project_and_task_stores_cover_task_lifecycle(tmp_path):
     path = db(tmp_path)
     with sqlite3.connect(path) as connection:
@@ -84,6 +100,18 @@ def test_task_dependencies_criteria_and_attempts(tmp_path):
         assert store.record_attempt(second, "failed", "agent", "error") == 1
 
 
+def test_list_ready_returns_only_ready_tasks(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        store = TaskStore(connection)
+        ready = store.create("Ready", priority="high")
+        other = store.create("Other")
+        store.transition(ready, "ready")
+        assert [row["id"] for row in store.list_ready()] == [ready]
+        assert other not in [row["id"] for row in store.list_ready()]
+
+
 def test_event_and_artifact_stores(tmp_path):
     path = db(tmp_path)
     with sqlite3.connect(path) as connection:
@@ -93,4 +121,3 @@ def test_event_and_artifact_stores(tmp_path):
         assert EventStore(connection).list_for_task(task_id)[0]["id"] == event_id
         artifact_id = ArtifactStore(connection).register(task_id, "result.txt", "text", "abc")
         assert ArtifactStore(connection).list_for_task(task_id)[0]["id"] == artifact_id
-
