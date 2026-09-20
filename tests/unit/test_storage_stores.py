@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +12,7 @@ from harness.storage.database import (
     schema_version,
     transaction,
 )
+from harness.storage.database import CURRENT_SCHEMA_VERSION, SCHEMA_PATH, apply_migrations, schema_version
 from harness.storage.event_store import EventStore
 from harness.storage.project_store import ProjectStore
 from harness.storage.task_store import TaskStore
@@ -38,6 +40,24 @@ def test_database_transaction_health_version_and_backup(tmp_path):
     assert backup.exists()
     restored = restore_database(backup, tmp_path / "restored.sqlite")
     assert healthcheck(restored)
+
+
+def test_schema_file_and_migration_are_applied(tmp_path):
+    path = db(tmp_path)
+    assert SCHEMA_PATH.exists()
+    assert schema_version(path) == CURRENT_SCHEMA_VERSION
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT value FROM schema_metadata WHERE key = 'schema_name'").fetchone()[0] == "md-harness"
+        assert apply_migrations(connection) == CURRENT_SCHEMA_VERSION
+
+
+def test_sqlite_seed_contains_three_tasks(tmp_path):
+    path = db(tmp_path)
+    seed = Path(__file__).parents[1] / "fixtures" / "sqlite_seed.sql"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(seed.read_text(encoding="utf-8"))
+        tasks = connection.execute("SELECT external_key, status FROM tasks ORDER BY id").fetchall()
+    assert tasks == [("FIX-001", "completed"), ("FIX-002", "ready"), ("FIX-003", "created")]
 
 
 def test_transaction_rolls_back_on_sqlite_error(tmp_path):
