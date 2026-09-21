@@ -9,7 +9,11 @@ class Project:
     id: int | None
     name: str
     path: str
+    parent_id: int | None = None
+    description: str = ""
+    status: str = "active"
     created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -21,12 +25,14 @@ class Task:
     title: str
     description: str | None = None
     task_type: str = "task"
-    status: str = "created"
+    status: str = "idea"
     priority: str = "normal"
     created_at: datetime | None = None
     updated_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    approval_status: str = "pending"
+    assigned_agent: str | None = None
 
 
 @dataclass(slots=True)
@@ -41,6 +47,16 @@ class TaskAcceptanceCriterion:
     id: int | None
     task_id: int
     criterion: str
+    completed: bool = False
+
+
+@dataclass(slots=True)
+class TaskTestCriterion:
+    id: int | None
+    task_id: int
+    criterion: str
+    test_type: str = "automated"
+    command: str | None = None
     completed: bool = False
 
 

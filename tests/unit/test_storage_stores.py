@@ -85,6 +85,8 @@ def test_project_and_task_stores_cover_task_lifecycle(tmp_path):
         project_id = projects.create("Project", "/workspace")
         assert projects.get(project_id)["name"] == "Project"
         assert len(projects.list()) == 1
+        child_id = projects.create("Child", "/workspace/child", description="Child project", parent_id=project_id)
+        assert projects.children(project_id)[0]["id"] == child_id
         task_id = tasks.create("Task", project_id=project_id, priority="high")
         assert tasks.get(task_id)["title"] == "Task"
         with pytest.raises(ValueError):
@@ -130,6 +132,37 @@ def test_list_ready_returns_only_ready_tasks(tmp_path):
         store.transition(ready, "ready")
         assert [row["id"] for row in store.list_ready()] == [ready]
         assert other not in [row["id"] for row in store.list_ready()]
+
+
+def test_approval_test_criteria_and_executable_tasks(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        store = TaskStore(connection)
+        dependency = store.create("Dependency")
+        task = store.create("Executable", assigned_agent="developer")
+        store.transition(task, "ready")
+        store.add_dependency(task, dependency)
+        store.approve(task, "reviewer", "scope confirmed")
+        assert store.get_executable_tasks("developer") == []
+        store.transition(dependency, "ready")
+        store.transition(dependency, "planned")
+        store.transition(dependency, "in_progress")
+        store.transition(dependency, "review")
+        store.transition(dependency, "completed")
+        assert store.get_executable_tasks("developer")[0]["id"] == task
+        criterion = store.add_test_criterion(task, "Coverage is sufficient", command="pytest --cov")
+        assert store.test_criteria(task)[0]["id"] == criterion
+        store.revoke_approval(task, "reviewer", "needs changes")
+        assert store.get(task)["approval_status"] == "revoked"
+
+
+def test_approval_rejects_unknown_task(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        store = TaskStore(connection)
+        with pytest.raises(ValueError, match="not found"):
+            store.approve(999, "reviewer")
 
 
 def test_event_and_artifact_stores(tmp_path):

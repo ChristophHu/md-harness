@@ -2,9 +2,13 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY,
+    parent_id INTEGER REFERENCES projects(id),
     name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
     path TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'cancelled')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -15,8 +19,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT,
     task_type TEXT NOT NULL DEFAULT 'task',
-    status TEXT NOT NULL DEFAULT 'created',
+    status TEXT NOT NULL DEFAULT 'idea',
     priority TEXT NOT NULL DEFAULT 'normal',
+    approval_status TEXT NOT NULL DEFAULT 'pending' CHECK (approval_status IN ('pending', 'approved', 'rejected', 'revoked')),
+    assigned_agent TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TEXT,
@@ -35,6 +41,44 @@ CREATE TABLE IF NOT EXISTS task_acceptance_criteria (
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     criterion TEXT NOT NULL,
     completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS task_test_criteria (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    criterion TEXT NOT NULL,
+    test_type TEXT NOT NULL DEFAULT 'automated',
+    command TEXT,
+    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+    UNIQUE(task_id, criterion)
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS task_assignments (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    assignment_type TEXT NOT NULL DEFAULT 'execution',
+    assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    released_at TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released'))
+);
+
+CREATE TABLE IF NOT EXISTS task_approvals (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
+    approved_by TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS task_attempts (
@@ -66,6 +110,12 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_executable ON tasks(approval_status, status, priority);
+CREATE INDEX IF NOT EXISTS idx_task_test_criteria_task ON task_test_criteria(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_assignments_task ON task_assignments(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_approvals_task ON task_approvals(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
@@ -77,3 +127,9 @@ BEGIN
     UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
 END;
 
+CREATE TRIGGER IF NOT EXISTS trg_projects_updated_at
+AFTER UPDATE OF parent_id, name, description, path, status ON projects
+FOR EACH ROW
+BEGIN
+    UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;

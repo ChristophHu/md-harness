@@ -3,8 +3,8 @@ from sqlite3 import Connection, Row
 from typing import Any
 
 class TaskStore:
-    TRANSITIONS = {"created": {"ready", "cancelled"}, "ready": {"planned", "cancelled"}, "planned": {"in_progress", "cancelled"}, "in_progress": {"review", "failed", "blocked"}, "review": {"completed", "in_progress"}, "failed": {"in_progress", "cancelled"}, "blocked": {"in_progress", "cancelled"}, "completed": set(), "cancelled": set()}
-    FIELD_NAMES = {"title", "description", "task_type", "priority", "external_key", "parent_id", "project_id"}
+    TRANSITIONS = {"idea": {"backlog", "ready", "cancelled"}, "created": {"ready", "cancelled"}, "backlog": {"planned", "ready", "cancelled"}, "ready": {"planned", "in_progress", "cancelled"}, "planned": {"in_progress", "cancelled"}, "in_progress": {"review", "failed", "blocked"}, "review": {"completed", "in_progress"}, "failed": {"in_progress", "cancelled"}, "blocked": {"in_progress", "cancelled"}, "completed": set(), "cancelled": set()}
+    FIELD_NAMES = {"title", "description", "task_type", "priority", "external_key", "parent_id", "project_id", "assigned_agent"}
     def __init__(self, connection: Connection): self.connection = connection
     def create(self, title: str, *, project_id: int | None = None, **fields: Any) -> int:
         if set(fields) - self.FIELD_NAMES: raise ValueError("unsupported task field")
@@ -20,6 +20,55 @@ class TaskStore:
         self.connection.execute(f"UPDATE tasks SET {', '.join(f'{key} = ?' for key in fields)} WHERE id = ?", [*fields.values(), task_id])
     def list_ready(self) -> list[Row]:
         return self.connection.execute("SELECT * FROM tasks WHERE status = 'ready' ORDER BY priority, id").fetchall()
+
+    def approve(self, task_id: int, approved_by: str, reason: str | None = None) -> None:
+        self._require_task(task_id)
+        self.connection.execute(
+            "UPDATE tasks SET approval_status = 'approved' WHERE id = ?", (task_id,)
+        )
+        self.connection.execute(
+            "INSERT INTO task_approvals (task_id, status, approved_by, reason) VALUES (?, 'approved', ?, ?)",
+            (task_id, approved_by, reason),
+        )
+
+    def revoke_approval(self, task_id: int, approved_by: str, reason: str | None = None) -> None:
+        self._require_task(task_id)
+        self.connection.execute(
+            "UPDATE tasks SET approval_status = 'revoked' WHERE id = ?", (task_id,)
+        )
+        self.connection.execute(
+            "INSERT INTO task_approvals (task_id, status, approved_by, reason) VALUES (?, 'revoked', ?, ?)",
+            (task_id, approved_by, reason),
+        )
+
+    def get_executable_tasks(self, agent: str | None = None) -> list[Row]:
+        query = """SELECT t.* FROM tasks t
+            WHERE t.approval_status = 'approved' AND t.status IN ('ready', 'planned')
+            AND (? IS NULL OR t.assigned_agent = ?)
+            AND NOT EXISTS (
+                SELECT 1 FROM task_dependencies d JOIN tasks dependency
+                ON dependency.id = d.depends_on_task_id
+                WHERE d.task_id = t.id AND d.dependency_type = 'blocks'
+                AND dependency.status != 'completed'
+            ) ORDER BY t.priority, t.id"""
+        return self.connection.execute(query, (agent, agent)).fetchall()
+
+    def add_test_criterion(self, task_id: int, criterion: str, *, test_type: str = "automated", command: str | None = None) -> int:
+        return self.connection.execute(
+            "INSERT INTO task_test_criteria (task_id, criterion, test_type, command) VALUES (?, ?, ?, ?)",
+            (task_id, criterion, test_type, command),
+        ).lastrowid
+
+    def test_criteria(self, task_id: int) -> list[Row]:
+        return self.connection.execute(
+            "SELECT * FROM task_test_criteria WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+
+    def _require_task(self, task_id: int) -> Row:
+        task = self.get(task_id)
+        if task is None:
+            raise ValueError("task not found")
+        return task
     def transition(self, task_id: int, status: str) -> None:
         task = self.get(task_id)
         if task is None: raise ValueError("task not found")
