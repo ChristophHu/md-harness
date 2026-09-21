@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from harness.storage.artifact_store import ArtifactStore
+from harness.storage.agent_store import AgentStore
 from harness.storage.database import (
     backup_database,
     healthcheck,
@@ -96,6 +97,7 @@ def test_project_and_task_stores_cover_task_lifecycle(tmp_path):
             tasks.update(task_id, status="invalid")
         tasks.transition(task_id, "ready")
         tasks.transition(task_id, "planned")
+        tasks.approve(task_id, "reviewer")
         tasks.transition(task_id, "in_progress")
         tasks.transition(task_id, "review")
         tasks.transition(task_id, "completed")
@@ -147,6 +149,7 @@ def test_approval_test_criteria_and_executable_tasks(tmp_path):
         assert store.get_executable_tasks("developer") == []
         store.transition(dependency, "ready")
         store.transition(dependency, "planned")
+        store.approve(dependency, "reviewer")
         store.transition(dependency, "in_progress")
         store.transition(dependency, "review")
         store.transition(dependency, "completed")
@@ -160,9 +163,68 @@ def test_approval_test_criteria_and_executable_tasks(tmp_path):
 def test_approval_rejects_unknown_task(tmp_path):
     path = db(tmp_path)
     with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
         store = TaskStore(connection)
         with pytest.raises(ValueError, match="not found"):
             store.approve(999, "reviewer")
+
+
+def test_dependencies_reject_self_and_cycles(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        store = TaskStore(connection)
+        first = store.create("First")
+        second = store.create("Second")
+        store.add_dependency(second, first)
+        assert store._depends_on(first, second, {first}) is False
+        with pytest.raises(ValueError, match="itself"):
+            store.add_dependency(first, first)
+        with pytest.raises(ValueError, match="cycle"):
+            store.add_dependency(first, second)
+
+
+def test_unapproved_task_cannot_start(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        store = TaskStore(connection)
+        task = store.create("Task")
+        store.transition(task, "ready")
+        store.transition(task, "planned")
+        with pytest.raises(ValueError, match="approved"):
+            store.transition(task, "in_progress")
+
+
+def test_agent_store_and_foreign_keys(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.row_factory = sqlite3.Row
+        tasks = TaskStore(connection)
+        agents = AgentStore(connection)
+        task = tasks.create("Task")
+        agent = agents.create("developer", description="Builds code", capabilities='["python"]')
+        assignment = agents.assign(task, agent)
+        assert agents.get(agent)["name"] == "developer"
+        assert agents.assignments(task)[0]["id"] == assignment
+        with pytest.raises(sqlite3.IntegrityError):
+            agents.create("developer")
+        with pytest.raises(sqlite3.IntegrityError):
+            agents.assign(task, 999)
+
+
+def test_cascades_and_constraints(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        task = TaskStore(connection).create("Task", external_key="UNIQUE-1")
+        with pytest.raises(sqlite3.IntegrityError):
+            TaskStore(connection).create("Duplicate", external_key="UNIQUE-1")
+        TaskStore(connection).add_test_criterion(task, "same")
+        with pytest.raises(sqlite3.IntegrityError):
+            TaskStore(connection).add_test_criterion(task, "same")
+        connection.execute("DELETE FROM tasks WHERE id = ?", (task,))
+        assert connection.execute("SELECT COUNT(*) FROM task_test_criteria WHERE task_id = ?", (task,)).fetchone()[0] == 0
 
 
 def test_event_and_artifact_stores(tmp_path):

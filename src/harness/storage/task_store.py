@@ -73,9 +73,26 @@ class TaskStore:
         task = self.get(task_id)
         if task is None: raise ValueError("task not found")
         if status not in self.TRANSITIONS.get(task["status"], set()): raise ValueError(f"invalid transition: {task['status']} -> {status}")
+        if status == "in_progress" and task["approval_status"] != "approved":
+            raise ValueError("task must be approved before execution")
         self.connection.execute("UPDATE tasks SET status = ?, started_at = CASE WHEN ? = 'in_progress' THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END, completed_at = CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE completed_at END WHERE id = ?", (status, status, status, task_id))
     def add_dependency(self, task_id: int, depends_on_task_id: int, dependency_type: str = "blocks") -> None:
+        if task_id == depends_on_task_id:
+            raise ValueError("a task cannot depend on itself")
+        if self._depends_on(depends_on_task_id, task_id):
+            raise ValueError("dependency cycle detected")
         self.connection.execute("INSERT INTO task_dependencies VALUES (?, ?, ?)", (task_id, depends_on_task_id, dependency_type))
+
+    def _depends_on(self, task_id: int, target_id: int, visited: set[int] | None = None) -> bool:
+        visited = visited or set()
+        if task_id in visited:
+            return False
+        visited.add(task_id)
+        for row in self.connection.execute("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?", (task_id,)):
+            dependency_id = row[0]
+            if dependency_id == target_id or self._depends_on(dependency_id, target_id, visited):
+                return True
+        return False
     def dependencies(self, task_id: int) -> list[Row]:
         return self.connection.execute("SELECT * FROM task_dependencies WHERE task_id = ?", (task_id,)).fetchall()
     def add_criterion(self, task_id: int, criterion: str) -> int:

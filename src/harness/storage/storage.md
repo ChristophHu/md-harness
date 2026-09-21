@@ -20,6 +20,7 @@ Der Vault bleibt die Quelle für menschlich gepflegtes Wissen. SQLite ist dagege
 - `schema.sql`: vollständiges, idempotentes Initialschema mit Tabellen, Indizes und Triggern
 - `project_store.py`: Projekte anlegen, laden und auflisten
 - `task_store.py`: Aufgaben, Aktualisierungen, Statuswechsel, Freigaben, Abhängigkeiten, Akzeptanz- und Testkriterien sowie Agentenversuche
+- `agent_store.py`: Agenten registrieren und Task-Zuweisungen verwalten
 - `event_store.py`: Aufgabenereignisse protokollieren und abfragen
 - `artifact_store.py`: erzeugte Artefakte registrieren und abfragen
 - `migrations/`: versionierte SQL-Migrationen im Format `NNN_name.sql`
