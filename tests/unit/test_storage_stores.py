@@ -236,3 +236,19 @@ def test_event_and_artifact_stores(tmp_path):
         assert EventStore(connection).list_for_task(task_id)[0]["id"] == event_id
         artifact_id = ArtifactStore(connection).register(task_id, "result.txt", "text", "abc")
         assert ArtifactStore(connection).list_for_task(task_id)[0]["id"] == artifact_id
+
+
+def test_event_payload_variants_and_missing_store_records(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        task_id = TaskStore(connection).create("Task")
+        events = EventStore(connection)
+        events.record(task_id, "plain", "text")
+        events.record(task_id, "empty", None)
+        rows = events.list_for_task(task_id)
+        assert rows[0]["payload"] == "text"
+        assert rows[1]["payload"] is None
+        assert ProjectStore(connection).get(999) is None
+        assert AgentStore(connection).get(999) is None
+        assert ArtifactStore(connection).list_for_task(999) == []

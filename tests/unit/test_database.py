@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from harness.storage.database import connect, initialize_database
 
 
@@ -8,6 +10,10 @@ EXPECTED_TABLES = {
     "tasks",
     "task_dependencies",
     "task_acceptance_criteria",
+    "task_test_criteria",
+    "task_approvals",
+    "agents",
+    "task_assignments",
     "task_attempts",
     "task_events",
     "task_artifacts",
@@ -70,3 +76,23 @@ def test_database_rejects_invalid_acceptance_criterion(tmp_path):
             pass
         else:
             raise AssertionError("invalid completed value was accepted")
+
+
+def test_database_rejects_invalid_status_and_approval_values(tmp_path):
+    path = initialize_database(tmp_path / "harness.sqlite")
+    with connect(path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO tasks (title, status) VALUES ('task', 'unknown')")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO tasks (title, approval_status) VALUES ('task', 'unknown')")
+
+
+def test_task_cascade_removes_related_records(tmp_path):
+    path = initialize_database(tmp_path / "harness.sqlite")
+    with connect(path) as connection:
+        connection.execute("INSERT INTO tasks (title) VALUES ('task')")
+        connection.execute("INSERT INTO task_approvals (task_id, status) VALUES (1, 'approved')")
+        connection.execute("INSERT INTO task_test_criteria (task_id, criterion) VALUES (1, 'test')")
+        connection.execute("DELETE FROM tasks WHERE id = 1")
+        assert connection.execute("SELECT COUNT(*) FROM task_approvals").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM task_test_criteria").fetchone()[0] == 0

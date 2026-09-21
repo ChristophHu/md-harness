@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT,
     task_type TEXT NOT NULL DEFAULT 'task',
-    status TEXT NOT NULL DEFAULT 'idea',
+    status TEXT NOT NULL DEFAULT 'idea' CHECK (status IN ('idea', 'created', 'backlog', 'planned', 'ready', 'in_progress', 'blocked', 'review', 'testing', 'completed', 'failed', 'cancelled')),
     priority TEXT NOT NULL DEFAULT 'normal',
     approval_status TEXT NOT NULL DEFAULT 'pending' CHECK (approval_status IN ('pending', 'approved', 'rejected', 'revoked')),
     assigned_agent TEXT,
