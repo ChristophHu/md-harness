@@ -43,13 +43,21 @@ Das Schema umfasst:
 
 Projekte können über `projects.parent_id` hierarchisch verschachtelt werden. Aufgaben können über `tasks.parent_id` in Epics, Features, Tasks und atomare Subtasks zerlegt werden. `approval_status` ist bewusst vom operativen `status` getrennt: Ein Task darf nur nach expliziter Freigabe ausführbar werden.
 
-Zusätzlich existieren Indizes für Status/Priorität, Projekte, Events, Agentenversuche und Artefakte. Ein Trigger aktualisiert `tasks.updated_at` bei relevanten Änderungen automatisch.
+Zusätzlich existieren Indizes für Status/Priorität, Projekt- und Task-Hierarchien, ausführbare Tasks, Events, Agentenversuche, Kriterien und Artefakte. Trigger aktualisieren `tasks.updated_at` und `projects.updated_at` bei relevanten Änderungen automatisch.
+
+Der vorgesehene Lebenszyklus trennt fachliche Planung und Ausführung:
+
+```text
+idea → backlog → planned → ready → in_progress → review → completed
+```
+
+Ein Task kann unabhängig davon freigegeben oder zurückgezogen werden. Die Freigabe wird in `task_approvals` historisiert; `tasks.approval_status` enthält den aktuellen Freigabestatus.
 
 ## Migrationen und Versionierung
 
 Neue Datenbanken werden aus `schema.sql` initialisiert. Danach werden ausstehende Migrationen aus `migrations/` anhand ihrer dreistelligen Versionsnummer ausgeführt. Die aktuelle Version wird in SQLite über `PRAGMA user_version` gespeichert.
 
-Bestehende Migrationen werden nicht verändert. Schemaänderungen erhalten eine neue Datei, beispielsweise `002_add_memory_table.sql`.
+Bestehende Migrationen werden nicht verändert. Schemaänderungen erhalten eine neue Datei, beispielsweise `002_add_memory_table.sql`. Die aktuelle Modellversion wird als neue Ausgangsbasis initialisiert; eine automatische Konvertierung der verworfenen alten lokalen Struktur ist nicht vorgesehen.
 
 ## Transaktionen und Sicherheit
 
