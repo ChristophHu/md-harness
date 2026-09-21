@@ -232,6 +232,19 @@ Task-Input-Tool → SQLite → Workflow-Engine
 
 Synchronisationsfehler werden in SQLite protokolliert und können später erneut verarbeitet werden. Ein eigenes Kanban-Board kann später entwickelt werden und direkt auf SQLite oder eine kontrollierte Harness-Schnittstelle zugreifen; es bleibt eine Darstellungsschicht und ersetzt SQLite nicht als führende Datenquelle.
 
+## Entwicklungs- und Programmierprinzipien
+
+Die Entwicklung folgt dem Prinzip „Divide and Conquer“: Große Probleme werden in überschaubare Teilprobleme zerlegt. Aus diesen Teilproblemen werden Tasks und bei Bedarf hierarchische Subtasks mit klaren Akzeptanz- und Testkriterien erstellt.
+
+Zusätzlich gelten:
+
+- KISS: Lösungen so einfach wie möglich halten
+- DRY: unnötige Wiederholung von Wissen und Logik vermeiden
+- YAGNI: nur aktuell benötigte oder ausdrücklich freigegebene Funktionen implementieren
+- Clean Code: lesbaren, wartbaren, testbaren und klar strukturierten Code entwickeln
+
+Diese Prinzipien sind bei Planung, Implementierung, Review und Refactoring zu berücksichtigen. Begründete Abweichungen werden als Architekturentscheidung dokumentiert.
+
 ## Gitflow
 
 Für die Entwicklung ist Gitflow verbindlich zu verwenden. Die Branches und ihre Rollen sind:
