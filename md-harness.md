@@ -245,6 +245,8 @@ Zusätzlich gelten:
 
 Diese Prinzipien sind bei Planung, Implementierung, Review und Refactoring zu berücksichtigen. Begründete Abweichungen werden als Architekturentscheidung dokumentiert.
 
+Die konkreten Clean-Code-Leitlinien umfassen SOLID (SRP, OCP, LSP, ISP und DIP), aussagekräftige Namen, kleine Funktionen mit einem Abstraktionsniveau, das Gesetz von Demeter, strukturierte Fehlerbehandlung, sparsame und begründete Kommentare sowie die Pfadfinder-Regel. Abweichungen von diesen Leitlinien sind fachlich zu begründen. Starre Grenzwerte, etwa eine maximale Zeilenzahl, dienen als Warnsignal und werden im Kontext bewertet.
+
 ## Gitflow
 
 Für die Entwicklung ist Gitflow verbindlich zu verwenden. Die Branches und ihre Rollen sind:
