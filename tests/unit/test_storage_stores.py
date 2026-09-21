@@ -58,7 +58,12 @@ def test_sqlite_seed_contains_three_tasks(tmp_path):
     with sqlite3.connect(path) as connection:
         connection.executescript(seed.read_text(encoding="utf-8"))
         tasks = connection.execute("SELECT external_key, status FROM tasks ORDER BY id").fetchall()
-    assert tasks == [("FIX-001", "completed"), ("FIX-002", "ready"), ("FIX-003", "created")]
+        agent = connection.execute("SELECT name FROM agents WHERE id = 200").fetchone()[0]
+        assignment_count = connection.execute("SELECT COUNT(*) FROM task_assignments").fetchone()[0]
+    assert tasks[:3] == [("FIX-001", "completed"), ("FIX-002", "ready"), ("FIX-003", "created")]
+    assert tasks[3] == ("FIX-004", "ready")
+    assert agent == "developer"
+    assert assignment_count == 1
 
 
 def test_transaction_rolls_back_on_sqlite_error(tmp_path):

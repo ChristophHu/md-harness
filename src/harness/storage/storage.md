@@ -70,7 +70,7 @@ Transaktionen werden über `database.transaction()` ausgeführt. Bei einem SQLit
 
 ## Tests
 
-Die Storage-Schicht wird durch `tests/unit/test_storage_stores.py` und `tests/unit/test_database.py` geprüft. Reproduzierbare Testdaten liegen in `tests/fixtures/sqlite_seed.sql` und enthalten ein Projekt mit drei Tasks, einer Abhängigkeit und einem Akzeptanzkriterium.
+Die Storage-Schicht wird durch `tests/unit/test_storage_stores.py` und `tests/unit/test_database.py` geprüft. Reproduzierbare Beispieldaten liegen in `tests/fixtures/sqlite_seed.sql`. Sie enthalten ein Hauptprojekt mit Unterprojekt, vier hierarchische Tasks, eine Abhängigkeit, Akzeptanz- und Testkriterien, einen Agenten, eine Zuweisung, eine Freigabe und ein Event.
 
 Der vollständige Testlauf erfolgt mit:
 
