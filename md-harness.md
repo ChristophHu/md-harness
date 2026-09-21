@@ -240,6 +240,15 @@ hotfix/*   → develop
 
 Release- und Hotfix-Branches müssen nach dem Merge in den stabilen Branch auch nach `develop` zurückgeführt werden. Releases erhalten einen Versions-Tag wie `v1.0.0`. Der konkrete stabile Branch (`main` oder `master`) muss in der Projektkonfiguration eindeutig festgelegt sein.
 
+## Codequalität und Fehlerbehebung
+
+Codeanalyse, Codequalität, Refactoring und Fehlerbehebung werden als Workflow-Themen behandelt. Der Workflow `quality-check` prüft die aktuelle Python-Anwendung mit den dafür vorgesehenen Lintern:
+
+- Ruff für Python-Code und Python-Formatierung
+- SQLFluff für SQL-Dateien
+
+Der Qualitätsworkflow umfasst Analyse, Fehlerbehebung, Tests und Coverage. Er soll vor Reviews, Commits und Integrationen erfolgreich durchlaufen werden.
+
 ## Konfiguration
 
 ## Struktur

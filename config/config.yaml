@@ -37,6 +37,12 @@ execution:
   dry_run: true
   max_retries: 2
 
+quality:
+  enabled: true
+  linters:
+    python: ruff
+    sql: sqlfluff
+
 security:
   require_approval_for:
     - shell_command
