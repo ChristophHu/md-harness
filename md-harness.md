@@ -246,6 +246,7 @@ Codeanalyse, Codequalität, Refactoring und Fehlerbehebung werden als Workflow-T
 
 - Ruff für Python-Code und Python-Formatierung
 - SQLFluff für SQL-Dateien
+- mypy für statische Typprüfung
 
 Der Qualitätsworkflow umfasst Analyse, Fehlerbehebung, Tests und Coverage. Er soll vor Reviews, Commits und Integrationen erfolgreich durchlaufen werden.
 

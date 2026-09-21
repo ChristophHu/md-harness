@@ -42,6 +42,8 @@ quality:
   linters:
     python: ruff
     sql: sqlfluff
+  analyzers:
+    typing: mypy
 
 security:
   require_approval_for:
