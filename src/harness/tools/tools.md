@@ -56,7 +56,12 @@ Unterstützt unter anderem:
 - Dateien vollständig oder selektiv stagen
 - Commits erstellen
 - Pull und Push
+- Fetch, Merge und Rebase
 - Branches wechseln oder erstellen
+- Branches löschen; geschützte Haupt- und Entwicklungsbranches werden dabei abgelehnt
+- Diffs, Diff-Statistiken und geänderte Dateien prüfen
+- Arbeitsverzeichnis und letzten Commit prüfen
+- Tags erstellen, löschen und anzeigen
 - Commit-Historie anzeigen
 - Remotes hinzufügen und anzeigen
 
@@ -83,4 +88,3 @@ SQL-Parameter sollen grundsätzlich gebunden übergeben werden. Das verhindert S
 ## Sicherheitsprinzip
 
 Alle Tools werden über ein gemeinsames Interface beschrieben und können vor der Ausführung zentral validiert werden. Berechtigungen, Dry-Run-Verhalten und potenziell destruktive oder netzwerkbasierte Aktionen müssen vor der tatsächlichen Ausführung geprüft werden.
-

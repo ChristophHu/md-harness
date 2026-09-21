@@ -133,3 +133,67 @@ def test_commit_staged_and_remote_operations_validate_and_delegate(tmp_path):
     with patch.object(GitRepository, "_run", return_value="added") as run:
         assert repo.add_remote("origin", "https://example.test/repo.git") == "added"
         run.assert_called_once_with("remote", "add", "origin", "https://example.test/repo.git")
+
+
+def test_gitflow_branches_merge_rebase_fetch_and_protection(tmp_path):
+    repo = GitRepository.init(tmp_path / "repo")
+    with patch.object(GitRepository, "_run", return_value="ok") as run:
+        assert repo.create_branch("feature/task", "develop") == "ok"
+        run.assert_called_with("switch", "-c", "feature/task", "develop")
+        repo.fetch("upstream", "develop")
+        run.assert_called_with("fetch", "upstream", "develop")
+        repo.merge("feature/task", no_ff=False)
+        run.assert_called_with("merge", "feature/task")
+        repo.merge("feature/task")
+        run.assert_called_with("merge", "--no-ff", "feature/task")
+        repo.rebase("develop")
+        run.assert_called_with("rebase", "develop")
+        repo.delete_branch("feature/task", remote=True)
+        run.assert_called_with("push", "origin", "--delete", "feature/task")
+    with pytest.raises(GitError, match="protected"):
+        repo.delete_branch("main")
+    with pytest.raises(ValueError):
+        repo.create_branch("bad branch")
+    with pytest.raises(ValueError, match="branch"):
+        repo.create_branch("")
+
+
+def test_review_release_and_branch_helpers(tmp_path):
+    repo = GitRepository.init(tmp_path / "repo")
+    with patch.object(GitRepository, "_run", side_effect=["a.py\nb.py", "stat", "show", "v1", "deleted", "v1\nv2", "main\nfeature/x"]):
+        assert repo.changed_files() == ["a.py", "b.py"]
+        assert repo.diff_stat() == "stat"
+        assert repo.show() == "show"
+        assert repo.tag("v1", "release") == "v1"
+        assert repo.delete_tag("v1") == "deleted"
+        assert repo.list_tags() == ["v1", "v2"]
+        assert repo.list_branches() == ["main", "feature/x"]
+    with patch.object(GitRepository, "_run", return_value=""):
+        assert repo.check_clean() is True
+    with patch.object(GitRepository, "_run", return_value="last"):
+        assert repo.last_commit() == "last"
+    with patch.object(GitRepository, "_run", return_value="diff") as run:
+        assert repo.diff() == "diff"
+        run.assert_called_with("diff")
+    with patch.object(GitRepository, "_run", return_value="cached") as run:
+        assert repo.diff(staged=True) == "cached"
+        run.assert_called_with("diff", "--cached")
+    with patch.object(GitRepository, "_run", return_value="tagged") as run:
+        assert repo.tag("v2") == "tagged"
+        run.assert_called_with("tag", "v2")
+    with pytest.raises(ValueError):
+        repo.show(" ")
+    with pytest.raises(ValueError):
+        repo.tag("")
+    with pytest.raises(ValueError):
+        repo.delete_tag("")
+
+
+def test_execute_dispatches_extended_operations(tmp_path):
+    repo = GitRepository.init(tmp_path / "repo")
+    with patch.object(GitRepository, "status", return_value="clean"):
+        assert repo.execute(operation="status") == "clean"
+    with patch.object(GitRepository, "create_branch", return_value="created"):
+        assert repo.execute(operation="create_branch", branch="feature/x") == "created"
+    with pytest.raises(GitError, match="unsupported"):
+        repo.execute(operation="unknown")
