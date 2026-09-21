@@ -59,14 +59,18 @@ class Tool(ABC):
         allowed = {parameter.name for parameter in self.definition.parameters}
         unknown = set(arguments) - allowed
         if unknown:
-            raise ToolError(f"unknown arguments for {self.tool_name}: {sorted(unknown)}")
+            raise ToolError(
+                f"unknown arguments for {self.tool_name}: {sorted(unknown)}"
+            )
         missing = {
             parameter.name
             for parameter in self.definition.parameters
             if parameter.required and parameter.name not in arguments
         }
         if missing:
-            raise ToolError(f"missing arguments for {self.tool_name}: {sorted(missing)}")
+            raise ToolError(
+                f"missing arguments for {self.tool_name}: {sorted(missing)}"
+            )
 
     @abstractmethod
     def execute(self, **arguments: Any) -> Any:

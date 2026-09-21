@@ -1,5 +1,6 @@
-import pytest
 import runpy
+
+import pytest
 
 from harness.cli import main
 

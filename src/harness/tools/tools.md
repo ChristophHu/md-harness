@@ -67,6 +67,10 @@ Unterstützt unter anderem:
 
 Netzwerkoperationen wie Pull und Push müssen durch die Sicherheits- und Ausführungsregeln des Harnesses kontrolliert werden.
 
+Alle vom Harness ausgeführten Commits, Pushes, Branch-Erstellungen und Merges
+werden zusätzlich durch `security/gitflow_policy.py` gegen die Gitflow-Regeln
+validiert.
+
 ### `sqlite.py`
 
 Stellt kontrollierte, parametrisierte SQLite-Operationen bereit.

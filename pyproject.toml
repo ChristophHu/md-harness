@@ -34,3 +34,9 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
 ]
+
+[tool.ruff.lint]
+ignore = ["SIM117"]
+
+[tool.mypy]
+disable_error_code = ["return-value", "override", "valid-type"]

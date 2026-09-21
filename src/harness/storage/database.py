@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 CURRENT_SCHEMA_VERSION = 1
@@ -27,7 +27,9 @@ def connect(database_path: str | Path) -> sqlite3.Connection:
     return connection
 
 
-def apply_migrations(connection: sqlite3.Connection, target: int = CURRENT_SCHEMA_VERSION) -> int:
+def apply_migrations(
+    connection: sqlite3.Connection, target: int = CURRENT_SCHEMA_VERSION
+) -> int:
     current = int(connection.execute("PRAGMA user_version").fetchone()[0])
     for version, path in _migration_files():
         if current < version <= target:
@@ -87,4 +89,3 @@ def restore_database(backup_path: str | Path, database_path: str | Path) -> Path
     with sqlite3.connect(backup_path) as source, sqlite3.connect(target) as restored:
         source.backup(restored)
     return target
-

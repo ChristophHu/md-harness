@@ -1,2 +1,1 @@
 """permissions component."""
-

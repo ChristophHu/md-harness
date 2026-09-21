@@ -42,7 +42,9 @@ def test_keychain_provider_returns_none_on_non_macos():
 
 
 def test_keychain_provider_builds_normalized_service_name():
-    provider = MacOSKeychainSecretProvider(service_prefix="test-service", account="alice")
+    provider = MacOSKeychainSecretProvider(
+        service_prefix="test-service", account="alice"
+    )
     assert provider._service("QDRANT_API_KEY") == "test-service/qdrant-api-key"
     assert provider._account() == "alice"
 
@@ -102,8 +104,15 @@ def test_keychain_set_succeeds_on_successful_command():
     ):
         provider.set("API_KEY", "value")
     assert run.call_args.args[0] == [
-        "security", "add-generic-password", "-a", "alice", "-s", "dev-harness/api-key",
-        "-w", "value", "-U",
+        "security",
+        "add-generic-password",
+        "-a",
+        "alice",
+        "-s",
+        "dev-harness/api-key",
+        "-w",
+        "value",
+        "-U",
     ]
 
 

@@ -1,5 +1,6 @@
-import pytest
 from pathlib import Path
+
+import pytest
 
 from harness.tools.base import (
     PermissionLevel,
@@ -58,7 +59,7 @@ def test_filesystem_tool_dispatches_operations(tmp_path):
     assert tool.execute(operation="write", path="file.txt", content="hello")
     assert tool.execute(operation="read", path="file.txt") == "hello"
     assert tool.execute(operation="exists", path="file.txt") is True
-    assert tool.execute(operation="mkdir", path="folder") .is_dir()
+    assert tool.execute(operation="mkdir", path="folder").is_dir()
     assert tool.execute(operation="list") == [Path("file.txt"), Path("folder")]
     tool.execute(operation="copy", path="file.txt", destination="copy.txt")
     tool.execute(operation="move", path="copy.txt", destination="moved.txt")
@@ -81,9 +82,19 @@ def test_git_tool_dispatches_operations(tmp_path):
 def test_sqlite_tool_dispatches_operations(tmp_path):
     tool = SQLiteTool(tmp_path / "db.sqlite")
     tool.execute(operation="initialize", sql="ignored")
-    tool.execute(operation="execute", sql="CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-    tool.execute(operation="execute", sql="INSERT INTO items (name) VALUES (?)", parameters=("one",))
-    assert tool.execute(operation="fetch_one", sql="SELECT name FROM items")["name"] == "one"
+    tool.execute(
+        operation="execute",
+        sql="CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    tool.execute(
+        operation="execute",
+        sql="INSERT INTO items (name) VALUES (?)",
+        parameters=("one",),
+    )
+    assert (
+        tool.execute(operation="fetch_one", sql="SELECT name FROM items")["name"]
+        == "one"
+    )
     assert tool.execute(operation="fetch_all", sql="SELECT * FROM items")
     assert tool.execute(operation="table_exists", table="items") is True
     tool.execute(operation="vacuum")

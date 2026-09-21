@@ -1,2 +1,1 @@
 """planner component."""
-

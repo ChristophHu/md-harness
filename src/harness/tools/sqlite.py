@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from harness.storage.database import SCHEMA_PATH
@@ -42,19 +42,43 @@ class SQLiteTool(Tool):
         if self.timeout <= 0:
             raise ValueError("timeout must be positive")
 
-    def execute(self, operation: str, parameters: Sequence[object] | Mapping[str, object] = (), **arguments: Any) -> Any:
-        if operation not in {"initialize", "execute", "fetch_one", "fetch_all", "table_exists", "vacuum"} and not arguments:
+    def execute(
+        self,
+        operation: str,
+        parameters: Sequence[object] | Mapping[str, object] = (),
+        **arguments: Any,
+    ) -> Any:
+        if (
+            operation
+            not in {
+                "initialize",
+                "execute",
+                "fetch_one",
+                "fetch_all",
+                "table_exists",
+                "vacuum",
+            }
+            and not arguments
+        ):
             return self.execute_sql(operation, parameters)
         sql = arguments.pop("sql", None)
-        if operation == "initialize": return self.initialize()
-        if operation == "execute": return self.execute_sql(sql, arguments.pop("parameters", parameters))
-        if operation == "fetch_one": return self.fetch_one(sql, parameters)
-        if operation == "fetch_all": return self.fetch_all(sql, parameters)
-        if operation == "table_exists": return self.table_exists(arguments.pop("table"))
-        if operation == "vacuum": return self.vacuum()
+        if operation == "initialize":
+            return self.initialize()
+        if operation == "execute":
+            return self.execute_sql(sql, arguments.pop("parameters", parameters))
+        if operation == "fetch_one":
+            return self.fetch_one(sql, parameters)
+        if operation == "fetch_all":
+            return self.fetch_all(sql, parameters)
+        if operation == "table_exists":
+            return self.table_exists(arguments.pop("table"))
+        if operation == "vacuum":
+            return self.vacuum()
         raise SQLiteError(f"unsupported operation: {operation}")
 
-    def execute_sql(self, sql: str | None, parameters: Sequence[object] | Mapping[str, object] = ()) -> int:
+    def execute_sql(
+        self, sql: str | None, parameters: Sequence[object] | Mapping[str, object] = ()
+    ) -> int:
         if not sql:
             raise SQLiteError("sql is required")
         return self.execute_statement(sql, parameters)
@@ -71,7 +95,9 @@ class SQLiteTool(Tool):
         """Create the database and apply an idempotent schema script."""
         try:
             with self.connect() as connection:
-                connection.executescript(schema or SCHEMA_PATH.read_text(encoding="utf-8"))
+                connection.executescript(
+                    schema or SCHEMA_PATH.read_text(encoding="utf-8")
+                )
         except sqlite3.Error as error:
             raise SQLiteError("could not initialize database") from error
 
