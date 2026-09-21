@@ -218,6 +218,20 @@ Die Datenbank wird nicht als Wissensquelle verwendet. Der Obsidian-Vault enthäl
 
 Für die Storage-Schicht gilt ebenfalls die Testregel: Jede Änderung wird durch Tests begleitet. Der Standardlauf ist `uv run pytest`; die aktuelle Gesamt- und Storage-Coverage beträgt 100 %.
 
+## Quelle der Wahrheit für Aufgaben
+
+SQLite ist die primäre Quelle der Wahrheit für alle Aufgaben und ihren operativen Status. Externe Task- und Kanban-Systeme sind nachgelagerte Projektionen oder optionale Integrationen. Ein Ausfall einer externen Integration darf die lokale Aufgabenverwaltung nicht blockieren.
+
+Das Synchronisationsmodell ist zunächst einseitig:
+
+```text
+Task-Input-Tool → SQLite → Workflow-Engine
+                              ↓
+                    Kanban-Adapter / Kanban-UI
+```
+
+Synchronisationsfehler werden in SQLite protokolliert und können später erneut verarbeitet werden. Ein eigenes Kanban-Board kann später entwickelt werden und direkt auf SQLite oder eine kontrollierte Harness-Schnittstelle zugreifen; es bleibt eine Darstellungsschicht und ersetzt SQLite nicht als führende Datenquelle.
+
 ## Gitflow
 
 Für die Entwicklung ist Gitflow verbindlich zu verwenden. Die Branches und ihre Rollen sind:
