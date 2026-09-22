@@ -5,6 +5,7 @@ import pytest
 from harness.config import ConfigError, PersistenceMode
 from harness.engine.orchestrator import Orchestrator
 from harness.engine.result import EngineResult, ResultStatus
+from harness.storage.transaction import TransactionError, TransactionManager
 
 
 class StubContextBuilder:
@@ -320,6 +321,51 @@ def test_orchestrator_accepts_disabled_persistence_mode():
 def test_orchestrator_rejects_invalid_persistence_mode():
     with pytest.raises(ConfigError, match="persistence_mode"):
         Orchestrator(StubContextBuilder(object()), persistence_mode="invalid")
+
+
+def test_orchestrator_rejects_stores_on_different_connections():
+    class Store:
+        def __init__(self):
+            self.connection = object()
+
+    with pytest.raises(TransactionError, match="share"):
+        Orchestrator(
+            StubContextBuilder(object()),
+            transaction_manager=TransactionManager(object()),
+            task_store=Store(),
+        )
+
+
+def test_orchestrator_uses_failure_transaction_after_persistence_error():
+    class Manager:
+        def __init__(self):
+            self.fallback = False
+
+        def _validate_connections(self, _stores):
+            return None
+
+        def atomic(self):
+            class BrokenContext:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    raise RuntimeError("write failed")
+
+            return BrokenContext()
+
+        def record_failure(self, *_args):
+            self.fallback = True
+
+    manager = Manager()
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=object(),
+        event_store=object(),
+        transaction_manager=manager,
+    )
+    orchestrator._fail_task(1, "broken", "task.failed")
+    assert manager.fallback is True
 
 
 def test_orchestrator_retries_execution_without_replanning():

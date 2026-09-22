@@ -10,6 +10,7 @@ from harness.engine.context import ExecutionContext
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
 from harness.engine.result import EngineResult, NextAction, ResultStatus
+from harness.storage.transaction import TransactionManager
 from harness.tools.base import ToolRegistry
 
 
@@ -35,6 +36,7 @@ class Orchestrator:
         max_cycles: int = 3,
         max_retries: int = 2,
         persistence_mode: PersistenceMode | str = PersistenceMode.OPTIONAL,
+        transaction_manager: TransactionManager | None = None,
     ) -> None:
         self.context_builder = context_builder
         self.planner = planner
@@ -51,6 +53,11 @@ class Orchestrator:
         self.task_store = task_store
         self.event_store = event_store
         self.artifact_store = artifact_store
+        if transaction_manager is not None:
+            transaction_manager._validate_connections(
+                (task_store, event_store, artifact_store)
+            )
+        self.transaction_manager = transaction_manager
         try:
             self.persistence_mode = PersistenceMode(persistence_mode)
         except ValueError as error:
@@ -284,16 +291,27 @@ class Orchestrator:
 
     def _transition(self, task_id: int, status: str) -> None:
         if self.task_store is not None:
-            self.task_store.transition(task_id, status)
+            if self.transaction_manager is None:
+                self.task_store.transition(task_id, status)
+            else:
+                with self.transaction_manager.atomic():
+                    self.task_store.transition(task_id, status)
 
     def _event(self, task_id: int, event_type: str, payload: Any = None) -> None:
         if self.event_store is not None:
-            self.event_store.record(task_id, event_type, payload)
+            if self.transaction_manager is None:
+                self.event_store.record(task_id, event_type, payload)
+            else:
+                with self.transaction_manager.atomic():
+                    self.event_store.record(task_id, event_type, payload)
 
     def _start_attempt(self, task_id: int) -> int | None:
         if self.task_store is None or not hasattr(self.task_store, "record_attempt"):
             return None
-        return self.task_store.record_attempt(task_id, "running")
+        if self.transaction_manager is None:
+            return self.task_store.record_attempt(task_id, "running")
+        with self.transaction_manager.atomic():
+            return self.task_store.record_attempt(task_id, "running")
 
     def _finish_attempt(
         self, attempt_id: int | None, status: str, error: str | None = None
@@ -303,14 +321,32 @@ class Orchestrator:
             and self.task_store is not None
             and hasattr(self.task_store, "complete_attempt")
         ):
-            self.task_store.complete_attempt(attempt_id, status, error)
+            if self.transaction_manager is None:
+                self.task_store.complete_attempt(attempt_id, status, error)
+            else:
+                with self.transaction_manager.atomic():
+                    self.task_store.complete_attempt(attempt_id, status, error)
 
     def _fail_task(self, task_id: int, message: str, event_type: str) -> None:
-        self._transition(task_id, "failed")
-        self._event(task_id, event_type, {"error": message})
-        if event_type != "task.failed":
-            self._event(
-                task_id, "task.failed", {"error": message, "source": event_type}
+        if self.transaction_manager is None:
+            self._transition(task_id, "failed")
+            self._event(task_id, event_type, {"error": message})
+            if event_type != "task.failed":
+                self._event(
+                    task_id, "task.failed", {"error": message, "source": event_type}
+                )
+            return
+        try:
+            with self.transaction_manager.atomic():
+                self.task_store.transition(task_id, "failed")
+                self.event_store.record(task_id, event_type, {"error": message})
+                if event_type != "task.failed":
+                    self.event_store.record(
+                        task_id, "task.failed", {"error": message, "source": event_type}
+                    )
+        except Exception:  # noqa: BLE001 - persistence fallback must handle any write failure
+            self.transaction_manager.record_failure(
+                self.task_store, self.event_store, task_id, message
             )
 
     def _register_artifacts(self, task_id: int, result: EngineResult) -> None:

@@ -46,6 +46,10 @@ Projekte können über `projects.parent_id` hierarchisch verschachtelt werden. A
 
 Zusätzlich existieren Indizes für Status/Priorität, Projekt- und Task-Hierarchien, ausführbare Tasks, Events, Agentenversuche, Kriterien und Artefakte. Trigger aktualisieren `tasks.updated_at` und `projects.updated_at` bei relevanten Änderungen automatisch. `planning_started_at`, `validation_started_at` und `failed_at` markieren die jeweiligen Prozessphasen.
 
+## Transaktionen
+
+`TransactionManager` koordiniert atomare SQLite-Blöcke für die Stores. `TaskStore`, `EventStore` und `ArtifactStore` müssen dafür dieselbe `sqlite3.Connection` verwenden. Erfolgreiche Blöcke werden committed; bei Exceptions erfolgt ein Rollback. Nach einem Rollback kann eine separate Fehlertransaktion `task.persistence.failed` und den fehlgeschlagenen Taskstatus persistieren.
+
 Der operative Lebenszyklus bildet den Engine-Workflow direkt ab:
 
 ```text

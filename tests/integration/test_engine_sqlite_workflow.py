@@ -14,6 +14,7 @@ from harness.storage.database import connect, initialize_database
 from harness.storage.event_store import EventStore
 from harness.storage.project_store import ProjectStore
 from harness.storage.task_store import TaskStore
+from harness.storage.transaction import TransactionManager
 
 
 def build_orchestrator(tmp_path, validator):
@@ -61,6 +62,9 @@ def build_orchestrator(tmp_path, validator):
         task_store=tasks,
         event_store=EventStore(connection),
         artifact_store=ArtifactStore(connection),
+        transaction_manager=TransactionManager(
+            connection, tasks, EventStore(connection), ArtifactStore(connection)
+        ),
     )
     return orchestrator, connection, task_id
 
