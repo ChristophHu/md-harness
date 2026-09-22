@@ -29,7 +29,7 @@ def db(tmp_path):
 def test_database_transaction_health_version_and_backup(tmp_path):
     path = db(tmp_path)
     assert healthcheck(path) is True
-    assert schema_version(path) == 1
+    assert schema_version(path) == 3
     with transaction(path) as connection:
         connection.execute("INSERT INTO projects (name, path) VALUES ('p', '/p')")
     with transaction(path) as connection:
@@ -73,7 +73,7 @@ def test_sqlite_seed_contains_three_tasks(tmp_path):
             "SELECT COUNT(*) FROM task_assignments"
         ).fetchone()[0]
     assert tasks[:3] == [
-        ("FIX-001", "completed"),
+        ("FIX-001", "done"),
         ("FIX-002", "ready"),
         ("FIX-003", "created"),
     ]
@@ -126,11 +126,11 @@ def test_project_and_task_stores_cover_task_lifecycle(tmp_path):
         with pytest.raises(ValueError):
             tasks.update(task_id, status="invalid")
         tasks.transition(task_id, "ready")
-        tasks.transition(task_id, "planned")
         tasks.approve(task_id, "reviewer")
-        tasks.transition(task_id, "in_progress")
-        tasks.transition(task_id, "review")
-        tasks.transition(task_id, "completed")
+        tasks.transition(task_id, "planning")
+        tasks.transition(task_id, "executing")
+        tasks.transition(task_id, "validating")
+        tasks.transition(task_id, "done")
         assert tasks.get(task_id)["completed_at"] is not None
         with pytest.raises(ValueError, match="invalid transition"):
             tasks.transition(task_id, "ready")
@@ -152,6 +152,8 @@ def test_task_dependencies_criteria_and_attempts(tmp_path):
         store.complete_criterion(criterion_id)
         assert store.criteria(second)[0]["completed"] == 1
         assert store.record_attempt(second, "failed", "agent", "error") == 1
+        store.complete_attempt(1, "completed")
+        assert store.attempts(second)[0]["status"] == "completed"
 
 
 def test_list_ready_returns_only_ready_tasks(tmp_path):
@@ -178,11 +180,11 @@ def test_approval_test_criteria_and_executable_tasks(tmp_path):
         store.approve(task, "reviewer", "scope confirmed")
         assert store.get_executable_tasks("developer") == []
         store.transition(dependency, "ready")
-        store.transition(dependency, "planned")
         store.approve(dependency, "reviewer")
-        store.transition(dependency, "in_progress")
-        store.transition(dependency, "review")
-        store.transition(dependency, "completed")
+        store.transition(dependency, "planning")
+        store.transition(dependency, "executing")
+        store.transition(dependency, "validating")
+        store.transition(dependency, "done")
         assert store.get_executable_tasks("developer")[0]["id"] == task
         criterion = store.add_test_criterion(
             task, "Coverage is sufficient", command="pytest --cov"
@@ -222,9 +224,8 @@ def test_unapproved_task_cannot_start(tmp_path):
         store = TaskStore(connection)
         task = store.create("Task")
         store.transition(task, "ready")
-        store.transition(task, "planned")
         with pytest.raises(ValueError, match="approved"):
-            store.transition(task, "in_progress")
+            store.transition(task, "planning")
 
 
 def test_agent_store_and_foreign_keys(tmp_path):

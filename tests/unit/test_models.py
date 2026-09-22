@@ -21,7 +21,7 @@ def test_project_model_defaults():
 def test_task_model_defaults():
     task = Task(None, 1, None, "TASK-1", "Implement feature")
     assert task.task_type == "task"
-    assert task.status == "idea"
+    assert task.status == "created"
     assert task.priority == "normal"
     assert task.description is None
 

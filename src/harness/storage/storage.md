@@ -46,10 +46,19 @@ Projekte können über `projects.parent_id` hierarchisch verschachtelt werden. A
 
 Zusätzlich existieren Indizes für Status/Priorität, Projekt- und Task-Hierarchien, ausführbare Tasks, Events, Agentenversuche, Kriterien und Artefakte. Trigger aktualisieren `tasks.updated_at` und `projects.updated_at` bei relevanten Änderungen automatisch.
 
-Der vorgesehene Lebenszyklus trennt fachliche Planung und Ausführung:
+Der operative Lebenszyklus bildet den Engine-Workflow direkt ab:
 
 ```text
-idea → backlog → planned → ready → in_progress → review → completed
+created → ready → planning → executing → validating → done
+```
+
+Zusätzliche Übergänge bilden Fehlerbehandlung und Unterbrechungen ab:
+
+```text
+validating → executing   (Ausführungsfehler)
+validating → planning    (Planungsfehler)
+* → waiting              (externe Voraussetzung oder Freigabe fehlt)
+* → failed               (nicht behebbarer Fehler oder Limit erreicht)
 ```
 
 Ein Task kann unabhängig davon freigegeben oder zurückgezogen werden. Die Freigabe wird in `task_approvals` historisiert; `tasks.approval_status` enthält den aktuellen Freigabestatus.
@@ -59,6 +68,8 @@ Ein Task kann unabhängig davon freigegeben oder zurückgezogen werden. Die Frei
 Neue Datenbanken werden aus `schema.sql` initialisiert. Danach werden ausstehende Migrationen aus `migrations/` anhand ihrer dreistelligen Versionsnummer ausgeführt. Die aktuelle Version wird in SQLite über `PRAGMA user_version` gespeichert.
 
 Bestehende Migrationen werden nicht verändert. Schemaänderungen erhalten eine neue Datei, beispielsweise `002_add_memory_table.sql`. Die aktuelle Modellversion wird als neue Ausgangsbasis initialisiert; eine automatische Konvertierung der verworfenen alten lokalen Struktur ist nicht vorgesehen.
+
+Schema-Version 3 ergänzt den Taskstatus `failed`. Der Orchestrator verwaltet außerdem `task_attempts`: Jeder Workflow-Zyklus wird begonnen, bei Retry/Replan als fehlgeschlagen abgeschlossen und bei Erfolg, Waiting oder endgültigem Fehler abgeschlossen.
 
 ## Transaktionen und Sicherheit
 
@@ -82,6 +93,6 @@ Die aktuelle Storage- und Gesamt-Coverage beträgt 100 %.
 
 ## Ausführbare Tasks
 
-`TaskStore.get_executable_tasks()` liefert nur freigegebene (`approval_status = approved`), vorbereitete (`ready` oder `planned`) und nicht durch offene Blocker-Abhängigkeiten gesperrte Tasks. Optional kann nach einem zugewiesenen Agenten gefiltert werden.
+`TaskStore.get_executable_tasks()` liefert nur freigegebene (`approval_status = approved`), vorbereitete (`ready` oder `planning`) und nicht durch offene Blocker-Abhängigkeiten gesperrte Tasks. Optional kann nach einem zugewiesenen Agenten gefiltert werden.
 
 Die bisherige lokale Datenbankstruktur gilt für diese Modellversion als verworfen. Eine neue Datenbank wird aus dem aktuellen `schema.sql` initialisiert; bestehende lokale Datenbankdateien werden nicht automatisch migriert oder gelöscht.

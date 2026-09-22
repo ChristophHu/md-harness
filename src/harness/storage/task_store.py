@@ -6,16 +6,20 @@ from typing import Any, ClassVar
 
 class TaskStore:
     TRANSITIONS: ClassVar[dict[str, set[str]]] = {
-        "idea": {"backlog", "ready", "cancelled"},
-        "created": {"ready", "cancelled"},
-        "backlog": {"planned", "ready", "cancelled"},
-        "ready": {"planned", "in_progress", "cancelled"},
-        "planned": {"in_progress", "cancelled"},
-        "in_progress": {"review", "failed", "blocked"},
-        "review": {"completed", "in_progress"},
-        "failed": {"in_progress", "cancelled"},
-        "blocked": {"in_progress", "cancelled"},
-        "completed": set(),
+        "created": {"ready", "failed", "cancelled"},
+        "ready": {"planning", "failed", "cancelled"},
+        "planning": {"executing", "waiting", "failed", "cancelled"},
+        "executing": {"validating", "planning", "waiting", "failed", "cancelled"},
+        "validating": {
+            "done",
+            "executing",
+            "planning",
+            "waiting",
+            "failed",
+            "cancelled",
+        },
+        "waiting": {"planning", "executing", "validating", "failed", "cancelled"},
+        "done": set(),
         "cancelled": set(),
     }
     FIELD_NAMES: ClassVar[set[str]] = {
@@ -90,13 +94,13 @@ class TaskStore:
 
     def get_executable_tasks(self, agent: str | None = None) -> list[Row]:
         query = """SELECT t.* FROM tasks t
-            WHERE t.approval_status = 'approved' AND t.status IN ('ready', 'planned')
+            WHERE t.approval_status = 'approved' AND t.status IN ('ready', 'planning')
             AND (? IS NULL OR t.assigned_agent = ?)
             AND NOT EXISTS (
                 SELECT 1 FROM task_dependencies d JOIN tasks dependency
                 ON dependency.id = d.depends_on_task_id
                 WHERE d.task_id = t.id AND d.dependency_type = 'blocks'
-                AND dependency.status != 'completed'
+                AND dependency.status != 'done'
             ) ORDER BY t.priority, t.id"""
         return self.connection.execute(query, (agent, agent)).fetchall()
 
@@ -130,10 +134,13 @@ class TaskStore:
             raise ValueError("task not found")
         if status not in self.TRANSITIONS.get(task["status"], set()):
             raise ValueError(f"invalid transition: {task['status']} -> {status}")
-        if status == "in_progress" and task["approval_status"] != "approved":
-            raise ValueError("task must be approved before execution")
+        if (
+            status in {"planning", "executing"}
+            and task["approval_status"] != "approved"
+        ):
+            raise ValueError("task must be approved before planning or execution")
         self.connection.execute(
-            "UPDATE tasks SET status = ?, started_at = CASE WHEN ? = 'in_progress' THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END, completed_at = CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE completed_at END WHERE id = ?",
+            "UPDATE tasks SET status = ?, started_at = CASE WHEN ? = 'executing' THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END, completed_at = CASE WHEN ? = 'done' THEN CURRENT_TIMESTAMP ELSE completed_at END WHERE id = ?",
             (status, status, status, task_id),
         )
 
@@ -200,3 +207,18 @@ class TaskStore:
             "INSERT INTO task_attempts (task_id, agent, status, error_message) VALUES (?, ?, ?, ?)",
             (task_id, agent, status, error_message),
         ).lastrowid
+
+    def attempts(self, task_id: int) -> list[Row]:
+        """Return execution attempts for a task in creation order."""
+        return self.connection.execute(
+            "SELECT * FROM task_attempts WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+
+    def complete_attempt(
+        self, attempt_id: int, status: str, error_message: str | None = None
+    ) -> None:
+        """Complete an execution attempt with its final status."""
+        self.connection.execute(
+            "UPDATE task_attempts SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ? WHERE id = ?",
+            (status, error_message, attempt_id),
+        )

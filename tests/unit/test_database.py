@@ -2,7 +2,11 @@ import sqlite3
 
 import pytest
 
-from harness.storage.database import connect, initialize_database
+from harness.storage.database import (
+    CURRENT_SCHEMA_VERSION,
+    connect,
+    initialize_database,
+)
 
 EXPECTED_TABLES = {
     "projects",
@@ -23,6 +27,16 @@ def test_initialize_database_creates_parent_directory_and_file(tmp_path):
     path = tmp_path / "nested" / "harness.sqlite"
     assert initialize_database(path) == path
     assert path.exists()
+
+
+def test_current_schema_version_is_three(tmp_path):
+    path = initialize_database(tmp_path / "harness.sqlite")
+    with connect(path) as connection:
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == CURRENT_SCHEMA_VERSION
+            == 3
+        )
 
 
 def test_initialize_database_creates_all_tables(tmp_path):

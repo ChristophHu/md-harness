@@ -4,6 +4,7 @@ Fachliche und technische Abläufe des Harnesses. Die Workflows beschreiben, wie 
 
 ## Inhalt
 
+- `mvp`: kleinster vollständig durchlaufbarer Aufgabenzyklus
 - `task-loop`: allgemeiner Aufgabenzyklus
 - `feature`: Entwicklung neuer Funktionen
 - `bugfix`: Analyse und Behebung von Fehlern

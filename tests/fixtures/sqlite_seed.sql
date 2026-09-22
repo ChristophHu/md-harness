@@ -7,7 +7,7 @@ VALUES (101, 100, 'Fixture-Teilprojekt', 'Beispielhafte fachliche Unterteilung.'
 
 INSERT INTO tasks (id, project_id, external_key, title, description, status, priority)
 VALUES
-    (1001, 100, 'FIX-001', 'Anforderungen prüfen', 'Markdown-Anforderungen auswerten', 'completed', 'high'),
+    (1001, 100, 'FIX-001', 'Anforderungen prüfen', 'Markdown-Anforderungen auswerten', 'done', 'high'),
     (1002, 100, 'FIX-002', 'Implementierung vorbereiten', 'Grundstruktur vorbereiten', 'ready', 'normal'),
     (1003, 100, 'FIX-003', 'Tests ausführen', 'Automatisierte Tests ausführen', 'created', 'low');
 

@@ -92,3 +92,59 @@ SQL-Parameter sollen grundsätzlich gebunden übergeben werden. Das verhindert S
 ## Sicherheitsprinzip
 
 Alle Tools werden über ein gemeinsames Interface beschrieben und können vor der Ausführung zentral validiert werden. Berechtigungen, Dry-Run-Verhalten und potenziell destruktive oder netzwerkbasierte Aktionen müssen vor der tatsächlichen Ausführung geprüft werden.
+
+## ToolRegistryFactory
+
+`factory.py` stellt mit `ToolRegistryFactory` eine zentrale Stelle zur Erzeugung einer konsistent konfigurierten `ToolRegistry` bereit.
+
+Die Factory:
+
+- registriert standardmäßig `filesystem`, `git` und `sqlite`
+- beschränkt alle Tools auf den angegebenen Workspace beziehungsweise die angegebene Datenbank
+- erlaubt ein explizites Teilset über `enabled_tools`
+- lehnt unbekannte Toolnamen ab
+- ermöglicht sichere Defaults für destruktive Dateioperationen
+- erzeugt reproduzierbare Registries für Produktion und Tests
+
+Beispiel:
+
+```python
+registry = ToolRegistryFactory.create(
+    workspace="/workspace/project",
+    database="/workspace/project/state/harness.sqlite",
+    enabled_tools={"filesystem", "git"},
+)
+```
+
+Die Factory erzeugt und konfiguriert Tools, führt sie aber nicht aus. Die Ausführung und die Prüfung, ob ein Tool im konkreten Plan autorisiert ist, bleiben beim Executor und bei `ToolSecurityPolicy`.
+
+## Tool Security Policy
+
+`security/tool_policy.py` autorisiert jeden Tool-Aufruf vor der Ausführung. Die Policy prüft:
+
+- ob das Tool exakt im Plan-Schritt hinterlegt ist
+- ob das Tool im Context verfügbar ist
+- ob das Permission-Level (`read`, `write`, `destructive`, `network`) erlaubt ist
+- ob Netzwerkzugriff freigegeben wurde
+- ob destruktive Operationen freigegeben wurden
+- ob der Task genehmigt ist
+- ob Toolpfade innerhalb des Workspace liegen
+- ob Schreib- oder Netzwerkoperationen im `dry_run` erlaubt sind
+
+Ein registriertes Tool ist damit nicht automatisch ausführbar. Die Registry beschreibt die verfügbaren Werkzeuge, der Plan legt die erlaubten Werkzeuge für den konkreten Lauf fest und die Security Policy erzwingt diese Grenze.
+
+### Vorteile
+
+- einheitliche Tool-Konfiguration für alle Engine-Läufe
+- zentrale Anwendung von Workspace- und Sicherheitsgrenzen
+- weniger duplizierte Initialisierungslogik
+- einfache Tests mit einem begrenzten Toolset
+- spätere Erweiterbarkeit über Konfiguration
+
+### Nachteile und Grenzen
+
+- zusätzliche Abstraktionsschicht bei wenigen Tools
+- fehlerhafte Defaults könnten zu einer zu weit gefassten Registry führen
+- die Factory darf nicht zur versteckten Ausführungs- oder Autorisierungslogik werden
+
+Der Orchestrator kann eine erzeugte Registry über `tool_registry` erhalten und daraus bei Bedarf den Executor aufbauen. Eine bereits injizierte Executor-Instanz hat Vorrang und bleibt für Spezialfälle und Tests möglich.
