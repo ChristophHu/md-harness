@@ -52,3 +52,69 @@ class TransactionManager:
                 )
         except Exception as error:
             raise TransactionError("could not persist transaction failure") from error
+
+
+class EngineUnitOfWork:
+    """Group one engine phase into a single persistence transaction."""
+
+    def __init__(
+        self,
+        manager: TransactionManager,
+        task_store: Any,
+        event_store: Any,
+        artifact_store: Any,
+    ) -> None:
+        self.manager = manager
+        self.task_store = task_store
+        self.event_store = event_store
+        self.artifact_store = artifact_store
+        manager._validate_connections((task_store, event_store, artifact_store))
+
+    @contextmanager
+    def phase(self) -> Iterator[sqlite3.Connection]:
+        """Commit all writes in the phase or roll them back together."""
+        with self.manager.atomic() as connection:
+            yield connection
+
+    def cycle_start(self, task_id: int, status: str, event_type: str) -> None:
+        with self.phase():
+            self.task_store.transition(task_id, status)
+            self.task_store.record_attempt(task_id, "running")
+            self.event_store.record(task_id, event_type)
+
+    def start_cycle(self, task_id: int, status: str, event_type: str) -> int:
+        """Atomically create the attempt and persist the cycle start."""
+        with self.phase():
+            self.task_store.transition(task_id, status)
+            attempt_id = self.task_store.record_attempt(task_id, "running")
+            self.event_store.record(task_id, event_type)
+            return attempt_id
+
+    def execution_result(self, task_id: int, attempt_id: int, result: Any) -> None:
+        with self.phase():
+            self.event_store.record(task_id, "task.execution.completed", result)
+            for path in sorted(set(result.artifacts)):
+                self.artifact_store.register(task_id, path, "execution-artifact")
+            self.task_store.complete_attempt(attempt_id, "completed")
+
+    def decision(
+        self, task_id: int, status: str, event_type: str, payload: Any = None
+    ) -> None:
+        with self.phase():
+            self.task_store.transition(task_id, status)
+            self.event_store.record(task_id, event_type, payload)
+
+    def finish_decision(
+        self,
+        task_id: int,
+        attempt_id: int,
+        attempt_status: str,
+        status: str,
+        event_type: str,
+        payload: Any = None,
+    ) -> None:
+        """Atomically finish an attempt, transition the task and record an event."""
+        with self.phase():
+            self.task_store.complete_attempt(attempt_id, attempt_status)
+            self.task_store.transition(task_id, status)
+            self.event_store.record(task_id, event_type, payload)

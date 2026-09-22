@@ -172,3 +172,27 @@ def test_sqlite_workflow_supports_cancelled(tmp_path):
         ).fetchone()[0]
         == "task.cancelled"
     )
+
+
+def test_sqlite_workflow_persists_invalid_next_action(tmp_path):
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult(ResultStatus.SUCCESS, data={"next_action": "invalid"})
+
+    orchestrator, connection, task_id = build_orchestrator(tmp_path, Validator())
+    result = orchestrator.run(task_id)
+
+    assert result.status is ResultStatus.FAILED
+    task = connection.execute(
+        "SELECT status, failed_at FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    assert task[0] == "failed"
+    assert task[1] is not None
+    events = [
+        row[0]
+        for row in connection.execute(
+            "SELECT event_type FROM task_events WHERE task_id = ?", (task_id,)
+        )
+    ]
+    assert "task.validation.invalid_next_action" in events
+    assert "task.failed" in events

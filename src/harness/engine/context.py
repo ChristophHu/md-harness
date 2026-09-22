@@ -67,6 +67,7 @@ class ExecutionContext:
     workspace: str | None = None
     dry_run: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    resume_checkpoint: dict[str, Any] | None = None
 
     def add_knowledge_document(self, document: str) -> None:
         """Add a knowledge document once while preserving insertion order."""

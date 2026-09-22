@@ -10,6 +10,7 @@ from harness.engine.result import (
     ExecutionErrorType,
     ExecutionResult,
     ExecutionStatus,
+    InvalidNextActionError,
     NextAction,
     ResultStatus,
     StepExecution,
@@ -109,6 +110,14 @@ def test_tool_execution_result_supports_error_and_exit_code() -> None:
     assert result.data == {}
     assert result.error == "permission denied"
     assert result.exit_code == 1
+
+
+def test_invalid_next_action_error_is_structured():
+    error = InvalidNextActionError("unknown")
+
+    assert error.error.error_type is ExecutionErrorType.INVALID_NEXT_ACTION
+    assert error.error.details["value"] == "unknown"
+    assert str(error) == "Unknown next_action: unknown"
 
 
 @pytest.mark.parametrize(

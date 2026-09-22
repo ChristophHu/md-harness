@@ -241,11 +241,25 @@ Ausführungsfehler werden als `ExecutionError` mit einem stabilen `ExecutionErro
 
 Der Orchestrator wertet `ExecutionResult.next_action` nach jeder Ausführung aus. `validate` ruft den Validator auf, `retry_execution` wiederholt die Ausführung mit demselben Plan, `replan` startet die Planung mit aktualisiertem Kontext erneut, `wait` beendet den Lauf im Status `waiting` und `stop` beendet ihn erfolgreich im Status `done`. Jede Entscheidung wird als `task.execution.next_action` persistiert.
 
+Unbekannte `next_action`-Werte werden als `invalid_next_action` klassifiziert. Der aktuelle Attempt und Task werden auf `failed` gesetzt; zusätzlich werden `task.execution.invalid_next_action` beziehungsweise `task.validation.invalid_next_action` sowie `task.failed` persistiert.
+
+Ein `ContextBuilder` sollte mit `ContextBuilder.from_stores(...)` aus demselben `StoreBundle` wie der Orchestrator erzeugt werden. Dadurch werden `TaskStore`, `EventStore`, `ArtifactStore` und `CheckpointStore` automatisch gemeinsam verdrahtet und auf Identität geprüft.
+
 Die Persistenz wird über `execution.persistence_mode` konfiguriert:
 
 - `required`: `TaskStore`, `EventStore` und `ArtifactStore` müssen vorhanden sein; andernfalls wird die Orchestrator-Konfiguration abgelehnt.
 - `optional`: fehlende Stores werden toleriert, die Ausführung kann ohne vollständige Persistenz laufen.
 - `disabled`: persistenzfreier Lauf, insbesondere für isolierte Tests.
+
+### Atomare Workflow-Phasen
+
+Die Persistenz wird fachlich in Phasen gebündelt:
+
+1. Cycle-Start: Taskstatus, neuer Attempt und Start-Event
+2. Execution-Ergebnis: Execution-Event, Artefakte und Attempt-Abschluss
+3. Workflow-Entscheidung: nächster Status und Folge-Event
+
+Jede Phase wird durch `EngineUnitOfWork` atomar committed oder vollständig zurückgerollt. Die Toolausführung selbst liegt außerhalb der SQLite-Transaktion. Bei einem Persistenzfehler wird eine separate Fehlertransaktion verwendet, die `task.persistence.failed` und den Status `failed` speichert.
 
 SQLite enthält alle fachlich relevanten Informationen für einen Task und seine Abnahme. Die Daten sind auf mehrere Tabellen verteilt und werden für einen Engine-Lauf zu einem `ExecutionContext` zusammengeführt.
 

@@ -50,6 +50,10 @@ Zusätzlich existieren Indizes für Status/Priorität, Projekt- und Task-Hierarc
 
 `TransactionManager` koordiniert atomare SQLite-Blöcke für die Stores. `TaskStore`, `EventStore` und `ArtifactStore` müssen dafür dieselbe `sqlite3.Connection` verwenden. Erfolgreiche Blöcke werden committed; bei Exceptions erfolgt ein Rollback. Nach einem Rollback kann eine separate Fehlertransaktion `task.persistence.failed` und den fehlgeschlagenen Taskstatus persistieren.
 
+`StoreFactory.create(connection)` erzeugt dafür ein vollständiges `StoreBundle` mit allen drei Stores und dem zugehörigen `TransactionManager`. Der Orchestrator kann dieses Bundle über `stores=` erhalten und akzeptiert dann keine parallel übergebenen Einzel-Stores.
+
+`EngineUnitOfWork` liegt fachlich über dem `TransactionManager`. Sie bündelt die Persistenz eines Cycle-Starts, eines Execution-Ergebnisses und einer Workflow-Entscheidung jeweils in einer Transaktion. Die eigentliche Toolausführung bleibt außerhalb der Transaktion, da externe Seiteneffekte nicht durch SQLite zurückgerollt werden können.
+
 Der operative Lebenszyklus bildet den Engine-Workflow direkt ab:
 
 ```text
@@ -100,3 +104,5 @@ Die aktuelle Storage- und Gesamt-Coverage beträgt 100 %.
 `TaskStore.get_executable_tasks()` liefert nur freigegebene (`approval_status = approved`), vorbereitete (`ready` oder `planning`) und nicht durch offene Blocker-Abhängigkeiten gesperrte Tasks. Optional kann nach einem zugewiesenen Agenten gefiltert werden.
 
 Die bisherige lokale Datenbankstruktur gilt für diese Modellversion als verworfen. Eine neue Datenbank wird aus dem aktuellen `schema.sql` initialisiert; bestehende lokale Datenbankdateien werden nicht automatisch migriert oder gelöscht.
+
+`CheckpointStore` persistiert Resume-Punkte wartender Tasks mit Phase, nächster Aktion, Attempt, Grund und Zeitpunkten. `Orchestrator.resume()` markiert einen vorhandenen Checkpoint als wieder aufgenommen und startet den Task erneut mit dem gespeicherten Kontext.

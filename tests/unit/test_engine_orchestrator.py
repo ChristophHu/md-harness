@@ -1,5 +1,7 @@
 """Tests for the engine orchestration boundary."""
 
+import sqlite3
+
 import pytest
 
 from harness.config import ConfigError, PersistenceMode
@@ -434,6 +436,101 @@ def test_orchestrator_stops_on_unknown_next_action():
     assert result.status is ResultStatus.FAILED
 
 
+def test_orchestrator_persists_invalid_execution_action_as_failure():
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(ExecutionStatus.SUCCESS, next_action="bad"),
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=object(),
+    ).run(22)
+
+    assert result.status is ResultStatus.FAILED
+    assert result.data["error"]["error_type"] == "invalid_next_action"
+
+
+def test_orchestrator_persists_invalid_validation_action_as_failure():
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed", execution=ExecutionResult(ExecutionStatus.SUCCESS)
+            )
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult(ResultStatus.SUCCESS, data={"next_action": "bad"})
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+    ).run(23)
+
+    assert result.status is ResultStatus.FAILED
+    assert result.data["error"]["error_type"] == "invalid_next_action"
+
+
+def test_action_accepts_existing_next_action_enum():
+    from harness.engine.result import NextAction
+
+    assert Orchestrator._action(NextAction.VALIDATE) is NextAction.VALIDATE
+
+
+def test_resume_marks_checkpoint_and_runs():
+    from harness.engine.result import NextAction
+
+    class Checkpoint:
+        def __init__(self, value):
+            self.value = value
+            self.marked = False
+
+        def get(self, _task_id):
+            return self.value
+
+        def mark_resumed(self, _task_id):
+            self.marked = True
+
+        def save(self, *_args, **_kwargs):
+            return 1
+
+    checkpoint = Checkpoint({"resumed_at": None})
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=checkpoint
+    )
+    orchestrator.run = lambda _task_id: EngineResult.success("resumed")
+    orchestrator._save_checkpoint(1, "waiting", NextAction.WAIT, 4, "approval")
+    assert orchestrator.resume(1).successful is True
+    assert checkpoint.marked is True
+
+
+def test_resume_without_checkpoint_falls_back_to_run():
+    checkpoint = type("Checkpoint", (), {"get": lambda self, _task_id: None})()
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=checkpoint
+    )
+    orchestrator.run = lambda _task_id: EngineResult.success("replanned")
+    assert orchestrator.resume(1).message == "replanned"
+
+
 def test_orchestrator_stops_after_maximum_cycles():
     class Planner:
         def plan(self, _context):
@@ -580,6 +677,25 @@ def test_orchestrator_manages_attempt_helpers():
     assert calls == [("start", 4, "running"), ("finish", 9, "failed", "error")]
 
 
+def test_orchestrator_attempt_helper_uses_transaction_manager():
+    connection = sqlite3.connect(":memory:")
+
+    class Attempts:
+        def __init__(self):
+            self.connection = connection
+
+        def record_attempt(self, _task_id, _status):
+            return 7
+
+    store = Attempts()
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=store,
+        transaction_manager=TransactionManager(connection, store),
+    )
+    assert orchestrator._start_attempt(4) == 7
+
+
 def test_orchestrator_ignores_missing_artifact_payload():
     class Artifacts:
         def register(self, *_args):
@@ -590,6 +706,30 @@ def test_orchestrator_ignores_missing_artifact_payload():
     )
 
     orchestrator._register_artifacts(1, EngineResult.success("no execution"))
+    orchestrator._persist_execution(1, EngineResult.success("no execution"))
+
+
+def test_orchestrator_registers_artifact_payload_without_unit_of_work():
+    registered = []
+
+    class Artifacts:
+        def register(self, *args):
+            registered.append(args)
+
+    from harness.engine.result import ExecutionResult, ExecutionStatus, StepExecution
+
+    result = EngineResult.success(
+        "executed",
+        execution=ExecutionResult(
+            ExecutionStatus.SUCCESS,
+            artifacts=["a.txt"],
+            steps=[StepExecution("step", ExecutionStatus.SUCCESS, artifacts=["b.txt"])],
+        ),
+    )
+    Orchestrator(
+        StubContextBuilder(object()), artifact_store=Artifacts()
+    )._register_artifacts(1, result)
+    assert [item[1] for item in registered] == ["a.txt", "b.txt"]
 
 
 @pytest.mark.parametrize(

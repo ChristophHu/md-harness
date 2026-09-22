@@ -44,6 +44,7 @@ class ExecutionErrorType(StrEnum):
     TOOL_FAILURE = "tool_failure"
     WORKSPACE_ERROR = "workspace_error"
     EXTERNAL_BLOCKER = "external_blocker"
+    INVALID_NEXT_ACTION = "invalid_next_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +57,18 @@ class ExecutionError:
     step_id: str | None = None
     retryable: bool = False
     details: dict[str, Any] = field(default_factory=dict)
+
+
+class InvalidNextActionError(ValueError):
+    """Raised when a stage returns an unsupported workflow action."""
+
+    def __init__(self, value: object) -> None:
+        self.error = ExecutionError(
+            ExecutionErrorType.INVALID_NEXT_ACTION,
+            f"Unknown next_action: {value}",
+            details={"value": value},
+        )
+        super().__init__(self.error.message)
 
 
 def action_for_error(error: ExecutionError) -> NextAction:

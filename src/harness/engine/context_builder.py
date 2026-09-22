@@ -27,6 +27,7 @@ class ContextBuilder:
         knowledge_loader: Callable[[int], Iterable[str]] | None = None,
         tool_registry: Any | None = None,
         dry_run: bool = False,
+        checkpoint_store: Any | None = None,
     ) -> None:
         self.task_store = task_store
         self.event_store = event_store
@@ -35,6 +36,21 @@ class ContextBuilder:
         self.knowledge_loader = knowledge_loader
         self.tool_registry = tool_registry
         self.dry_run = dry_run
+        self.checkpoint_store = checkpoint_store
+
+    @classmethod
+    def from_stores(
+        cls, stores: Any, project_store: Any, **options: Any
+    ) -> ContextBuilder:
+        """Create a builder wired to every store in one StoreBundle."""
+        return cls(
+            stores.task_store,
+            stores.event_store,
+            stores.artifact_store,
+            project_store,
+            checkpoint_store=stores.checkpoint_store,
+            **options,
+        )
 
     def build(self, task_id: int) -> ExecutionContext:
         """Load all sources and create a consistent task snapshot."""
@@ -80,6 +96,12 @@ class ContextBuilder:
             last_plan=last_plan,
             last_validation=last_validation,
             replanning_reasons=replanning_reasons,
+            resume_checkpoint=(
+                dict(self.checkpoint_store.get(task_id))
+                if self.checkpoint_store is not None
+                and self.checkpoint_store.get(task_id) is not None
+                else None
+            ),
         )
         if self.knowledge_loader is not None:
             context.knowledge_documents.extend(self.knowledge_loader(task_id))

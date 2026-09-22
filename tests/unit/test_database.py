@@ -29,13 +29,13 @@ def test_initialize_database_creates_parent_directory_and_file(tmp_path):
     assert path.exists()
 
 
-def test_current_schema_version_is_four(tmp_path):
+def test_current_schema_version_is_five(tmp_path):
     path = initialize_database(tmp_path / "harness.sqlite")
     with connect(path) as connection:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == CURRENT_SCHEMA_VERSION
-            == 4
+            == 5
         )
 
 
