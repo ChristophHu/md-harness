@@ -140,8 +140,14 @@ class TaskStore:
         ):
             raise ValueError("task must be approved before planning or execution")
         self.connection.execute(
-            "UPDATE tasks SET status = ?, started_at = CASE WHEN ? = 'executing' THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END, completed_at = CASE WHEN ? = 'done' THEN CURRENT_TIMESTAMP ELSE completed_at END WHERE id = ?",
-            (status, status, status, task_id),
+            """UPDATE tasks SET status = ?,
+                started_at = CASE WHEN ? = 'executing' THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END,
+                planning_started_at = CASE WHEN ? = 'planning' THEN COALESCE(planning_started_at, CURRENT_TIMESTAMP) ELSE planning_started_at END,
+                validation_started_at = CASE WHEN ? = 'validating' THEN COALESCE(validation_started_at, CURRENT_TIMESTAMP) ELSE validation_started_at END,
+                failed_at = CASE WHEN ? = 'failed' THEN CURRENT_TIMESTAMP ELSE failed_at END,
+                completed_at = CASE WHEN ? = 'done' THEN CURRENT_TIMESTAMP ELSE completed_at END
+                WHERE id = ?""",
+            (status, status, status, status, status, status, task_id),
         )
 
     def add_dependency(

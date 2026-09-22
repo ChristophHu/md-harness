@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,14 @@ class ConfigError(ValueError):
     """Raised when configuration values are invalid."""
 
 
+class PersistenceMode(StrEnum):
+    """Controls whether engine state must be persisted."""
+
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+    DISABLED = "disabled"
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionConfig:
     """Limits and switches for one engine execution."""
@@ -20,8 +29,18 @@ class ExecutionConfig:
     dry_run: bool = True
     max_retries: int = 2
     max_cycles: int = 3
+    persistence_mode: PersistenceMode = PersistenceMode.OPTIONAL
 
     def __post_init__(self) -> None:
+        if not isinstance(self.persistence_mode, PersistenceMode):
+            try:
+                object.__setattr__(
+                    self, "persistence_mode", PersistenceMode(self.persistence_mode)
+                )
+            except ValueError as error:
+                raise ConfigError(
+                    "persistence_mode must be required, optional or disabled"
+                ) from error
         if self.max_retries < 0:
             raise ConfigError("max_retries must be non-negative")
         if self.max_cycles < 1:
@@ -43,7 +62,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     settings = ExecutionConfig(
         **{
             key: execution[key]
-            for key in ("dry_run", "max_retries", "max_cycles")
+            for key in ("dry_run", "max_retries", "max_cycles", "persistence_mode")
             if key in execution
         }
     )

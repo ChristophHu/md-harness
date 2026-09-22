@@ -7,9 +7,19 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from harness.engine.result import ExecutionErrorType
+
 
 class ToolError(RuntimeError):
     """Base error for tool registration and execution."""
+
+    def __init__(
+        self,
+        message: str,
+        error_type: ExecutionErrorType = ExecutionErrorType.TOOL_FAILURE,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class PermissionLevel(StrEnum):
@@ -60,7 +70,8 @@ class Tool(ABC):
         unknown = set(arguments) - allowed
         if unknown:
             raise ToolError(
-                f"unknown arguments for {self.tool_name}: {sorted(unknown)}"
+                f"unknown arguments for {self.tool_name}: {sorted(unknown)}",
+                ExecutionErrorType.INVALID_ARGUMENTS,
             )
         missing = {
             parameter.name
@@ -69,7 +80,8 @@ class Tool(ABC):
         }
         if missing:
             raise ToolError(
-                f"missing arguments for {self.tool_name}: {sorted(missing)}"
+                f"missing arguments for {self.tool_name}: {sorted(missing)}",
+                ExecutionErrorType.INVALID_ARGUMENTS,
             )
 
     @abstractmethod
@@ -93,7 +105,9 @@ class ToolRegistry:
         try:
             return self._tools[name]
         except KeyError as error:
-            raise ToolError(f"unknown tool: {name}") from error
+            raise ToolError(
+                f"unknown tool: {name}", ExecutionErrorType.TOOL_NOT_FOUND
+            ) from error
 
     def list(self) -> list[ToolDefinition]:
         return [tool.definition for tool in self._tools.values()]

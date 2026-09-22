@@ -35,6 +35,46 @@ class NextAction(StrEnum):
     STOP = "stop"
 
 
+class ExecutionErrorType(StrEnum):
+    """Stable categories used to select the next orchestration action."""
+
+    TOOL_NOT_FOUND = "tool_not_found"
+    UNAUTHORIZED_TOOL = "unauthorized_tool"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    TOOL_FAILURE = "tool_failure"
+    WORKSPACE_ERROR = "workspace_error"
+    EXTERNAL_BLOCKER = "external_blocker"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionError:
+    """Structured execution failure passed between engine stages."""
+
+    error_type: ExecutionErrorType
+    message: str
+    tool: str | None = None
+    step_id: str | None = None
+    retryable: bool = False
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def action_for_error(error: ExecutionError) -> NextAction:
+    """Map a structured error to the next safe workflow action."""
+    if error.error_type is ExecutionErrorType.EXTERNAL_BLOCKER:
+        return NextAction.WAIT
+    if error.error_type is ExecutionErrorType.WORKSPACE_ERROR:
+        if error.details.get("permission_required"):
+            return (
+                NextAction.WAIT
+                if error.details.get("approval_expected")
+                else NextAction.REPLAN
+            )
+        return NextAction.RETRY_EXECUTION if error.retryable else NextAction.REPLAN
+    if error.error_type is ExecutionErrorType.TOOL_FAILURE and error.retryable:
+        return NextAction.RETRY_EXECUTION
+    return NextAction.REPLAN
+
+
 @dataclass(slots=True)
 class EngineResult:
     """Portable result passed between engine components and the orchestrator."""
@@ -108,6 +148,7 @@ class ExecutionResult:
     changed_files: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    error_details: list[ExecutionError] = field(default_factory=list)
     next_action: NextAction | None = None
     attempt_id: int | None = None
     dry_run: bool = False

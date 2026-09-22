@@ -44,7 +44,7 @@ Das Schema umfasst:
 
 Projekte können über `projects.parent_id` hierarchisch verschachtelt werden. Aufgaben können über `tasks.parent_id` in Epics, Features, Tasks und atomare Subtasks zerlegt werden. `approval_status` ist bewusst vom operativen `status` getrennt: Ein Task darf nur nach expliziter Freigabe ausführbar werden.
 
-Zusätzlich existieren Indizes für Status/Priorität, Projekt- und Task-Hierarchien, ausführbare Tasks, Events, Agentenversuche, Kriterien und Artefakte. Trigger aktualisieren `tasks.updated_at` und `projects.updated_at` bei relevanten Änderungen automatisch.
+Zusätzlich existieren Indizes für Status/Priorität, Projekt- und Task-Hierarchien, ausführbare Tasks, Events, Agentenversuche, Kriterien und Artefakte. Trigger aktualisieren `tasks.updated_at` und `projects.updated_at` bei relevanten Änderungen automatisch. `planning_started_at`, `validation_started_at` und `failed_at` markieren die jeweiligen Prozessphasen.
 
 Der operative Lebenszyklus bildet den Engine-Workflow direkt ab:
 

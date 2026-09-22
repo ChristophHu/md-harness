@@ -7,6 +7,7 @@ from pathlib import Path
 
 from harness.engine.context import ExecutionContext
 from harness.engine.plan import PlanStep
+from harness.engine.result import ExecutionErrorType
 from harness.tools.base import PermissionLevel, Tool, ToolError
 
 
@@ -29,19 +30,30 @@ class ToolSecurityPolicy:
         """Raise ``ToolError`` when a plan step may not use the tool."""
         if plan_step.tool != tool.tool_name:
             raise ToolError(
-                f"tool '{tool.tool_name}' is not authorized by plan step '{plan_step.id}'"
+                f"tool '{tool.tool_name}' is not authorized by plan step '{plan_step.id}'",
+                ExecutionErrorType.UNAUTHORIZED_TOOL,
             )
         if tool.tool_name not in context.available_tools:
-            raise ToolError(f"tool '{tool.tool_name}' is not available in the context")
+            raise ToolError(
+                f"tool '{tool.tool_name}' is not available in the context",
+                ExecutionErrorType.TOOL_NOT_FOUND,
+            )
         permission = tool.definition.permission
         if permission is PermissionLevel.NETWORK and not self.allow_network:
-            raise ToolError(f"network permission denied for tool '{tool.tool_name}'")
+            raise ToolError(
+                f"network permission denied for tool '{tool.tool_name}'",
+                ExecutionErrorType.UNAUTHORIZED_TOOL,
+            )
         if permission is PermissionLevel.DESTRUCTIVE and not self.allow_destructive:
             raise ToolError(
-                f"destructive permission denied for tool '{tool.tool_name}'"
+                f"destructive permission denied for tool '{tool.tool_name}'",
+                ExecutionErrorType.UNAUTHORIZED_TOOL,
             )
         if self.require_approval and context.approval_status != "approved":
-            raise ToolError("tool execution requires task approval")
+            raise ToolError(
+                "tool execution requires task approval",
+                ExecutionErrorType.EXTERNAL_BLOCKER,
+            )
         if (
             context.dry_run
             and permission
@@ -52,14 +64,20 @@ class ToolSecurityPolicy:
             }
             and not self.dry_run_allows_writes
         ):
-            raise ToolError(f"tool '{tool.tool_name}' is not allowed during dry-run")
+            raise ToolError(
+                f"tool '{tool.tool_name}' is not allowed during dry-run",
+                ExecutionErrorType.UNAUTHORIZED_TOOL,
+            )
         if self.enforce_workspace:
             self._check_workspace(tool, context)
 
     @staticmethod
     def _check_workspace(tool: Tool, context: ExecutionContext) -> None:
         if not context.workspace:
-            raise ToolError("workspace is required for tool execution")
+            raise ToolError(
+                "workspace is required for tool execution",
+                ExecutionErrorType.WORKSPACE_ERROR,
+            )
         workspace = Path(context.workspace).expanduser().resolve()
         for attribute in ("root", "path"):
             value = getattr(tool, attribute, None)
@@ -69,5 +87,6 @@ class ToolSecurityPolicy:
                 Path(value).expanduser().resolve().relative_to(workspace)
             except ValueError as error:
                 raise ToolError(
-                    f"tool '{tool.tool_name}' is outside the configured workspace"
+                    f"tool '{tool.tool_name}' is outside the configured workspace",
+                    ExecutionErrorType.WORKSPACE_ERROR,
                 ) from error

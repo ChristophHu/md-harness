@@ -3,7 +3,7 @@
 from harness.engine.context import ExecutionContext
 from harness.engine.executor import Executor
 from harness.engine.plan import ExecutionPlan, PlanStep
-from harness.engine.result import ExecutionStatus, ResultStatus
+from harness.engine.result import ExecutionStatus, ResultStatus, ToolExecutionResult
 from harness.security.tool_policy import ToolSecurityPolicy
 from harness.tools.base import (
     PermissionLevel,
@@ -61,6 +61,41 @@ def test_executor_supports_noop_steps():
 
     assert result.successful is True
     assert result.data["execution"].steps[0].result == "no-op"
+
+
+def test_executor_marks_explicitly_skipped_steps():
+    plan = ExecutionPlan("Task", [PlanStep("skip", "Skip", "skip")])
+
+    result = Executor(ToolRegistry()).execute(context(available_tools=[]), plan)
+
+    step = result.data["execution"].steps[0]
+    assert step.status is ExecutionStatus.SKIPPED
+    assert step.result == "skipped"
+
+
+def test_executor_preserves_tool_output_exit_code_and_changes():
+    class ReportingTool(EchoTool):
+        def execute(self, **_arguments):
+            return ToolExecutionResult(
+                output="updated",
+                exit_code=0,
+                data={"changed_files": ["src/app.py"], "artifacts": ["report.txt"]},
+            )
+
+    registry = ToolRegistry()
+    registry.register(ReportingTool())
+    plan = ExecutionPlan(
+        "Task", [PlanStep("step", "Report", "execute", "echo", {"value": 1})]
+    )
+
+    result = Executor(registry).execute(context(), plan)
+    execution = result.data["execution"]
+    tool_result = execution.steps[0].result
+
+    assert tool_result.output == "updated"
+    assert tool_result.exit_code == 0
+    assert execution.changed_files == ["src/app.py"]
+    assert execution.artifacts == ["report.txt"]
 
 
 def test_executor_waits_without_workspace():

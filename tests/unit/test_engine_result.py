@@ -2,14 +2,19 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from harness.engine.result import (
     EngineResult,
+    ExecutionError,
+    ExecutionErrorType,
     ExecutionResult,
     ExecutionStatus,
     NextAction,
     ResultStatus,
     StepExecution,
     ToolExecutionResult,
+    action_for_error,
 )
 
 
@@ -104,3 +109,54 @@ def test_tool_execution_result_supports_error_and_exit_code() -> None:
     assert result.data == {}
     assert result.error == "permission denied"
     assert result.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "action"),
+    [
+        (
+            ExecutionError(ExecutionErrorType.EXTERNAL_BLOCKER, "blocked"),
+            NextAction.WAIT,
+        ),
+        (
+            ExecutionError(ExecutionErrorType.WORKSPACE_ERROR, "lock", retryable=True),
+            NextAction.RETRY_EXECUTION,
+        ),
+        (
+            ExecutionError(ExecutionErrorType.WORKSPACE_ERROR, "invalid"),
+            NextAction.REPLAN,
+        ),
+        (
+            ExecutionError(
+                ExecutionErrorType.WORKSPACE_ERROR,
+                "approval",
+                details={"permission_required": True, "approval_expected": True},
+            ),
+            NextAction.WAIT,
+        ),
+        (
+            ExecutionError(
+                ExecutionErrorType.WORKSPACE_ERROR,
+                "permission",
+                details={"permission_required": True},
+            ),
+            NextAction.REPLAN,
+        ),
+        (
+            ExecutionError(
+                ExecutionErrorType.TOOL_FAILURE, "temporary", retryable=True
+            ),
+            NextAction.RETRY_EXECUTION,
+        ),
+        (
+            ExecutionError(ExecutionErrorType.TOOL_FAILURE, "permanent"),
+            NextAction.REPLAN,
+        ),
+        (
+            ExecutionError(ExecutionErrorType.INVALID_ARGUMENTS, "bad args"),
+            NextAction.REPLAN,
+        ),
+    ],
+)
+def test_action_for_structured_execution_error(error, action) -> None:
+    assert action_for_error(error) is action

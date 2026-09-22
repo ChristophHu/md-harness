@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
+from harness.config import ConfigError, PersistenceMode
 from harness.engine.context import ExecutionContext
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
@@ -33,6 +34,7 @@ class Orchestrator:
         artifact_store: Any | None = None,
         max_cycles: int = 3,
         max_retries: int = 2,
+        persistence_mode: PersistenceMode | str = PersistenceMode.OPTIONAL,
     ) -> None:
         self.context_builder = context_builder
         self.planner = planner
@@ -49,6 +51,18 @@ class Orchestrator:
         self.task_store = task_store
         self.event_store = event_store
         self.artifact_store = artifact_store
+        try:
+            self.persistence_mode = PersistenceMode(persistence_mode)
+        except ValueError as error:
+            raise ConfigError(
+                "persistence_mode must be required, optional or disabled"
+            ) from error
+        if self.persistence_mode is PersistenceMode.REQUIRED and not all(
+            (task_store, event_store, artifact_store)
+        ):
+            raise ConfigError(
+                "required persistence mode needs task, event and artifact stores"
+            )
         if max_cycles < 1:
             raise ValueError("max_cycles must be positive")
         if max_retries < 0:
@@ -91,6 +105,38 @@ class Orchestrator:
                 task_id, "task.execution.completed", self._serialize(execution_result)
             )
             self._register_artifacts(task_id, execution_result)
+            execution = execution_result.data.get("execution")
+            next_action = self._action(
+                getattr(execution, "next_action", None)
+                or execution_result.data.get("next_action")
+            )
+            if execution_result.successful and next_action in {
+                NextAction.WAIT,
+                NextAction.STOP,
+            }:
+                self._event(
+                    task_id,
+                    "task.execution.next_action",
+                    {"next_action": next_action.value},
+                )
+                self._finish_attempt(
+                    attempt_id,
+                    "waiting" if next_action is NextAction.WAIT else "completed",
+                )
+                if next_action is NextAction.WAIT:
+                    self._transition(task_id, "waiting")
+                    self._event(task_id, "task.waiting")
+                else:
+                    self._transition(task_id, "done")
+                    self._event(task_id, "task.done")
+                if next_action is NextAction.WAIT:
+                    return EngineResult(
+                        status=ResultStatus.WAITING,
+                        message=execution_result.message,
+                        errors=execution_result.errors,
+                        data=execution_result.data,
+                    )
+                return execution_result
             if not execution_result.successful:
                 self._event(
                     task_id,
@@ -100,7 +146,12 @@ class Orchestrator:
                         "errors": execution_result.errors,
                     },
                 )
-                next_action = self._action(execution_result.data.get("next_action"))
+                self._event(
+                    task_id,
+                    "task.execution.next_action",
+                    {"next_action": next_action.value if next_action else None},
+                )
+                next_action = next_action or NextAction.REPLAN
                 if next_action in {NextAction.REPLAN, NextAction.RETRY_EXECUTION}:
                     if next_action is NextAction.RETRY_EXECUTION:
                         retries += 1
@@ -119,11 +170,57 @@ class Orchestrator:
                     )
                     action = next_action
                     continue
+                if next_action is NextAction.WAIT:
+                    self._finish_attempt(
+                        attempt_id, "waiting", execution_result.message
+                    )
+                    self._transition(task_id, "waiting")
+                    self._event(task_id, "task.waiting")
+                    return EngineResult(
+                        status=ResultStatus.WAITING,
+                        message=execution_result.message,
+                        errors=execution_result.errors,
+                        data=execution_result.data,
+                    )
+                if next_action is NextAction.STOP:
+                    self._finish_attempt(attempt_id, "failed", execution_result.message)
+                    self._fail_task(
+                        task_id, execution_result.message, "task.execution.failed"
+                    )
+                    return execution_result
                 self._finish_attempt(attempt_id, "failed", execution_result.message)
                 self._fail_task(
                     task_id, execution_result.message, "task.execution.failed"
                 )
                 return execution_result
+
+            self._event(
+                task_id,
+                "task.execution.next_action",
+                {"next_action": (next_action or NextAction.VALIDATE).value},
+            )
+            if next_action is NextAction.RETRY_EXECUTION:
+                retries += 1
+                if retries > self.max_retries:
+                    result = EngineResult.failure("Maximum execution retries exceeded.")
+                    self._finish_attempt(attempt_id, "failed", result.message)
+                    self._fail_task(task_id, result.message, "task.failed")
+                    return result
+                self._finish_attempt(attempt_id, "failed", execution_result.message)
+                self._event(
+                    task_id,
+                    "task.retrying",
+                    {"retry_number": retries, "max_retries": self.max_retries},
+                )
+                action = NextAction.RETRY_EXECUTION
+                continue
+            if next_action is NextAction.REPLAN:
+                self._finish_attempt(attempt_id, "failed", execution_result.message)
+                self._event(
+                    task_id, "task.replanning", {"reason": "execution requested replan"}
+                )
+                action = NextAction.REPLAN
+                continue
 
             self._transition(task_id, "validating")
             self._event(task_id, "task.validating")

@@ -2,19 +2,19 @@
 
 import pytest
 
-from harness.config import ConfigError, ExecutionConfig, load_config
+from harness.config import ConfigError, ExecutionConfig, PersistenceMode, load_config
 
 
 def test_execution_config_defaults_and_load(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(
-        "project: {}\nexecution:\n  dry_run: false\n  max_retries: 4\n  max_cycles: 6\n",
+        "project: {}\nexecution:\n  dry_run: false\n  max_retries: 4\n  max_cycles: 6\n  persistence_mode: required\n",
         encoding="utf-8",
     )
 
     config = load_config(path)
 
-    assert config["execution"] == ExecutionConfig(False, 4, 6)
+    assert config["execution"] == ExecutionConfig(False, 4, 6, PersistenceMode.REQUIRED)
 
 
 def test_execution_config_rejects_invalid_limits():
@@ -22,6 +22,11 @@ def test_execution_config_rejects_invalid_limits():
         ExecutionConfig(max_retries=-1)
     with pytest.raises(ConfigError, match="max_cycles"):
         ExecutionConfig(max_cycles=0)
+
+
+def test_execution_config_rejects_invalid_persistence_mode():
+    with pytest.raises(ConfigError, match="persistence_mode"):
+        ExecutionConfig(persistence_mode="invalid")
 
 
 def test_load_config_handles_defaults_and_invalid_shapes(tmp_path):

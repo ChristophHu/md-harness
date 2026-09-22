@@ -235,6 +235,18 @@ Die Engine koordiniert den Ablauf, besitzt aber nicht die zugrunde liegenden Dat
 
 ## ExecutionContext und SQLite
 
+### Fehlerklassifikation
+
+Ausführungsfehler werden als `ExecutionError` mit einem stabilen `ExecutionErrorType`, optionalem Tool- und Step-Bezug sowie Retry- und Detailinformationen zurückgegeben. Die zentrale Klassifikation leitet daraus die nächste Aktion ab: Tool- und Policy-Fehler führen zu `replan`, temporäre Tool- oder Workspace-Fehler zu `retry_execution`, externe Blocker zu `wait` und eine fehlerfreie Ausführung zu `validate`. Workspace-Fehler mit erwarteter Berechtigungsfreigabe werden ebenfalls in `wait` überführt; fehlende oder ungültige Workspaces führen zu `replan`.
+
+Der Orchestrator wertet `ExecutionResult.next_action` nach jeder Ausführung aus. `validate` ruft den Validator auf, `retry_execution` wiederholt die Ausführung mit demselben Plan, `replan` startet die Planung mit aktualisiertem Kontext erneut, `wait` beendet den Lauf im Status `waiting` und `stop` beendet ihn erfolgreich im Status `done`. Jede Entscheidung wird als `task.execution.next_action` persistiert.
+
+Die Persistenz wird über `execution.persistence_mode` konfiguriert:
+
+- `required`: `TaskStore`, `EventStore` und `ArtifactStore` müssen vorhanden sein; andernfalls wird die Orchestrator-Konfiguration abgelehnt.
+- `optional`: fehlende Stores werden toleriert, die Ausführung kann ohne vollständige Persistenz laufen.
+- `disabled`: persistenzfreier Lauf, insbesondere für isolierte Tests.
+
 SQLite enthält alle fachlich relevanten Informationen für einen Task und seine Abnahme. Die Daten sind auf mehrere Tabellen verteilt und werden für einen Engine-Lauf zu einem `ExecutionContext` zusammengeführt.
 
 Die Tabelle `tasks` liefert die Kerndaten:
@@ -242,7 +254,8 @@ Die Tabelle `tasks` liefert die Kerndaten:
 ```text
 id, project_id, parent_id, external_key, title, description,
 task_type, status, priority, approval_status, assigned_agent,
-created_at, updated_at, started_at, completed_at
+created_at, updated_at, started_at, planning_started_at,
+validation_started_at, failed_at, completed_at
 ```
 
 Die Abnahme und technische Validierung werden getrennt modelliert:

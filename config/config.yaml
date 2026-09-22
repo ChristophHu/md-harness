@@ -51,6 +51,7 @@ execution:
   dry_run: true
   max_retries: 2
   max_cycles: 3
+  persistence_mode: required
 
 quality:
   enabled: true

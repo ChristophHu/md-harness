@@ -29,7 +29,7 @@ def db(tmp_path):
 def test_database_transaction_health_version_and_backup(tmp_path):
     path = db(tmp_path)
     assert healthcheck(path) is True
-    assert schema_version(path) == 3
+    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 4
     with transaction(path) as connection:
         connection.execute("INSERT INTO projects (name, path) VALUES ('p', '/p')")
     with transaction(path) as connection:
@@ -128,14 +128,27 @@ def test_project_and_task_stores_cover_task_lifecycle(tmp_path):
         tasks.transition(task_id, "ready")
         tasks.approve(task_id, "reviewer")
         tasks.transition(task_id, "planning")
+        assert tasks.get(task_id)["planning_started_at"] is not None
         tasks.transition(task_id, "executing")
         tasks.transition(task_id, "validating")
+        assert tasks.get(task_id)["validation_started_at"] is not None
         tasks.transition(task_id, "done")
         assert tasks.get(task_id)["completed_at"] is not None
         with pytest.raises(ValueError, match="invalid transition"):
             tasks.transition(task_id, "ready")
         with pytest.raises(ValueError, match="not found"):
             tasks.transition(999, "ready")
+
+
+def test_failed_transition_records_failure_timestamp(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        tasks = TaskStore(connection)
+        task_id = tasks.create("Task")
+        tasks.transition(task_id, "ready")
+        tasks.transition(task_id, "failed")
+        assert tasks.get(task_id)["failed_at"] is not None
 
 
 def test_task_dependencies_criteria_and_attempts(tmp_path):

@@ -45,7 +45,10 @@ def build_orchestrator(tmp_path, validator):
             )
             execution.steps.append(
                 StepExecution(
-                    "report", ExecutionStatus.SUCCESS, artifacts=["step-report.txt"]
+                    "report",
+                    ExecutionStatus.SUCCESS,
+                    artifacts=["step-report.txt"],
+                    changed_files=["src/generated.py"],
                 )
             )
             return EngineResult.success("executed", execution=execution)
@@ -71,7 +74,8 @@ def test_sqlite_workflow_persists_success_attempt_and_events(tmp_path):
     result = orchestrator.run(task_id)
 
     task = connection.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, created_at, updated_at, started_at, planning_started_at, validation_started_at, completed_at, failed_at FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     attempt = connection.execute(
         "SELECT status, completed_at FROM task_attempts WHERE task_id = ?", (task_id,)
@@ -84,6 +88,8 @@ def test_sqlite_workflow_persists_success_attempt_and_events(tmp_path):
     ]
     assert result.status is ResultStatus.SUCCESS
     assert task[0] == "done"
+    assert all(task[index] is not None for index in range(1, 7))
+    assert task[7] is None
     assert attempt[0] == "completed"
     assert attempt[1] is not None
     assert "task.plan.created" in events
@@ -96,6 +102,13 @@ def test_sqlite_workflow_persists_success_attempt_and_events(tmp_path):
         )
     ]
     assert artifacts == ["report.txt", "step-report.txt"]
+    assert (
+        "src/generated.py"
+        in connection.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'task.execution.completed'",
+            (task_id,),
+        ).fetchone()[0]
+    )
 
 
 def test_sqlite_workflow_persists_validation_failure_and_failed_status(tmp_path):
@@ -113,10 +126,16 @@ def test_sqlite_workflow_persists_validation_failure_and_failed_status(tmp_path)
     assert result.status is ResultStatus.FAILED
     assert (
         connection.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, failed_at, planning_started_at, validation_started_at FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()[0]
         == "failed"
     )
+    failed_task = connection.execute(
+        "SELECT failed_at, planning_started_at, validation_started_at FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    assert all(value is not None for value in failed_task)
     events = [
         row[0]
         for row in connection.execute(

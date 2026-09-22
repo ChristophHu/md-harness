@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TEXT,
+    planning_started_at TEXT,
+    validation_started_at TEXT,
+    failed_at TEXT,
     completed_at TEXT
 );
 

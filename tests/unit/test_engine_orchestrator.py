@@ -2,6 +2,7 @@
 
 import pytest
 
+from harness.config import ConfigError, PersistenceMode
 from harness.engine.orchestrator import Orchestrator
 from harness.engine.result import EngineResult, ResultStatus
 
@@ -61,6 +62,40 @@ def test_orchestrator_passes_context_through_all_stages():
         ("execute", context, "plan"),
         ("validate", context, "plan", "execution"),
     ]
+
+
+def test_orchestrator_routes_explicit_validate_action_to_validator():
+    calls = []
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(
+                    ExecutionStatus.SUCCESS, next_action="validate"
+                ),
+            )
+
+    class Validator:
+        def validate(self, *_args):
+            calls.append(True)
+            return EngineResult.success("validated")
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+    ).run(21)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert calls == [True]
 
 
 def test_orchestrator_returns_planning_failure_without_execution():
@@ -265,6 +300,26 @@ def test_orchestrator_rejects_nonpositive_max_cycles():
 def test_orchestrator_rejects_negative_max_retries():
     with pytest.raises(ValueError, match="max_retries"):
         Orchestrator(StubContextBuilder(object()), max_retries=-1)
+
+
+def test_orchestrator_requires_all_stores_in_required_persistence_mode():
+    with pytest.raises(ConfigError, match="required persistence"):
+        Orchestrator(
+            StubContextBuilder(object()), persistence_mode=PersistenceMode.REQUIRED
+        )
+
+
+def test_orchestrator_accepts_disabled_persistence_mode():
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), persistence_mode=PersistenceMode.DISABLED
+    )
+
+    assert orchestrator.persistence_mode is PersistenceMode.DISABLED
+
+
+def test_orchestrator_rejects_invalid_persistence_mode():
+    with pytest.raises(ConfigError, match="persistence_mode"):
+        Orchestrator(StubContextBuilder(object()), persistence_mode="invalid")
 
 
 def test_orchestrator_retries_execution_without_replanning():
@@ -489,3 +544,156 @@ def test_orchestrator_ignores_missing_artifact_payload():
     )
 
     orchestrator._register_artifacts(1, EngineResult.success("no execution"))
+
+
+@pytest.mark.parametrize(
+    "next_action, expected",
+    [("wait", ResultStatus.WAITING), ("stop", ResultStatus.SUCCESS)],
+)
+def test_orchestrator_honors_execution_terminal_actions(next_action, expected):
+    transitions = []
+
+    class Store:
+        def transition(self, _task_id, status):
+            transitions.append(status)
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(
+                    ExecutionStatus.SUCCESS, next_action=next_action
+                ),
+            )
+
+    class Validator:
+        def validate(self, *_args):
+            raise AssertionError("terminal execution action must skip validation")
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+        task_store=Store(),
+    ).run(16)
+
+    assert result.status is expected
+    assert transitions[-1] == ("waiting" if next_action == "wait" else "done")
+
+
+def test_orchestrator_replans_after_successful_execution_request():
+    plans = []
+
+    class Planner:
+        def plan(self, _context):
+            plans.append(True)
+            return EngineResult.success("planned", plan=len(plans))
+
+    class Executor:
+        def execute(self, _context, plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            action = "replan" if plan == 1 else "stop"
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(ExecutionStatus.SUCCESS, next_action=action),
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=object(),
+    ).run(17)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert len(plans) == 2
+
+
+def test_orchestrator_retries_after_successful_execution_request():
+    executions = []
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            executions.append(True)
+            action = "retry_execution" if len(executions) == 1 else "stop"
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(ExecutionStatus.SUCCESS, next_action=action),
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=object(),
+    ).run(18)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert len(executions) == 2
+
+
+@pytest.mark.parametrize("next_action", ["wait", "stop", "validate"])
+def test_orchestrator_honors_failed_execution_terminal_actions(next_action):
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            return EngineResult(
+                ResultStatus.FAILED,
+                message="blocked",
+                data={"next_action": next_action},
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=object(),
+    ).run(19)
+
+    assert result.status is (
+        ResultStatus.WAITING if next_action == "wait" else ResultStatus.FAILED
+    )
+
+
+def test_orchestrator_limits_successful_execution_retry():
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(
+                    ExecutionStatus.SUCCESS, next_action="retry_execution"
+                ),
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=object(),
+        max_retries=0,
+    ).run(20)
+
+    assert result.status is ResultStatus.FAILED
