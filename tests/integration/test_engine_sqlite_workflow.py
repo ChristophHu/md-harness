@@ -1,23 +1,114 @@
 """End-to-end orchestration tests using real SQLite stores."""
 
+from dataclasses import dataclass
+
 from harness.engine.context_builder import ContextBuilder
+from harness.engine.executor import Executor
 from harness.engine.orchestrator import Orchestrator
 from harness.engine.plan import ExecutionPlan
+from harness.engine.planner import Planner
 from harness.engine.result import (
     EngineResult,
     ExecutionResult,
     ExecutionStatus,
     ResultStatus,
 )
+from harness.engine.validator import Validator
+from harness.security.tool_policy import ToolSecurityPolicy
 from harness.storage.artifact_store import ArtifactStore
+from harness.storage.checkpoint_store import CheckpointStore
 from harness.storage.database import connect, initialize_database
 from harness.storage.event_store import EventStore
 from harness.storage.project_store import ProjectStore
 from harness.storage.task_store import TaskStore
 from harness.storage.transaction import TransactionManager
+from harness.tools.base import PermissionLevel, Tool, ToolDefinition, ToolRegistry
 
 
-def build_orchestrator(tmp_path, validator):
+@dataclass
+class NoOpTool(Tool):
+    """Read-only test tool that accepts the planner's abstract steps."""
+
+    name: str
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "definition",
+            ToolDefinition(self.name, "test tool", PermissionLevel.READ),
+        )
+        Tool.__init__(self)
+
+    def execute(self, **_arguments):
+        return None
+
+
+def test_real_engine_components_complete_sqlite_workflow(tmp_path):
+    path = initialize_database(tmp_path / "real-harness.sqlite")
+    connection = connect(path)
+    projects = ProjectStore(connection)
+    tasks = TaskStore(connection)
+    project_id = projects.create("Project", str(tmp_path))
+    task_id = tasks.create(
+        "Implement healthcheck",
+        project_id=project_id,
+        description="Implement the healthcheck and validate it.",
+    )
+    tasks.add_test_criterion(task_id, "healthcheck passes")
+    connection.execute(
+        "INSERT INTO task_acceptance_criteria (task_id, criterion) VALUES (?, ?)",
+        (task_id, "healthcheck exists"),
+    )
+    tasks.transition(task_id, "ready")
+    tasks.approve(task_id, "integration-test")
+    registry = ToolRegistry()
+    registry.register(NoOpTool("filesystem"))
+    registry.register(NoOpTool("sqlite"))
+    event_store = EventStore(connection)
+    artifact_store = ArtifactStore(connection)
+    context_builder = ContextBuilder(
+        tasks, event_store, artifact_store, projects, tool_registry=registry
+    )
+    orchestrator = Orchestrator(
+        context_builder,
+        planner=Planner(),
+        executor=Executor(registry, ToolSecurityPolicy(require_approval=True)),
+        validator=Validator(),
+        task_store=tasks,
+        event_store=event_store,
+        artifact_store=artifact_store,
+        transaction_manager=TransactionManager(
+            connection, tasks, event_store, artifact_store
+        ),
+    )
+
+    result = orchestrator.run(task_id)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "done"
+    )
+    assert [
+        row[0]
+        for row in connection.execute(
+            "SELECT event_type FROM task_events WHERE task_id = ?", (task_id,)
+        )
+    ] == [
+        "task.planning",
+        "task.plan.created",
+        "task.executing",
+        "task.execution.completed",
+        "task.execution.next_action",
+        "task.validating",
+        "task.validation.completed",
+        "task.done",
+    ]
+
+
+def build_orchestrator(tmp_path, validator, planner=None, executor=None):
     path = initialize_database(tmp_path / "harness.sqlite")
     connection = connect(path)
     projects = ProjectStore(connection)
@@ -31,6 +122,7 @@ def build_orchestrator(tmp_path, validator):
         EventStore(connection),
         ArtifactStore(connection),
         projects,
+        checkpoint_store=CheckpointStore(connection),
     )
 
     class Planner:
@@ -56,17 +148,28 @@ def build_orchestrator(tmp_path, validator):
 
     orchestrator = Orchestrator(
         context_builder,
-        planner=Planner(),
-        executor=Executor(),
+        planner=planner or Planner(),
+        executor=executor or Executor(),
         validator=validator,
         task_store=tasks,
         event_store=EventStore(connection),
         artifact_store=ArtifactStore(connection),
+        checkpoint_store=context_builder.checkpoint_store,
         transaction_manager=TransactionManager(
             connection, tasks, EventStore(connection), ArtifactStore(connection)
         ),
     )
     return orchestrator, connection, task_id
+
+
+def _event_types(connection, task_id):
+    return [
+        row[0]
+        for row in connection.execute(
+            "SELECT event_type FROM task_events WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        )
+    ]
 
 
 def test_sqlite_workflow_persists_success_attempt_and_events(tmp_path):
@@ -196,3 +299,131 @@ def test_sqlite_workflow_persists_invalid_next_action(tmp_path):
     ]
     assert "task.validation.invalid_next_action" in events
     assert "task.failed" in events
+
+
+def test_sqlite_workflow_persists_replan_and_plan_feedback(tmp_path):
+    class Validator:
+        calls = 0
+
+        def validate(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return EngineResult(
+                    ResultStatus.FAILED,
+                    message="plan needs revision",
+                    data={"next_action": "replan"},
+                )
+            return EngineResult.success("validated", next_action="stop")
+
+    validator = Validator()
+    orchestrator, connection, task_id = build_orchestrator(tmp_path, validator)
+    result = orchestrator.run(task_id)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "done"
+    )
+    attempts = connection.execute(
+        "SELECT status FROM task_attempts WHERE task_id = ? ORDER BY id", (task_id,)
+    ).fetchall()
+    assert [row[0] for row in attempts] == ["failed", "completed"]
+    assert _event_types(connection, task_id).count("task.replanning") == 1
+    payload = connection.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'task.replanning'",
+        (task_id,),
+    ).fetchone()[0]
+    assert "plan needs revision" in payload
+
+
+def test_sqlite_workflow_persists_retry_attempts(tmp_path):
+    class Executor:
+        calls = 0
+
+        def execute(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return EngineResult(
+                    ResultStatus.FAILED,
+                    message="temporary failure",
+                    data={"next_action": "retry_execution"},
+                )
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed",
+                execution=ExecutionResult(ExecutionStatus.SUCCESS),
+            )
+
+    executor = Executor()
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("validated", next_action="stop")
+
+    orchestrator, connection, task_id = build_orchestrator(
+        tmp_path, Validator(), executor=executor
+    )
+    result = orchestrator.run(task_id)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert executor.calls == 2
+    attempts = connection.execute(
+        "SELECT status, error_message FROM task_attempts WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    assert attempts[0][0] == "failed"
+    assert attempts[0][1] == "temporary failure"
+    assert attempts[1][0] == "completed"
+    assert "task.retrying" in _event_types(connection, task_id)
+
+
+def test_sqlite_workflow_persists_wait_checkpoint_and_resume(tmp_path):
+    class Validator:
+        calls = 0
+
+        def validate(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return EngineResult(
+                    ResultStatus.WAITING,
+                    message="approval required",
+                    data={"next_action": "wait"},
+                )
+            return EngineResult.success("validated", next_action="stop")
+
+    validator = Validator()
+    orchestrator, connection, task_id = build_orchestrator(tmp_path, validator)
+    waiting = orchestrator.run(task_id)
+    checkpoint = connection.execute(
+        "SELECT phase, next_action, reason, resumed_at FROM task_checkpoints WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert waiting.status is ResultStatus.WAITING
+    assert checkpoint[0:3] == ("waiting", "wait", "approval required")
+    assert checkpoint[3] is None
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "waiting"
+    )
+
+    resumed = orchestrator.resume(task_id)
+
+    assert resumed.status is ResultStatus.SUCCESS
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "done"
+    )
+    assert (
+        connection.execute(
+            "SELECT resumed_at FROM task_checkpoints WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        is not None
+    )
+    assert _event_types(connection, task_id).count("task.waiting") == 1

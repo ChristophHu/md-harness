@@ -29,6 +29,14 @@ def test_execution_config_rejects_invalid_persistence_mode():
         ExecutionConfig(persistence_mode="invalid")
 
 
+@pytest.mark.parametrize("field", ["dry_run", "max_retries", "max_cycles"])
+def test_execution_config_rejects_wrong_scalar_types(field):
+    values = {"dry_run": True, "max_retries": 1, "max_cycles": 1}
+    values[field] = "invalid"
+    with pytest.raises(ConfigError, match=field):
+        ExecutionConfig(**values)
+
+
 def test_load_config_handles_defaults_and_invalid_shapes(tmp_path):
     defaults = tmp_path / "defaults.yaml"
     defaults.write_text("project: {}\n", encoding="utf-8")

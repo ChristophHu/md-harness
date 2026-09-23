@@ -167,7 +167,17 @@ Bereits vorhandene Tools sind:
 
 Der `ContextBuilder` liest über `tool_registry.list()` die verfügbaren Toolnamen und übernimmt sie in den `ExecutionContext`. Die Registry führt selbst keine automatische Auswahl durch; sie stellt nur die registrierten und berechtigten Tools bereit.
 
-Noch offen ist eine zentrale Factory oder Initialisierungsschicht, die abhängig von Workspace, Konfiguration und Berechtigungen eine passende Registry aufbaut. Diese kann später beispielsweise als `src/harness/tools/factory.py` ergänzt werden.
+Die zentrale Initialisierung erfolgt über `src/harness/application.py`. `build_orchestrator(...)` lädt die YAML-Konfiguration, initialisiert Datenbank und `StoreBundle`, erzeugt die `ToolRegistry` über `ToolRegistryFactory`, konfiguriert den `ContextBuilder` und verdrahtet anschließend Planner, Executor, Validator und Orchestrator. Dabei werden `dry_run`, `max_retries`, `max_cycles` und `persistence_mode` aus `ExecutionConfig` übernommen.
+
+Der Anwendungseinstieg liegt in `src/harness/cli.py`. Ein produktiver Lauf kann über die folgenden Befehle gestartet oder gesteuert werden:
+
+```text
+harness --config config/config.yaml run <task-id>
+harness --config config/config.yaml resume <task-id>
+harness --config config/config.yaml cancel <task-id>
+```
+
+Die CLI hält keine eigene Engine- oder Persistenzlogik, sondern verwendet ausschließlich die Composition Root. `persistence_mode: disabled` ist für den produktiven CLI-Bootstrap absichtlich nicht zugelassen, weil der CLI-Lauf auf der SQLite-Aufgabenverwaltung basiert.
 - `result.py`: definiert standardisierte Ergebnisse, Statuswerte, Fehler, Tests und Artefakte.
 
 ## Executor und Tool-Sicherheit

@@ -10,6 +10,7 @@ from harness.engine.result import (
     ExecutionErrorType,
     ExecutionResult,
     ExecutionStatus,
+    NextAction,
     ResultStatus,
     StepExecution,
     ToolExecutionResult,
@@ -47,7 +48,7 @@ class Executor:
                 ExecutionStatus.WAITING,
                 errors=[error.message],
                 error_details=[error],
-                next_action="wait",
+                next_action=NextAction.WAIT,
             )
             return EngineResult(
                 status=ResultStatus.WAITING,
@@ -100,6 +101,8 @@ class Executor:
                     ExecutionStatus.SUCCESS,
                     step.tool,
                     result=result,
+                    acceptance_criteria=list(step.acceptance_criteria),
+                    test_criteria=list(step.test_criteria),
                     artifacts=(
                         list(result.data.get("artifacts", []))
                         if isinstance(result, ToolExecutionResult)

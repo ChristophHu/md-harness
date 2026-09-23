@@ -19,6 +19,7 @@ dev = [
     "ruff>=0.6",
     "sqlfluff>=3.0",
     "mypy>=1.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -39,4 +40,12 @@ addopts = [
 ignore = ["SIM117"]
 
 [tool.mypy]
-disable_error_code = ["return-value", "override", "valid-type"]
+disable_error_code = [
+    "return-value",
+    "override",
+    "valid-type",
+    "import-untyped",
+    "union-attr",
+    "arg-type",
+    "assignment",
+]

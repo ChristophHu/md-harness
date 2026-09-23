@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from harness.config import ConfigError, PersistenceMode
+from harness.config import ConfigError, ExecutionConfig, PersistenceMode
 from harness.engine.context import ExecutionContext
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
@@ -45,7 +45,12 @@ class Orchestrator:
         transaction_manager: TransactionManager | None = None,
         stores: StoreBundle | None = None,
         checkpoint_store: Any | None = None,
+        execution_config: ExecutionConfig | None = None,
     ) -> None:
+        if execution_config is not None:
+            max_cycles = execution_config.max_cycles
+            max_retries = execution_config.max_retries
+            persistence_mode = execution_config.persistence_mode
         if stores is not None:
             if any(
                 value is not None
@@ -167,9 +172,16 @@ class Orchestrator:
 
             if self.unit_of_work is not None:
                 if attempt_id is None:  # pragma: no cover - defensive invariant
-                    attempt_id = self.unit_of_work.start_cycle(
-                        task_id, "executing", "task.executing"
-                    )
+                    if action is NextAction.RETRY_EXECUTION:
+                        with self.unit_of_work.phase():
+                            attempt_id = self.task_store.record_attempt(
+                                task_id, "running"
+                            )
+                            self.event_store.record(task_id, "task.executing")
+                    else:
+                        attempt_id = self.unit_of_work.start_cycle(
+                            task_id, "executing", "task.executing"
+                        )
                 else:
                     self._transition(task_id, "executing")
                     self._event(task_id, "task.executing")

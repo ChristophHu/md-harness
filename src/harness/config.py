@@ -32,6 +32,12 @@ class ExecutionConfig:
     persistence_mode: PersistenceMode = PersistenceMode.OPTIONAL
 
     def __post_init__(self) -> None:
+        if not isinstance(self.dry_run, bool):
+            raise ConfigError("dry_run must be a boolean")
+        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
+            raise ConfigError("max_retries must be an integer")
+        if not isinstance(self.max_cycles, int) or isinstance(self.max_cycles, bool):
+            raise ConfigError("max_cycles must be an integer")
         if not isinstance(self.persistence_mode, PersistenceMode):
             try:
                 object.__setattr__(
