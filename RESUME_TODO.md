@@ -14,30 +14,34 @@ sind als erledigt markiert; offene Punkte beschreiben verbleibende Arbeit und ke
   gemeinsam persistiert.
 - [x] Erfolgreiche Validierung schließt Task, Attempt, Event und Checkpoint
   atomar ab; `resume()` auf einem `done`-Task führt keine Stages erneut aus.
-- [ ] Waiting-Gründe als explizite typisierte Eingabe erzeugen, statt Freitext heuristisch über `_waiting_reason_code()` zu klassifizieren. Unbekannte
-  Gründe fallen aktuell auf `external_information` zurück.
-- [ ] Externe Voraussetzung für `external_information` als persistierten, atomar setzbaren Zustand modellieren. Der Resume-Pfad prüft derzeit ein
-  `external_ready`-Feld, für das es noch keinen definierten Store-/API-Pfad gibt.
+- [x] Neue WAIT-Ergebnisse verlangen einen typisierten `WaitReason`; die
+  Freitext-Heuristik dient nur dem Lesen alter Checkpoints.
+- [x] Externe Information mit `wait_token`, atomarer Auflösung, Event und
+  persistierter Informationsreferenz modellieren; der Context trägt die
+  Referenz nach einem Neustart.
 - [ ] Lease während langer Resume-Läufe verlängern oder mit Fencing absichern. Derzeit wird eine feste Lease vergeben und erst im `finally` freigegeben;
   überschreitet ein Lauf die Lease-Dauer, kann ein zweiter Worker übernehmen.
-- [ ] Resume-Claim mit Taskstatus, Checkpoint-Version und Attempt-Zuordnung validieren. Die Checkpoint-Zeile wird vor dem Claim gelesen; ein Lease-Claim
-  allein prüft nicht, ob Taskstatus, Workspace oder gespeicherter Plan noch zusammenpassen.
+- [ ] Resume-Claim mit Taskstatus, Checkpoint-Version und Attempt-Zuordnung
+  validieren. Die Checkpoint-Zeile wird nach dem Claim erneut gelesen; ein Lease-Claim
+  allein prüft aber nicht, ob Taskstatus, Workspace oder gespeicherter Plan noch zusammenpassen.
 - [ ] Cancellation gegen bereits laufende Resumer absichern. `cancel()` invalidiert den Checkpoint und leert dessen Lease, aber ein Worker, der den
   Checkpoint schon geladen hat, besitzt kein Fencing-Token für spätere Workflow-Schreibvorgänge.
 - [x] Recovery nach einem echten Prozessabbruch direkt nach dem Resume-Claim
   und Neustart mit derselben SQLite-Datei testen.
-- [ ] Weitere Crash-Phasengrenzen während Execution und Validation testen;
-  der vorhandene Prozesstest endet vor der eigentlichen Fortsetzung.
+- [ ] Weitere Crash-Phasengrenzen während Execution und laufender Validation
+  testen. Der Commit der Validation-Entscheidung ist mit anschließendem
+  Prozessabbruch und Neustart für Retry und Replan abgedeckt.
 
 ## Transaktionen und Workflow-Persistenz
 
 - [ ] Sämtliche Workflow-Entscheidungen konsistent über `EngineUnitOfWork`
-  persistieren. Execution-WAIT und einige Phasen sind atomar; weitere
-  Retry-/Replan-/Validation- und Fehlerpfade nutzen teils einzelne Store-
-  Schreibvorgänge oder Fallbacks.
-- [ ] Eine einheitliche Transaktionsgrenze für Validation-Ergebnis,
+  persistieren. Execution-WAIT und Validation-Entscheidungen sind atomar;
+  andere Execution-, Planungs- und Fehlerpfade nutzen teils noch einzelne
+  Store-Schreibvorgänge oder Fallbacks.
+- [x] Eine einheitliche Transaktionsgrenze für Validation-Ergebnis,
   `task.validation.completed`, Attempt-Abschluss, Statusentscheidung und
-  Checkpoint-Änderung sicherstellen.
+  Checkpoint-Änderung sicherstellen; Retry/Replan werden vor dem nächsten
+  Zyklus resumierbar persistiert.
 - [ ] Cycle, Attempt, Planversion und Events dauerhaft relational oder über
   stabile IDs verknüpfen; aktuell sind diese Zuordnungen teilweise nur in
   Checkpoint-Payloads/Events enthalten.
@@ -71,5 +75,5 @@ sind als erledigt markiert; offene Punkte beschreiben verbleibende Arbeit und ke
 ## Qualität und Repository-Status
 
 - [x] Unit-/Integrationstests für die aktuellen Änderungen ergänzen; lokaler
-  Stand: 394 Tests, 100 % Coverage.
+  Stand: 425 Tests, 100 % Coverage.
 - [x] Coverage-Ziel in CI beibehalten und die Suite nach den Änderungen erneut ausführen.

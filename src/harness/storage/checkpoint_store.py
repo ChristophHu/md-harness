@@ -92,6 +92,58 @@ class CheckpointStore:
                 ),
             )
             return cursor.lastrowid
+        wait_token = str(uuid.uuid4()) if next_action == "wait" else None
+        if {
+            "wait_token",
+            "external_resolved_at",
+            "resolved_by",
+            "information_ref",
+        } <= columns:
+            cursor = self.connection.execute(
+                """INSERT INTO task_checkpoints
+                (task_id, phase, next_action, plan_version, attempt_id, reason, context_data,
+                 next_step_id, completed_step_ids, plan_fingerprint, execution_result,
+                 validation_result, resume_count, invalidated_at, waiting_reason_code,
+                 wait_token, external_resolved_at, resolved_by, information_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL, NULL, NULL)
+                ON CONFLICT(task_id) DO UPDATE SET phase=excluded.phase,
+                next_action=excluded.next_action, plan_version=excluded.plan_version,
+                attempt_id=excluded.attempt_id, reason=excluded.reason,
+                context_data=excluded.context_data, next_step_id=excluded.next_step_id,
+                completed_step_ids=excluded.completed_step_ids,
+                plan_fingerprint=excluded.plan_fingerprint, created_at=CURRENT_TIMESTAMP,
+                resumed_at=NULL, execution_result=excluded.execution_result,
+                validation_result=excluded.validation_result, resume_count=0,
+                invalidated_at=NULL, waiting_reason_code=excluded.waiting_reason_code,
+                wait_token=excluded.wait_token,
+                external_resolved_at=CASE WHEN excluded.next_action = 'wait' THEN NULL
+                    ELSE task_checkpoints.external_resolved_at END,
+                resolved_by=CASE WHEN excluded.next_action = 'wait' THEN NULL
+                    ELSE task_checkpoints.resolved_by END,
+                information_ref=CASE WHEN excluded.next_action = 'wait' THEN NULL
+                    ELSE task_checkpoints.information_ref END""",
+                (
+                    task_id,
+                    phase,
+                    next_action,
+                    plan_version,
+                    attempt_id,
+                    reason,
+                    json.dumps(context_data) if context_data is not None else None,
+                    next_step_id,
+                    json.dumps(completed_step_ids or []),
+                    plan_fingerprint,
+                    json.dumps(execution_result)
+                    if execution_result is not None
+                    else None,
+                    json.dumps(validation_result)
+                    if validation_result is not None
+                    else None,
+                    waiting_reason_code,
+                    wait_token,
+                ),
+            )
+            return cursor.lastrowid
         cursor = self.connection.execute(
             """INSERT INTO task_checkpoints
             (task_id, phase, next_action, plan_version, attempt_id, reason, context_data,
@@ -128,6 +180,21 @@ class CheckpointStore:
             ),
         )
         return cursor.lastrowid
+
+    def resolve_external_wait(
+        self, task_id: int, wait_token: str, actor: str, information_ref: str
+    ) -> bool:
+        """Resolve only the current, still-open external-information wait."""
+        cursor = self.connection.execute(
+            """UPDATE task_checkpoints SET external_resolved_at = CURRENT_TIMESTAMP,
+               resolved_by = ?, information_ref = ?
+               WHERE task_id = ? AND wait_token = ? AND next_action = 'wait'
+               AND waiting_reason_code = 'external_information'
+               AND invalidated_at IS NULL AND external_resolved_at IS NULL
+               AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = 'waiting')""",
+            (actor, information_ref, task_id, wait_token, task_id),
+        )
+        return cursor.rowcount == 1
 
     def get(self, task_id: int) -> Row | None:
         return self.connection.execute(

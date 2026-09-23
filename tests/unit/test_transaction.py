@@ -125,6 +125,51 @@ def test_engine_unit_of_work_groups_cycle_start_and_decision():
     assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
 
 
+def test_external_resolution_rejects_invalid_input_and_missing_store():
+    connection = sqlite3.connect(":memory:")
+    store = type("Store", (), {"connection": connection})()
+    work = EngineUnitOfWork(TransactionManager(connection), store, store, store)
+    with pytest.raises(ValueError, match="non-empty"):
+        work.resolve_external_wait(1, "", "actor", "ref")
+    with pytest.raises(TransactionError, match="checkpoint store"):
+        work.resolve_external_wait(1, "token", "actor", "ref")
+
+
+@pytest.mark.parametrize("case", ["missing", "unresolved_update"])
+def test_external_resolution_store_race_failures(case):
+    connection = sqlite3.connect(":memory:")
+    store = type("Store", (), {"connection": connection})()
+
+    class Tasks:
+        def __init__(self):
+            self.connection = connection
+
+        def get(self, _task_id):
+            return None if case == "missing" else {"status": "waiting"}
+
+    class Checkpoints:
+        def __init__(self):
+            self.connection = connection
+
+        def resolve_external_wait(self, *_args):
+            return False
+
+        def get_active(self, _task_id):
+            return {
+                "wait_token": "token",
+                "waiting_reason_code": "external_information",
+                "external_resolved_at": None,
+            }
+
+    work = EngineUnitOfWork(
+        TransactionManager(connection), Tasks(), store, store, Checkpoints()
+    )
+    with pytest.raises(
+        ValueError, match="active waiting checkpoint|could not be resolved"
+    ):
+        work.resolve_external_wait(1, "token", "actor", "ref")
+
+
 def test_engine_unit_of_work_rolls_back_a_failed_phase():
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE events (task_id INTEGER, event_type TEXT)")

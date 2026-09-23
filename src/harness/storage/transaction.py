@@ -5,11 +5,27 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 
 class TransactionError(RuntimeError):
     """Raised when stores cannot participate in one transaction."""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationWrite:
+    """Complete, precomputed persistence decision for one validator result."""
+
+    task_id: int
+    attempt_id: int | None
+    validation: Any
+    outcome: str
+    message: str
+    checkpoint: dict[str, Any] | None = None
+    event_type: str | None = None
+    event_payload: Any = None
+    replan: tuple[int, int] | None = None
 
 
 class TransactionManager:
@@ -127,6 +143,45 @@ class EngineUnitOfWork:
         with self.phase():
             return self.checkpoint_store.release_resume_lease(task_id, token)
 
+    def resolve_external_wait(
+        self, task_id: int, wait_token: str, actor: str, information_ref: str
+    ) -> bool:
+        """Resolve one external wait and write its audit event in one transaction.
+
+        Returns False for an idempotent repeat with the same reference.
+        """
+        if not actor.strip() or not information_ref.strip() or not wait_token.strip():
+            raise ValueError("wait_token, actor and information_ref must be non-empty")
+        if self.checkpoint_store is None:
+            raise TransactionError("checkpoint store is required")
+        with self.phase():
+            if self.checkpoint_store.resolve_external_wait(
+                task_id, wait_token, actor, information_ref
+            ):
+                self.event_store.record(
+                    task_id,
+                    "task.external_wait.resolved",
+                    {
+                        "wait_token": wait_token,
+                        "actor": actor,
+                        "information_ref": information_ref,
+                    },
+                )
+                return True
+            task = self.task_store.get(task_id)
+            checkpoint = self.checkpoint_store.get_active(task_id)
+            if task is None or task["status"] != "waiting" or checkpoint is None:
+                raise ValueError("task has no active waiting checkpoint")
+            if checkpoint["wait_token"] != wait_token:
+                raise ValueError("stale wait token")
+            if checkpoint["waiting_reason_code"] != "external_information":
+                raise ValueError("checkpoint is not waiting for external information")
+            if checkpoint["external_resolved_at"] is not None:
+                if checkpoint["information_ref"] == information_ref:
+                    return False
+                raise ValueError("external wait was resolved with another reference")
+            raise ValueError("external wait could not be resolved")
+
     def execution_wait(
         self,
         task_id: int,
@@ -209,6 +264,91 @@ class EngineUnitOfWork:
             self.event_store.record(task_id, "task.done")
             if self.checkpoint_store is not None:
                 self.checkpoint_store.invalidate(task_id)
+
+    def validation_decision(self, write: ValidationWrite) -> None:
+        """Commit the validator result and its complete workflow decision."""
+        if write.checkpoint is not None and self.checkpoint_store is None:
+            raise TransactionError(
+                "resumable validation decision requires checkpoint store"
+            )
+        with self.phase() as connection:
+            task = self.task_store.get(write.task_id)
+            if task is None or task["status"] != "validating":
+                raise TransactionError("validation task is not validating")
+            if write.attempt_id is not None:
+                attempt = connection.execute(
+                    "SELECT task_id, status FROM task_attempts WHERE id = ?",
+                    (write.attempt_id,),
+                ).fetchone()
+                if (
+                    attempt is None
+                    or attempt["task_id"] != write.task_id
+                    or attempt["status"] != "running"
+                ):
+                    raise TransactionError("validation attempt is not active")
+            self.apply_validation_decision(
+                self.task_store, self.event_store, self.checkpoint_store, write
+            )
+
+    @staticmethod
+    def apply_validation_decision(
+        task_store: Any, event_store: Any, checkpoint_store: Any, write: ValidationWrite
+    ) -> None:
+        """Write one decision; the caller supplies the transaction boundary."""
+        task_id = write.task_id
+        record = getattr(event_store, "record", lambda *_args: None)
+        transition = getattr(task_store, "transition", lambda *_args: None)
+        complete_attempt = getattr(task_store, "complete_attempt", lambda *_args: None)
+        record(task_id, "task.validation.completed", write.validation)
+        if write.checkpoint is not None and checkpoint_store is not None:
+            checkpoint_store.save(task_id, **write.checkpoint)
+        if write.attempt_id is not None:
+            attempt_status = (
+                "completed"
+                if write.outcome == "done"
+                else "waiting"
+                if write.outcome == "wait"
+                else "failed"
+            )
+            complete_attempt(
+                write.attempt_id,
+                attempt_status,
+                write.message if attempt_status != "completed" else None,
+            )
+        if write.outcome == "done":
+            transition(task_id, "done")
+            record(task_id, "task.done")
+        elif write.outcome == "wait":
+            transition(task_id, "waiting")
+            record(task_id, "task.waiting", {"reason": write.message})
+        else:
+            record(
+                task_id,
+                "task.validation.failed",
+                {"error": write.message},
+            )
+            if write.outcome == "failed":
+                transition(task_id, "failed")
+                if write.event_type and write.event_type != "task.validation.failed":
+                    record(task_id, write.event_type, write.event_payload)
+                record(task_id, "task.failed", {"error": write.message})
+            else:
+                if write.replan is not None:
+                    parent_version, version = write.replan
+                    record_replan = getattr(task_store, "record_replan", None)
+                    if record_replan is not None:
+                        record_replan(
+                            task_id,
+                            "validation_failed",
+                            version,
+                            parent_plan_version=parent_version,
+                            attempt_id=write.attempt_id,
+                        )
+                record(task_id, write.event_type, write.event_payload)
+        if write.outcome in {"done", "failed"} and hasattr(
+            checkpoint_store, "invalidate"
+        ):
+            checkpoint_store.invalidate(task_id)
 
     def cancel(self, task_id: int, reason: str) -> None:
         """Atomically cancel the task and clean up all resumable state."""

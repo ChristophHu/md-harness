@@ -35,6 +35,16 @@ class NextAction(StrEnum):
     STOP = "stop"
 
 
+class WaitReason(StrEnum):
+    """Stable, explicit reason for a new waiting phase."""
+
+    APPROVAL = "approval"
+    EXTERNAL_INFORMATION = "external_information"
+    TEMPORARY_ERROR = "temporary_error"
+    WORKSPACE_MISSING = "workspace_missing"
+    MANUAL_REPLAN = "manual_replan"
+
+
 class ExecutionErrorType(StrEnum):
     """Stable categories used to select the next orchestration action."""
 
@@ -110,6 +120,7 @@ class EngineResult:
     artifacts: list[str] = field(default_factory=list)
     tests: dict[str, bool] = field(default_factory=dict)
     data: dict[str, Any] = field(default_factory=dict)
+    wait_reason: WaitReason | None = None
 
     @property
     def successful(self) -> bool:
@@ -131,9 +142,9 @@ class EngineResult:
         )
 
     @classmethod
-    def waiting(cls, message: str) -> EngineResult:
+    def waiting(cls, message: str, reason: WaitReason | None = None) -> EngineResult:
         """Create a result indicating that human input or approval is needed."""
-        return cls(status=ResultStatus.WAITING, message=message)
+        return cls(status=ResultStatus.WAITING, message=message, wait_reason=reason)
 
 
 @dataclass(slots=True)
@@ -175,6 +186,7 @@ class ExecutionResult:
     errors: list[str] = field(default_factory=list)
     error_details: list[ExecutionError] = field(default_factory=list)
     next_action: NextAction | None = None
+    wait_reason: WaitReason | None = None
     attempt_id: int | None = None
     dry_run: bool = False
     started_at: datetime | None = None

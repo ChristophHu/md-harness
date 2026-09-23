@@ -16,6 +16,7 @@ from harness.engine.result import (
     ResultStatus,
     StepExecution,
     ToolExecutionResult,
+    WaitReason,
     action_for_error,
 )
 from harness.security.tool_policy import ToolSecurityPolicy
@@ -51,11 +52,13 @@ class Executor:
                 errors=[error.message],
                 error_details=[error],
                 next_action=NextAction.WAIT,
+                wait_reason=WaitReason.WORKSPACE_MISSING,
             )
             return EngineResult(
                 status=ResultStatus.WAITING,
                 message=error.message,
                 errors=[error.message],
+                wait_reason=WaitReason.WORKSPACE_MISSING,
                 data={"execution": execution, "next_action": "wait"},
             )
 
@@ -110,11 +113,20 @@ class Executor:
                     errors=[str(error)],
                     error_details=[structured],
                     next_action=next_action,
+                    wait_reason=(
+                        WaitReason.EXTERNAL_INFORMATION
+                        if next_action is NextAction.WAIT
+                        and structured.error_type is ExecutionErrorType.EXTERNAL_BLOCKER
+                        else WaitReason.APPROVAL
+                        if next_action is NextAction.WAIT
+                        else None
+                    ),
                 )
                 return EngineResult(
                     status=ResultStatus.FAILED,
                     message="Plan tool authorization or execution failed.",
                     errors=execution.errors,
+                    wait_reason=execution.wait_reason,
                     data={"execution": execution, "next_action": next_action},
                 )
             normalized = (

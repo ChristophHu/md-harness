@@ -35,7 +35,7 @@ def test_current_schema_version_is_five(tmp_path):
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == CURRENT_SCHEMA_VERSION
-            == 11
+            == 12
         )
 
 

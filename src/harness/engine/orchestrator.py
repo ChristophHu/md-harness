@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,10 +21,25 @@ from harness.engine.result import (
     NextAction,
     ResultStatus,
     StepExecution,
+    WaitReason,
 )
 from harness.storage.factory import StoreBundle
-from harness.storage.transaction import EngineUnitOfWork, TransactionManager
+from harness.storage.transaction import (
+    EngineUnitOfWork,
+    TransactionManager,
+    ValidationWrite,
+)
 from harness.tools.base import ToolRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationDecision:
+    outcome: str
+    result: EngineResult
+    action: NextAction | None
+    retries: int
+    replans: int
+    event_type: str | None = None
 
 
 class Orchestrator:
@@ -192,6 +207,9 @@ class Orchestrator:
         _resume_plan: Any | None = None,
         _resume_action: NextAction | None = None,
         _resume_claimed: bool = False,
+        _resume_retries: int = 0,
+        _resume_replans: int = 0,
+        _resume_cycles: int = 0,
     ) -> EngineResult:
         """Run the complete pipeline once the stage components are available."""
         claimed = None if _resume_claimed else self._claim_task(task_id)
@@ -205,9 +223,9 @@ class Orchestrator:
 
         action = _resume_action or NextAction.REPLAN
         plan = _resume_plan
-        retries = 0
-        replans = 0
-        for _ in range(self.max_cycles):
+        retries = _resume_retries
+        replans = _resume_replans
+        for cycle in range(_resume_cycles, self.max_cycles):
             context = self.build_context(task_id)
             attempt_id = None
             if action is NextAction.REPLAN:
@@ -245,7 +263,14 @@ class Orchestrator:
                         NextAction.VALIDATE,
                         attempt_id,
                         "plan persisted for resumability",
-                        context_data={"plan": self._serialize(plan)},
+                        context_data={
+                            "plan": self._serialize(plan),
+                            "validation_progress": {
+                                "retries": retries,
+                                "replans": replans,
+                                "cycles": cycle,
+                            },
+                        },
                         plan_version=getattr(plan, "version", None),
                         next_step_id=(
                             plan.steps[0].id
@@ -293,19 +318,43 @@ class Orchestrator:
                 return self._handle_invalid_action(
                     task_id, attempt_id, error, "task.execution.invalid_next_action"
                 )
+            if (
+                execution_result.status is ResultStatus.WAITING
+                and next_action is not NextAction.WAIT
+            ):
+                return self._handle_stage_exception(
+                    task_id,
+                    attempt_id,
+                    "execution",
+                    ValueError("WAITING execution requires next_action=WAIT"),
+                )
+            if next_action is NextAction.WAIT:
+                try:
+                    self._require_wait_reason(execution_result)
+                except ValueError as error:
+                    return self._handle_stage_exception(
+                        task_id, attempt_id, "execution", error
+                    )
             if execution_result.successful and next_action in {
                 NextAction.WAIT,
                 NextAction.STOP,
             }:
                 if next_action is NextAction.WAIT:
                     self._persist_execution_wait(
-                        task_id, attempt_id, plan, execution_result
+                        task_id,
+                        attempt_id,
+                        plan,
+                        execution_result,
+                        retries=retries,
+                        replans=replans,
+                        cycle=cycle,
                     )
                     return EngineResult(
                         status=ResultStatus.WAITING,
                         message=execution_result.message,
                         errors=execution_result.errors,
                         data=execution_result.data,
+                        wait_reason=execution_result.wait_reason,
                     )
                 self._event(
                     task_id,
@@ -362,13 +411,20 @@ class Orchestrator:
                     continue
                 if next_action is NextAction.WAIT:
                     self._persist_execution_wait(
-                        task_id, attempt_id, plan, execution_result
+                        task_id,
+                        attempt_id,
+                        plan,
+                        execution_result,
+                        retries=retries,
+                        replans=replans,
+                        cycle=cycle,
                     )
                     return EngineResult(
                         status=ResultStatus.WAITING,
                         message=execution_result.message,
                         errors=execution_result.errors,
                         data=execution_result.data,
+                        wait_reason=execution_result.wait_reason,
                     )
                 if next_action is NextAction.STOP:
                     self._finish_attempt(attempt_id, "failed", execution_result.message)
@@ -428,84 +484,201 @@ class Orchestrator:
                 return self._handle_stage_exception(
                     task_id, attempt_id, "validation", error
                 )
-            self._event(
-                task_id, "task.validation.completed", self._serialize(validation)
-            )
-            try:
-                action = self._action(validation.data.get("next_action"))
-            except InvalidNextActionError as error:
-                return self._handle_invalid_action(
-                    task_id, attempt_id, error, "task.validation.invalid_next_action"
-                )
-            if validation.status is ResultStatus.SUCCESS:
-                self._complete_done(task_id, attempt_id)
-                return validation
-            if action is NextAction.WAIT:
-                self._save_checkpoint(
-                    task_id,
-                    "waiting",
-                    NextAction.WAIT,
-                    attempt_id,
-                    validation.message,
-                    context_data={
-                        "plan": self._serialize(plan),
-                        "execution": self._serialize(execution),
-                    },
-                )
-                self._finish_attempt(attempt_id, "waiting")
-                self._transition(task_id, "waiting")
-                self._event(task_id, "task.waiting")
-                return validation
-            if action in {NextAction.REPLAN, NextAction.RETRY_EXECUTION}:
-                self._event(
-                    task_id,
-                    "task.validation.failed",
-                    {"error": validation.message, "errors": validation.errors},
-                )
-                if action is NextAction.RETRY_EXECUTION:
-                    retries += 1
-                    if retries > self.max_retries:
-                        result = EngineResult.failure(
-                            "Maximum execution retries exceeded."
-                        )
-                        self._finish_attempt(attempt_id, "failed", result.message)
-                        self._fail_task(task_id, result.message, "task.failed")
-                        return result
-                    self._finish_attempt(attempt_id, "failed", validation.message)
-                    self._event(
-                        task_id,
-                        "task.retrying",
-                        {"retry_number": retries, "max_retries": self.max_retries},
-                    )
-                if action is NextAction.REPLAN:
-                    replans += 1
-                    if replans > self.max_replans:
-                        result = EngineResult.failure("Maximum replans exceeded.")
-                        self._finish_attempt(attempt_id, "failed", result.message)
-                        self._fail_task(
-                            task_id, result.message, "task.replan.exhausted"
-                        )
-                        return result
-                    self._finish_attempt(attempt_id, "failed", validation.message)
-                    self._event(
-                        task_id,
-                        "task.replanning",
-                        self._replanning_payload(plan, validation),
-                    )
-                    self._record_replan(task_id, plan, attempt_id, "validation_failed")
-                continue
-            self._finish_attempt(attempt_id, "failed", validation.message)
-            self._event(
+            decision = self._finish_validation(
                 task_id,
-                "task.validation.failed",
-                {"error": validation.message, "errors": validation.errors},
+                attempt_id,
+                plan,
+                execution,
+                validation,
+                retries=retries,
+                replans=replans,
+                cycle=cycle,
             )
-            self._fail_task(task_id, validation.message, "task.validation.failed")
-            return validation
+            if decision.outcome in {"retry", "replan"}:
+                retries, replans = decision.retries, decision.replans
+                action = decision.action
+                continue
+            return decision.result
 
         result = EngineResult.failure("Maximum orchestration cycles exceeded.")
         self._fail_task(task_id, result.message, "task.failed")
         return result
+
+    def _validation_decision(
+        self,
+        validation: EngineResult,
+        *,
+        retries: int,
+        replans: int,
+        cycle: int,
+    ) -> _ValidationDecision:
+        """Classify a validator result without changing persistent state."""
+        try:
+            action = self._action(validation.data.get("next_action"))
+        except InvalidNextActionError as error:
+            return _ValidationDecision(
+                "failed",
+                EngineResult(
+                    ResultStatus.FAILED,
+                    error.error.message,
+                    errors=[error.error.message],
+                    data={"error": self._serialize(error.error)},
+                ),
+                None,
+                retries,
+                replans,
+                "task.validation.invalid_next_action",
+            )
+        if validation.status is ResultStatus.WAITING and action is not NextAction.WAIT:
+            return _ValidationDecision(
+                "failed",
+                EngineResult.failure("WAITING validation requires next_action=WAIT"),
+                None,
+                retries,
+                replans,
+                "task.validation.invalid_next_action",
+            )
+        if action is NextAction.WAIT:
+            try:
+                self._require_wait_reason(validation)
+            except ValueError as error:
+                return _ValidationDecision(
+                    "failed",
+                    EngineResult.failure(str(error)),
+                    None,
+                    retries,
+                    replans,
+                    "task.validation.invalid_wait_reason",
+                )
+        if validation.status is ResultStatus.SUCCESS:
+            if action not in {None, NextAction.STOP}:
+                return _ValidationDecision(
+                    "failed",
+                    EngineResult.failure(
+                        "Successful validation has conflicting next_action"
+                    ),
+                    None,
+                    retries,
+                    replans,
+                    "task.validation.invalid_next_action",
+                )
+            return _ValidationDecision("done", validation, None, retries, replans)
+        if action is NextAction.WAIT:
+            return _ValidationDecision("wait", validation, action, retries, replans)
+        if action is NextAction.RETRY_EXECUTION:
+            retries += 1
+            if retries > self.max_retries:
+                return _ValidationDecision(
+                    "failed",
+                    EngineResult.failure("Maximum execution retries exceeded."),
+                    None,
+                    retries,
+                    replans,
+                )
+            if cycle + 1 >= self.max_cycles:
+                return _ValidationDecision(
+                    "failed",
+                    EngineResult.failure("Maximum orchestration cycles exceeded."),
+                    None,
+                    retries,
+                    replans,
+                )
+            return _ValidationDecision("retry", validation, action, retries, replans)
+        if action is NextAction.REPLAN:
+            replans += 1
+            if replans > self.max_replans:
+                return _ValidationDecision(
+                    "failed",
+                    EngineResult.failure("Maximum replans exceeded."),
+                    None,
+                    retries,
+                    replans,
+                    "task.replan.exhausted",
+                )
+            if cycle + 1 >= self.max_cycles:
+                return _ValidationDecision(
+                    "failed",
+                    EngineResult.failure("Maximum orchestration cycles exceeded."),
+                    None,
+                    retries,
+                    replans,
+                )
+            return _ValidationDecision("replan", validation, action, retries, replans)
+        return _ValidationDecision("failed", validation, None, retries, replans)
+
+    def _finish_validation(
+        self,
+        task_id: int,
+        attempt_id: int | None,
+        plan: Any,
+        execution: ExecutionResult,
+        validation: EngineResult,
+        *,
+        retries: int,
+        replans: int,
+        cycle: int,
+    ) -> _ValidationDecision:
+        """Commit one complete decision before scheduling any further stage."""
+        decision = self._validation_decision(
+            validation, retries=retries, replans=replans, cycle=cycle
+        )
+        checkpoint = None
+        if decision.outcome in {"wait", "retry", "replan"}:
+            checkpoint = {
+                "phase": "waiting" if decision.outcome == "wait" else "validating",
+                "next_action": decision.action.value,
+                "attempt_id": attempt_id,
+                "reason": validation.message,
+                "context_data": {
+                    "plan": self._serialize(plan),
+                    "execution": self._serialize(execution),
+                    "validation_progress": {
+                        "retries": decision.retries,
+                        "replans": decision.replans,
+                        "cycles": cycle if decision.outcome == "wait" else cycle + 1,
+                    },
+                },
+                "plan_version": getattr(plan, "version", None),
+                "execution_result": self._serialize(execution),
+                "validation_result": self._serialize(validation),
+                "waiting_reason_code": (
+                    self._require_wait_reason(validation).value
+                    if decision.outcome == "wait"
+                    else None
+                ),
+            }
+        event_type = decision.event_type
+        event_payload: Any = {"error": decision.result.message}
+        replan = None
+        if decision.outcome == "retry":
+            event_type = "task.retrying"
+            event_payload = {
+                "retry_number": decision.retries,
+                "max_retries": self.max_retries,
+            }
+        elif decision.outcome == "replan":
+            event_type = "task.replanning"
+            event_payload = self._replanning_payload(plan, validation)
+            version = getattr(plan, "version", 1)
+            replan = (version, version + 1)
+        write = ValidationWrite(
+            task_id,
+            attempt_id,
+            self._serialize(validation),
+            decision.outcome,
+            decision.result.message,
+            checkpoint,
+            event_type,
+            event_payload,
+            replan,
+        )
+        if self.unit_of_work is not None:
+            self.unit_of_work.validation_decision(write)
+        else:
+            EngineUnitOfWork.apply_validation_decision(
+                self.task_store, self.event_store, self.checkpoint_store, write
+            )
+        return decision
 
     def _transition(self, task_id: int, status: str) -> None:
         if self.task_store is not None:
@@ -660,7 +833,15 @@ class Orchestrator:
                     self.artifact_store.register(task_id, path, "execution-artifact")
 
     def _persist_execution_wait(
-        self, task_id: int, attempt_id: int | None, plan: Any, result: EngineResult
+        self,
+        task_id: int,
+        attempt_id: int | None,
+        plan: Any,
+        result: EngineResult,
+        *,
+        retries: int = 0,
+        replans: int = 0,
+        cycle: int = 0,
     ) -> None:
         """Persist execution progress before putting the task into waiting."""
         execution = result.data.get("execution")
@@ -681,12 +862,17 @@ class Orchestrator:
             "context_data": {
                 "plan": self._serialize(plan),
                 "execution": self._serialize(execution),
+                "validation_progress": {
+                    "retries": retries,
+                    "replans": replans,
+                    "cycles": cycle,
+                },
             },
             "plan_version": getattr(plan, "version", None),
             "next_step_id": next_step,
             "completed_step_ids": sorted(completed),
             "execution_result": self._serialize(result),
-            "waiting_reason_code": self._waiting_reason_code(result.message),
+            "waiting_reason_code": self._require_wait_reason(result).value,
         }
         if self.unit_of_work is not None and attempt_id is not None:
             self.unit_of_work.execution_wait(
@@ -714,6 +900,7 @@ class Orchestrator:
         completed_step_ids: list[str] | None = None,
         execution_result: Any | None = None,
         validation_result: Any | None = None,
+        wait_reason: WaitReason | None = None,
     ) -> None:
         if self.checkpoint_store is not None:
             self.checkpoint_store.save(
@@ -729,11 +916,36 @@ class Orchestrator:
                 execution_result=execution_result,
                 validation_result=validation_result,
                 waiting_reason_code=(
-                    self._waiting_reason_code(reason)
+                    self._coerce_wait_reason(wait_reason).value
                     if action is NextAction.WAIT
                     else None
                 ),
             )
+
+    @staticmethod
+    def _coerce_wait_reason(value: WaitReason | str | None) -> WaitReason:
+        try:
+            if value is None:
+                raise ValueError("missing")
+            return WaitReason(value)
+        except ValueError as error:
+            raise ValueError(f"WAIT requires a valid WaitReason: {value}") from error
+
+    @classmethod
+    def _require_wait_reason(cls, result: EngineResult) -> WaitReason:
+        return cls._coerce_wait_reason(result.wait_reason)
+
+    def resolve_external_wait(
+        self, task_id: int, wait_token: str, actor: str, information_ref: str
+    ) -> bool:
+        """Persist a reference to information supplied for one waiting phase."""
+        if self.unit_of_work is None:
+            raise ConfigError(
+                "external wait resolution requires transactional SQLite stores"
+            )
+        return self.unit_of_work.resolve_external_wait(
+            task_id, wait_token, actor, information_ref
+        )
 
     def _record_replan(
         self, task_id: int, plan: Any, attempt_id: int | None, reason_code: str
@@ -802,6 +1014,15 @@ class Orchestrator:
             if terminal is not None:
                 return terminal
             return EngineResult.waiting("Checkpoint is already being resumed.")
+        checkpoint = (
+            get_active(task_id)
+            if get_active is not None
+            else self.checkpoint_store.get(task_id)
+        )
+        if checkpoint is None:
+            if self.unit_of_work is not None:
+                self.unit_of_work.release_resume_lease(task_id, lease_token)
+            return EngineResult.failure("Checkpoint was retired during resume claim.")
         plan = None
         try:
             context_data = checkpoint["context_data"]
@@ -856,27 +1077,41 @@ class Orchestrator:
         return None
 
     def _resume_from_checkpoint(
-        self, task_id: int, checkpoint: Any, action: NextAction, plan: Any | None
+        self,
+        task_id: int,
+        checkpoint: Any,
+        action: NextAction,
+        plan: Any | None,
     ) -> EngineResult:
         """Dispatch resume deterministically by the persisted checkpoint action."""
+        progress = self._checkpoint_progress(checkpoint)
         if action is NextAction.RETRY_EXECUTION:
-            return self._resume_retry_execution(task_id, plan)
+            return self._resume_retry_execution(task_id, plan, progress=progress)
         if action is NextAction.WAIT:
             return self._resume_wait(task_id, checkpoint, plan)
         if action is NextAction.VALIDATE:
-            return self._resume_validation(task_id, plan)
+            return self._resume_validation(task_id, checkpoint, plan, progress=progress)
         if action is NextAction.REPLAN:
-            return self._resume_replan(task_id)
+            return self._resume_replan(task_id, progress=progress)
         return EngineResult.failure(f"Unsupported resume action: {action.value}")
 
-    def _resume_retry_execution(self, task_id: int, plan: Any | None) -> EngineResult:
+    def _resume_retry_execution(
+        self,
+        task_id: int,
+        plan: Any | None,
+        *,
+        progress: tuple[int, int, int] = (0, 0, 0),
+    ) -> EngineResult:
         if plan is None:
-            return self._resume_replan(task_id)
+            return self._resume_replan(task_id, progress=progress)
         return self.run(
             task_id,
             _resume_plan=plan,
             _resume_action=NextAction.RETRY_EXECUTION,
             _resume_claimed=True,
+            _resume_retries=progress[0],
+            _resume_replans=progress[1],
+            _resume_cycles=progress[2],
         )
 
     def _resume_wait(
@@ -896,13 +1131,14 @@ class Orchestrator:
         execution = self._deserialize_execution(
             payload.get("execution") if isinstance(payload, dict) else None
         )
+        progress = self._checkpoint_progress(checkpoint)
         should_continue = (
             reason_code in {"temporary_error", "workspace_missing", "manual_replan"}
             or reason_code == "approval"
             and task is not None
             and task["approval_status"] == "approved"
             or reason_code == "external_information"
-            and self._checkpoint_value(checkpoint, "external_ready") is True
+            and self._checkpoint_value(checkpoint, "external_resolved_at") is not None
         )
         if should_continue:
             if plan is None and isinstance(payload, dict):
@@ -912,13 +1148,17 @@ class Orchestrator:
                     task_id,
                     _resume_plan=plan,
                     _resume_action=NextAction.RETRY_EXECUTION,
+                    _resume_claimed=True,
+                    _resume_retries=progress[0],
+                    _resume_replans=progress[1],
+                    _resume_cycles=progress[2],
                 )
-            return self._resume_replan(task_id)
+            return self._resume_replan(task_id, progress=progress)
         if self.task_store is not None and (
             task is None or task["status"] != "waiting"
         ):
             self._transition(task_id, "waiting")
-        return EngineResult.waiting(reason)
+        return EngineResult.waiting(reason, WaitReason(reason_code))
 
     @staticmethod
     def _checkpoint_value(checkpoint: Any, key: str) -> Any:
@@ -926,6 +1166,22 @@ class Orchestrator:
             return checkpoint[key]
         except (KeyError, IndexError, TypeError):
             return None
+
+    @classmethod
+    def _checkpoint_progress(cls, checkpoint: Any) -> tuple[int, int, int]:
+        payload = cls._checkpoint_value(checkpoint, "context_data")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return (0, 0, 0)
+        data = (
+            payload.get("validation_progress", {}) if isinstance(payload, dict) else {}
+        )
+        values = tuple(data.get(key, 0) for key in ("retries", "replans", "cycles"))
+        return tuple(
+            value if type(value) is int and value >= 0 else 0 for value in values
+        )
 
     @staticmethod
     def _waiting_reason_code(reason: str) -> str:
@@ -941,7 +1197,12 @@ class Orchestrator:
         return "external_information"
 
     def _resume_validation(
-        self, task_id: int, checkpoint: Any, plan: Any | None = None
+        self,
+        task_id: int,
+        checkpoint: Any,
+        plan: Any | None = None,
+        *,
+        progress: tuple[int, int, int] | None = None,
     ) -> EngineResult:
         """Resume validation through the same state-decision path as a live run."""
         if isinstance(checkpoint, str) and plan is None:
@@ -979,7 +1240,9 @@ class Orchestrator:
             payload.get("execution") if isinstance(payload, dict) else None
         )
         if execution is None or self.validator is None:
-            return self._resume_replan(task_id)
+            return self._resume_replan(
+                task_id, progress=progress or self._checkpoint_progress(checkpoint)
+            )
         context = self.build_context(task_id)
         if self.unit_of_work is not None:
             attempt_id = self.unit_of_work.start_cycle(
@@ -995,52 +1258,43 @@ class Orchestrator:
             return self._handle_stage_exception(
                 task_id, attempt_id, "validation", error
             )
-        self._event(task_id, "task.validation.completed", self._serialize(validation))
-        try:
-            next_action = self._action(validation.data.get("next_action"))
-        except InvalidNextActionError as error:
-            return self._handle_invalid_action(
-                task_id, attempt_id, error, "task.validation.invalid_next_action"
-            )
-        if validation.status is ResultStatus.SUCCESS:
-            self._complete_done(task_id, attempt_id)
-            return validation
-        if next_action is NextAction.WAIT:
-            self._save_checkpoint(
-                task_id,
-                "waiting",
-                NextAction.WAIT,
-                attempt_id,
-                validation.message,
-                context_data={
-                    "plan": self._serialize(plan),
-                    "execution": self._serialize(execution),
-                },
-                plan_version=getattr(plan, "version", None),
-                execution_result=self._serialize(execution),
-            )
-            self._finish_attempt(attempt_id, "waiting", validation.message)
-            self._transition(task_id, "waiting")
-            self._event(task_id, "task.waiting", {"reason": validation.message})
-            return validation
-        if next_action is NextAction.RETRY_EXECUTION:
-            self._finish_attempt(attempt_id, "failed", validation.message)
+        progress = progress or self._checkpoint_progress(checkpoint)
+        decision = self._finish_validation(
+            task_id,
+            attempt_id,
+            plan,
+            execution,
+            validation,
+            retries=progress[0],
+            replans=progress[1],
+            cycle=progress[2],
+        )
+        if decision.outcome == "retry":
             return self.run(
                 task_id,
                 _resume_plan=plan,
-                _resume_action=next_action,
+                _resume_action=NextAction.RETRY_EXECUTION,
                 _resume_claimed=True,
+                _resume_retries=decision.retries,
+                _resume_replans=decision.replans,
+                _resume_cycles=progress[2] + 1,
             )
-        if next_action is NextAction.REPLAN:
-            self._finish_attempt(attempt_id, "failed", validation.message)
-            self._record_replan(task_id, plan, attempt_id, "validation_failed")
-            return self.run(task_id, _resume_claimed=True)
-        self._finish_attempt(attempt_id, "failed", validation.message)
-        self._fail_task(task_id, validation.message, "task.validation.failed")
-        return validation
+        if decision.outcome == "replan":
+            return self._resume_replan(
+                task_id, progress=(decision.retries, decision.replans, progress[2] + 1)
+            )
+        return decision.result
 
-    def _resume_replan(self, task_id: int) -> EngineResult:
-        return self.run(task_id)
+    def _resume_replan(
+        self, task_id: int, *, progress: tuple[int, int, int] = (0, 0, 0)
+    ) -> EngineResult:
+        return self.run(
+            task_id,
+            _resume_claimed=True,
+            _resume_retries=progress[0],
+            _resume_replans=progress[1],
+            _resume_cycles=progress[2],
+        )
 
     def cancel(self, task_id: int, reason: str = "Cancelled by user.") -> EngineResult:
         """Cancel a task and clean up its active execution state atomically."""

@@ -12,6 +12,7 @@ from harness.engine.result import (
     ExecutionStatus,
     NextAction,
     ResultStatus,
+    WaitReason,
 )
 
 
@@ -49,12 +50,14 @@ class Validator:
                 ResultStatus.WAITING,
                 "A blocking dependency is unresolved.",
                 ValidationResult(next_action=NextAction.WAIT),
+                WaitReason.EXTERNAL_INFORMATION,
             )
         if execution.status is ExecutionStatus.WAITING:
             return self._result(
                 ResultStatus.WAITING,
                 "Execution is waiting for an external prerequisite.",
                 ValidationResult(next_action=NextAction.WAIT),
+                execution.wait_reason,
             )
         if execution.status is ExecutionStatus.FAILED:
             action = (
@@ -280,10 +283,12 @@ class Validator:
         status: ResultStatus,
         message: str,
         validation: ValidationResult,
+        wait_reason: WaitReason | None = None,
     ) -> EngineResult:
         return EngineResult(
             status=status,
             message=message,
             errors=validation.errors,
+            wait_reason=wait_reason,
             data={"validation": validation, "next_action": validation.next_action},
         )

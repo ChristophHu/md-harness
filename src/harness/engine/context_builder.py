@@ -61,6 +61,12 @@ class ContextBuilder:
         project = self._project(task["project_id"])
         event_dicts = [dict(row) for row in self.event_store.list_for_task(task_id)]
         last_plan, last_validation, replanning_reasons = self._feedback(event_dicts)
+        checkpoint = (
+            self.checkpoint_store.get_active(task_id)
+            if self.checkpoint_store is not None
+            else None
+        )
+        checkpoint_data = dict(checkpoint) if checkpoint is not None else None
         context = ExecutionContext(
             task_id=task["id"],
             task_title=task["title"],
@@ -98,10 +104,10 @@ class ContextBuilder:
             last_plan=last_plan,
             last_validation=last_validation,
             replanning_reasons=replanning_reasons,
-            resume_checkpoint=(
-                dict(self.checkpoint_store.get(task_id))
-                if self.checkpoint_store is not None
-                and self.checkpoint_store.get(task_id) is not None
+            resume_checkpoint=checkpoint_data,
+            external_information_ref=(
+                checkpoint_data.get("information_ref")
+                if checkpoint_data and checkpoint_data.get("external_resolved_at")
                 else None
             ),
         )

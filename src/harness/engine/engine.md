@@ -463,12 +463,33 @@ wird kein neuer Attempt erzeugt. Nach Erfüllung der Voraussetzung wird der
 gespeicherte Einstiegspunkt fortgesetzt. Ein temporärer Fehler kann abhängig
 von Retry-Limits in `retry_execution` überführt werden.
 
+Neue WAIT-Ergebnisse von Executor und Validator benötigen einen expliziten
+`WaitReason` (`approval`, `external_information`, `temporary_error`,
+`workspace_missing` oder `manual_replan`). Nur alte Checkpoints ohne Code
+werden anhand ihres Freitexts eingeordnet. Jeder neue WAIT erhält einen
+eindeutigen `wait_token`. Für `external_information` kann der Aufrufer mit
+`Orchestrator.resolve_external_wait(task_id, wait_token, actor, information_ref)`
+eine dauerhaft erreichbare Referenz auf die bereitgestellte Information
+freigeben. Die Operation ist transaktional, für denselben Token und dieselbe
+Referenz idempotent und lehnt alte Token sowie andere Wartegründe ab.
+`resume()` bleibt bis zur Freigabe ohne neuen Attempt auf `waiting`; danach
+steht die Referenz in `ExecutionContext.external_information_ref` für Planner
+und Executor bereit. Die Anwendung, die den Wert setzt, muss sicherstellen,
+dass die referenzierte Information für diese Stages tatsächlich zugänglich ist.
+
 ### `validate`
 
 Die Execution gilt als abgeschlossen und wird nicht blind erneut ausgeführt.
 Der gespeicherte Plan und das Execution-Ergebnis bilden den Eingang für den
 Validator. Dessen Ergebnis entscheidet über `done`, `retry_execution`,
 `replan` oder einen neuen Waiting-Checkpoint.
+Normaler Lauf und Validation-Resume verwenden dieselbe Entscheidung. Das
+Validation-Ergebnis, sein Event, der Attempt-Abschluss, Taskstatus und
+Checkpoint werden bei SQLite-Persistenz in einer Unit-of-Work-Transaktion
+geschrieben. Retry und Replan erhalten bereits vor dem nächsten Zyklus einen
+wiederaufnehmbaren Checkpoint mit Plan und Zählern. Ein Absturz nach dem
+Commit kann daher am gespeicherten Einstiegspunkt fortgesetzt werden, ohne
+die vorherige Validation-Entscheidung nochmals zu schreiben.
 
 ### `replan`
 
