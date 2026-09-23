@@ -1,4 +1,4 @@
-from harness.application import build_orchestrator
+from harness.application import ApplicationFactory, build_orchestrator
 from harness.config import ConfigError, ExecutionConfig, PersistenceMode
 
 
@@ -47,6 +47,17 @@ def test_orchestrator_execution_config_overrides_constructor_defaults():
     )
     assert (orchestrator.max_retries, orchestrator.max_cycles) == (5, 8)
     assert orchestrator.persistence_mode is PersistenceMode.OPTIONAL
+
+
+def test_application_factory_owns_and_closes_connection(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("project:\n  workspace_dir: .\n", encoding="utf-8")
+    application = ApplicationFactory.create(config)
+    assert (
+        application.orchestrator.context_builder.tool_registry
+        is application.orchestrator.executor.registry
+    )
+    application.close()
 
 
 def test_build_orchestrator_rejects_disabled_persistence(tmp_path):

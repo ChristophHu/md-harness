@@ -220,3 +220,10 @@ def test_engine_unit_of_work_finishes_decision_atomically():
     )
     work.finish_decision(1, 4, "completed", "done", "task.done")
     assert connection.execute("SELECT status FROM tasks").fetchone()[0] == "done"
+
+
+def test_engine_unit_of_work_resume_without_checkpoint_store_returns_false():
+    connection = sqlite3.connect(":memory:")
+    store = Store(connection)
+    work = EngineUnitOfWork(TransactionManager(connection), store, store, store)
+    assert work.resume(1, "wait") is False

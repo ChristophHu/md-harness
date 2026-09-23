@@ -14,10 +14,13 @@ from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
 from harness.engine.result import (
     EngineResult,
+    ExecutionResult,
+    ExecutionStatus,
     FailureRecord,
     InvalidNextActionError,
     NextAction,
     ResultStatus,
+    StepExecution,
 )
 from harness.storage.factory import StoreBundle
 from harness.storage.transaction import EngineUnitOfWork, TransactionManager
@@ -99,7 +102,11 @@ class Orchestrator:
         self.transaction_manager = transaction_manager
         self.unit_of_work = (
             EngineUnitOfWork(
-                transaction_manager, task_store, event_store, artifact_store
+                transaction_manager,
+                task_store,
+                event_store,
+                artifact_store,
+                checkpoint_store,
             )
             if transaction_manager is not None
             and task_store is not None
@@ -430,7 +437,15 @@ class Orchestrator:
                 return validation
             if action is NextAction.WAIT:
                 self._save_checkpoint(
-                    task_id, "waiting", NextAction.WAIT, attempt_id, validation.message
+                    task_id,
+                    "waiting",
+                    NextAction.WAIT,
+                    attempt_id,
+                    validation.message,
+                    context_data={
+                        "plan": self._serialize(plan),
+                        "execution": self._serialize(execution),
+                    },
                 )
                 self._finish_attempt(attempt_id, "waiting")
                 self._transition(task_id, "waiting")
@@ -674,17 +689,16 @@ class Orchestrator:
         )
         if checkpoint is None:
             return self.run(task_id)
-        if checkpoint["resumed_at"] is None:
-            self.checkpoint_store.mark_resumed(task_id)
-            try:
-                next_action = checkpoint["next_action"]
-            except (KeyError, IndexError):
-                next_action = None
-            self._event(
-                task_id,
-                "task.resumed",
-                {"next_action": next_action},
-            )
+        try:
+            next_action = checkpoint["next_action"]
+        except (KeyError, IndexError):
+            next_action = None
+        if checkpoint["resumed_at"] is None and self.unit_of_work is not None:
+            self.unit_of_work.resume(task_id, next_action)
+        elif checkpoint["resumed_at"] is None:
+            resumed = self.checkpoint_store.mark_resumed(task_id)
+            if resumed:
+                self._event(task_id, "task.resumed", {"next_action": next_action})
         plan = None
         try:
             context_data = checkpoint["context_data"]
@@ -708,13 +722,66 @@ class Orchestrator:
             action = NextAction(checkpoint["next_action"])
         except (KeyError, ValueError):
             action = NextAction.REPLAN
-        if action is NextAction.RETRY_EXECUTION and plan is not None:
-            result = self.run(task_id, _resume_plan=plan, _resume_action=action)
-        else:
-            result = self.run(task_id)
+        result = self._resume_from_checkpoint(task_id, checkpoint, action, plan)
         if self.checkpoint_store is not None:
             self.checkpoint_store.mark_resumed(task_id)
         return result
+
+    def _resume_from_checkpoint(
+        self, task_id: int, checkpoint: Any, action: NextAction, plan: Any | None
+    ) -> EngineResult:
+        """Dispatch resume deterministically by the persisted checkpoint action."""
+        if action is NextAction.RETRY_EXECUTION:
+            return self._resume_retry_execution(task_id, plan)
+        if action is NextAction.WAIT:
+            return self._resume_wait(task_id, checkpoint)
+        if action is NextAction.VALIDATE:
+            return self._resume_validation(task_id, plan)
+        if action is NextAction.REPLAN:
+            return self._resume_replan(task_id)
+        return EngineResult.failure(f"Unsupported resume action: {action.value}")
+
+    def _resume_retry_execution(self, task_id: int, plan: Any | None) -> EngineResult:
+        if plan is None:
+            return self._resume_replan(task_id)
+        return self.run(
+            task_id, _resume_plan=plan, _resume_action=NextAction.RETRY_EXECUTION
+        )
+
+    def _resume_wait(self, task_id: int, checkpoint: Any) -> EngineResult:
+        """Keep unresolved external or approval blockers in ``waiting``."""
+        reason = str(checkpoint["reason"] or "waiting")
+        task = self.task_store.get(task_id) if self.task_store is not None else None
+        if task is not None and task["approval_status"] == "approved":
+            return self.run(task_id)
+        if self.task_store is not None and (
+            task is None or task["status"] != "waiting"
+        ):
+            self._transition(task_id, "waiting")
+        return EngineResult.waiting(reason)
+
+    def _resume_validation(self, task_id: int, plan: Any | None) -> EngineResult:
+        """Re-enter the validation-capable workflow without inventing a plan."""
+        if plan is None:
+            return self._resume_replan(task_id)
+        checkpoint = (
+            self.checkpoint_store.get(task_id)
+            if self.checkpoint_store is not None
+            else None
+        )
+        payload = checkpoint["context_data"] if checkpoint is not None else None
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        execution = self._deserialize_execution(
+            payload.get("execution") if isinstance(payload, dict) else None
+        )
+        if execution is None or self.validator is None:
+            return self._resume_replan(task_id)
+        context = self.build_context(task_id)
+        return self.validator.validate(context, plan, execution)
+
+    def _resume_replan(self, task_id: int) -> EngineResult:
+        return self.run(task_id)
 
     def cancel(self, task_id: int, reason: str = "Cancelled by user.") -> EngineResult:
         """Cancel a task and record the cancellation event."""
@@ -756,6 +823,43 @@ class Orchestrator:
             replanned_from=value.get("replanned_from"),
             reason=value.get("reason"),
         )
+
+    @staticmethod
+    def _deserialize_execution(value: Any) -> ExecutionResult | None:
+        if not isinstance(value, dict) or "status" not in value:
+            return None
+        try:
+            steps = [
+                StepExecution(
+                    step_id=item["step_id"],
+                    status=ExecutionStatus(item["status"]),
+                    tool=item.get("tool"),
+                    arguments=dict(item.get("arguments", {})),
+                    result=item.get("result"),
+                    artifacts=list(item.get("artifacts", [])),
+                    changed_files=list(item.get("changed_files", [])),
+                    acceptance_criteria=list(item.get("acceptance_criteria", [])),
+                    test_criteria=list(item.get("test_criteria", [])),
+                    error=item.get("error"),
+                )
+                for item in value.get("steps", [])
+            ]
+            return ExecutionResult(
+                status=ExecutionStatus(value["status"]),
+                steps=steps,
+                changed_files=list(value.get("changed_files", [])),
+                artifacts=list(value.get("artifacts", [])),
+                errors=list(value.get("errors", [])),
+                next_action=(
+                    NextAction(value["next_action"])
+                    if value.get("next_action")
+                    else None
+                ),
+                attempt_id=value.get("attempt_id"),
+                dry_run=bool(value.get("dry_run", False)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @classmethod
     def _replanning_payload(cls, plan: Any, validation: EngineResult) -> dict[str, Any]:

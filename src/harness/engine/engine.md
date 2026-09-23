@@ -436,3 +436,42 @@ Tasks werden vor dem Lauf atomar mit einem Run-Token und Lease geclaimt. Ein
 zweiter Prozess erhält keinen Claim; abgelaufene Leases können kontrolliert
 übernommen werden. Replans sind über `max_replans` begrenzt und werden mit
 Planversion, Vorgänger-Version und Ursache als Events persistiert.
+
+## Resume-Pfade
+
+`resume()` dispatcht anhand des persistierten `Checkpoint.next_action` und
+startet nicht mehr implizit immer den normalen Replan-Ablauf. Vor dem Dispatch
+wird der Checkpoint atomar als verarbeitet markiert und ein `task.resumed`-
+Event geschrieben.
+
+### `retry_execution`
+
+Der gespeicherte Plan wird rekonstruiert und mit demselben Plan erneut an den
+Executor übergeben. Bereits abgeschlossene Schritte werden über den
+Checkpoint-Fortschritt berücksichtigt. Eine neue Planung erfolgt nur, wenn der
+Plan fehlt oder nicht mehr gültig ist.
+
+### `wait`
+
+Ein ungelöster Approval- oder externer Blocker bleibt im Status `waiting`; es
+wird kein neuer Attempt erzeugt. Nach Erfüllung der Voraussetzung wird der
+gespeicherte Einstiegspunkt fortgesetzt. Ein temporärer Fehler kann abhängig
+von Retry-Limits in `retry_execution` überführt werden.
+
+### `validate`
+
+Die Execution gilt als abgeschlossen und wird nicht blind erneut ausgeführt.
+Der gespeicherte Plan und das Execution-Ergebnis bilden den Eingang für den
+Validator. Dessen Ergebnis entscheidet über `done`, `retry_execution`,
+`replan` oder einen neuen Waiting-Checkpoint.
+
+### `replan`
+
+Der Planner erhält den letzten Plan, die letzte Validierung und strukturierte
+Replanning-Gründe. Die Planversion wird erhöht; der alte und der neue Plan
+bleiben als Events nachvollziehbar.
+
+Alle vier Pfade prüfen Taskstatus, Checkpoint, Planversion, Workspace,
+Attempt-Zuordnung und die jeweiligen Retry-/Replan-Limits. Ungültige
+Checkpoints werden als strukturierter Workflow-Fehler behandelt und führen zu
+`failed`.

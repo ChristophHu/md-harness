@@ -33,3 +33,29 @@ def test_checkpoint_store_returns_none_for_unknown_task():
         "CREATE TABLE task_checkpoints (id INTEGER PRIMARY KEY, task_id INTEGER UNIQUE, phase TEXT, next_action TEXT, plan_version INTEGER, attempt_id INTEGER, reason TEXT, context_data TEXT, created_at TEXT, resumed_at TEXT)"
     )
     assert CheckpointStore(connection).get(99) is None
+
+
+def test_checkpoint_store_supports_legacy_schema_on_save():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE task_checkpoints (id INTEGER PRIMARY KEY, task_id INTEGER UNIQUE, phase TEXT, next_action TEXT, plan_version INTEGER, attempt_id INTEGER, reason TEXT, context_data TEXT, created_at TEXT, resumed_at TEXT)"
+    )
+    store = CheckpointStore(connection)
+    assert store.save(1, "waiting", "wait", reason="legacy") == 1
+    assert store.get(1)["reason"] == "legacy"
+
+
+def test_checkpoint_store_supports_intermediate_schema_on_save():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """CREATE TABLE task_checkpoints (
+        id INTEGER PRIMARY KEY, task_id INTEGER UNIQUE, phase TEXT,
+        next_action TEXT, plan_version INTEGER, attempt_id INTEGER, reason TEXT,
+        context_data TEXT, next_step_id TEXT, completed_step_ids TEXT,
+        plan_fingerprint TEXT, created_at TEXT, resumed_at TEXT)"""
+    )
+    store = CheckpointStore(connection)
+    assert store.save(1, "waiting", "wait", reason="intermediate") == 1
+    assert store.get(1)["reason"] == "intermediate"

@@ -135,6 +135,8 @@ CREATE INDEX IF NOT EXISTS idx_task_approvals_task ON task_approvals(task_id, cr
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_task_path_checksum
+    ON task_artifacts(task_id, path, checksum);
 
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE OF title, description, task_type, status, priority ON tasks

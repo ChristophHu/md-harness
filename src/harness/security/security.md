@@ -16,6 +16,26 @@ für `main` und `develop` eingerichtet. Dafür ist ein `GITHUB_TOKEN` mit
 Repository-Administrationsrecht erforderlich; das Secret gehört in die macOS
 Keychain oder die lokale Umgebung, nicht in das Repository.
 
+## Secret-Provider und GitHub-Authentifizierung
+
+Secrets werden ausschließlich über `SecretProvider` aufgelöst:
+
+- `MacOSKeychainSecretProvider` liest lokale Secrets aus der macOS-Keychain.
+- `EnvironmentSecretProvider` liest Secrets aus der Umgebung und ist für CI
+  vorgesehen.
+- `ChainedSecretProvider` verwendet zuerst die Keychain und fällt anschließend
+  auf die Umgebung zurück.
+
+`default_secret_provider()` ist die Standardverdrahtung für lokale Harness-
+Läufe. Secrets dürfen niemals im `ExecutionContext`, in SQLite, Events,
+Artefakten, Logs oder Git landen. Auch Fehlermeldungen dürfen Secret-Werte
+nicht enthalten.
+
+Für GitHub Actions wird die macOS-Keychain nicht verwendet. GitHub-Zugriffe
+erfolgen über den von GitHub bereitgestellten `GITHUB_TOKEN` oder über ein
+Repository-Secret. Ein persönlicher API-Key wird nicht in den Harness oder in
+den Workflow-Code eingebaut.
+
 ## Inhalt
 
 + - `permissions.py`, `command_policy.py`, `secrets.py` und `rotation.py`

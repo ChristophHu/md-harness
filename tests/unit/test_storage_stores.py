@@ -30,7 +30,7 @@ def db(tmp_path):
 def test_database_transaction_health_version_and_backup(tmp_path):
     path = db(tmp_path)
     assert healthcheck(path) is True
-    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 8
+    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 10
     with transaction(path) as connection:
         connection.execute("INSERT INTO projects (name, path) VALUES ('p', '/p')")
     with transaction(path) as connection:
@@ -57,6 +57,35 @@ def test_schema_file_and_migration_are_applied(tmp_path):
             == "md-harness"
         )
         assert apply_migrations(connection) == CURRENT_SCHEMA_VERSION
+
+
+def test_artifact_registration_normalizes_deduplicates_and_hashes(tmp_path):
+    path = db(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("report", encoding="utf-8")
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        store = ArtifactStore(connection, workspace)
+        first = store.register(1, "./report.txt", "report")
+        second = store.register(1, "report.txt", "report")
+        row = store.list_for_task(1)[0]
+    assert first == second
+    assert row["path"] == "report.txt"
+    assert row["size_bytes"] == 6
+    assert row["checksum"]
+
+
+def test_artifact_registration_rejects_unsafe_paths(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        store = ArtifactStore(connection)
+        with pytest.raises(ValueError):
+            store.register(1, "../secret.txt")
+        with pytest.raises(ValueError):
+            store.register(1, "")
+        with pytest.raises(ValueError):
+            store.register(1, "file.txt", size_bytes=-1)
 
 
 def test_sqlite_seed_contains_three_tasks(tmp_path):

@@ -597,6 +597,7 @@ def test_resume_marks_checkpoint_and_runs():
 
         def mark_resumed(self, _task_id):
             self.marked = True
+            return True
 
         def save(self, *_args, **_kwargs):
             return 1
@@ -690,6 +691,105 @@ def test_resume_ignores_corrupt_plan_payload():
     )
     orchestrator.run = lambda _task_id, **_kwargs: EngineResult.success("replanned")
     assert orchestrator.resume(1).successful
+
+
+@pytest.mark.parametrize("action", [NextAction.RETRY_EXECUTION, NextAction.VALIDATE])
+def test_resume_dispatches_explicit_plan_actions(action):
+    orchestrator = Orchestrator(StubContextBuilder(object()))
+    captured = []
+    orchestrator.run = lambda task_id, **kwargs: (
+        captured.append((task_id, kwargs)) or EngineResult.success("ok")
+    )
+    plan = object()
+    result = orchestrator._resume_from_checkpoint(1, {"reason": "test"}, action, plan)
+    assert result.successful
+    if action is NextAction.RETRY_EXECUTION:
+        assert captured[0][1]["_resume_plan"] is plan
+
+
+def test_resume_wait_keeps_unapproved_task_waiting():
+    class Tasks:
+        def get(self, _task_id):
+            return {"status": "waiting", "approval_status": "pending"}
+
+    orchestrator = Orchestrator(StubContextBuilder(object()), task_store=Tasks())
+    result = orchestrator._resume_wait(1, {"reason": "approval required"})
+    assert result.status is ResultStatus.WAITING
+
+
+def test_resume_validation_deserializes_and_calls_validator():
+    class Checkpoint:
+        def get(self, _task_id):
+            return {
+                "context_data": json.dumps(
+                    {"execution": {"status": "success", "steps": []}}
+                )
+            }
+
+    class Validator:
+        def validate(self, context, plan, execution):
+            assert context == "context"
+            assert plan == "plan"
+            assert execution.status.value == "success"
+            return EngineResult.success("validated")
+
+    orchestrator = Orchestrator(
+        StubContextBuilder("context"),
+        validator=Validator(),
+        checkpoint_store=Checkpoint(),
+    )
+    assert orchestrator._resume_validation(1, "plan").successful
+
+
+def test_resume_dispatches_invalid_action_as_failure():
+    orchestrator = Orchestrator(StubContextBuilder(object()))
+    result = orchestrator._resume_from_checkpoint(1, {}, NextAction.STOP, None)
+    assert result.status is ResultStatus.FAILED
+
+
+def test_resume_retry_without_plan_replans():
+    orchestrator = Orchestrator(StubContextBuilder(object()))
+    orchestrator.run = lambda task_id: EngineResult.success(str(task_id))
+    assert orchestrator._resume_retry_execution(3, None).successful
+
+
+def test_resume_validation_without_plan_replans():
+    orchestrator = Orchestrator(StubContextBuilder(object()))
+    orchestrator.run = lambda task_id: EngineResult.success(str(task_id))
+    assert orchestrator._resume_validation(3, None).successful
+
+
+def test_resume_wait_transitions_non_waiting_task():
+    class Tasks:
+        def get(self, _task_id):
+            return {"status": "ready", "approval_status": "pending"}
+
+        def transition(self, _task_id, status):
+            assert status == "waiting"
+
+    orchestrator = Orchestrator(StubContextBuilder(object()), task_store=Tasks())
+    assert (
+        orchestrator._resume_wait(1, {"reason": "external"}).status
+        is ResultStatus.WAITING
+    )
+
+
+def test_execution_result_deserialization_accepts_valid_payload():
+    execution = Orchestrator._deserialize_execution(
+        {
+            "status": "success",
+            "steps": [{"step_id": "s1", "status": "success"}],
+            "next_action": "validate",
+            "changed_files": ["a.py"],
+        }
+    )
+    assert execution is not None
+    assert execution.steps[0].step_id == "s1"
+
+
+def test_execution_result_deserialization_rejects_invalid_payload():
+    assert Orchestrator._deserialize_execution(None) is None
+    assert Orchestrator._deserialize_execution({"status": "invalid"}) is None
 
 
 def test_orchestrator_stops_after_maximum_cycles():

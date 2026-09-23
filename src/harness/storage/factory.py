@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 
 from harness.storage.artifact_store import ArtifactStore
 from harness.storage.checkpoint_store import CheckpointStore
@@ -28,10 +29,12 @@ class StoreFactory:
     """Build a complete, consistently connected persistence bundle."""
 
     @staticmethod
-    def create(connection: sqlite3.Connection) -> StoreBundle:
+    def create(
+        connection: sqlite3.Connection, workspace: str | Path | None = None
+    ) -> StoreBundle:
         task_store = TaskStore(connection)
         event_store = EventStore(connection)
-        artifact_store = ArtifactStore(connection)
+        artifact_store = ArtifactStore(connection, workspace)
         checkpoint_store = CheckpointStore(connection)
         manager = TransactionManager(
             connection, task_store, event_store, artifact_store, checkpoint_store

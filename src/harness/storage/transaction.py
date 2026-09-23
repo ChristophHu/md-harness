@@ -63,12 +63,27 @@ class EngineUnitOfWork:
         task_store: Any,
         event_store: Any,
         artifact_store: Any,
+        checkpoint_store: Any | None = None,
     ) -> None:
         self.manager = manager
         self.task_store = task_store
         self.event_store = event_store
         self.artifact_store = artifact_store
-        manager._validate_connections((task_store, event_store, artifact_store))
+        self.checkpoint_store = checkpoint_store
+        manager._validate_connections(
+            (task_store, event_store, artifact_store, checkpoint_store)
+        )
+
+    def resume(self, task_id: int, next_action: str) -> bool:
+        if self.checkpoint_store is None:
+            return False
+        with self.phase():
+            resumed = self.checkpoint_store.mark_resumed(task_id)
+            if resumed:
+                self.event_store.record(
+                    task_id, "task.resumed", {"next_action": next_action}
+                )
+            return resumed
 
     @contextmanager
     def phase(self) -> Iterator[sqlite3.Connection]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
 
     database_path = initialize_database(database)
     connection = connect(database_path)
-    stores = StoreFactory.create(connection)
+    stores = StoreFactory.create(connection, workspace)
     project_store = ProjectStore(connection)
     registry = ToolRegistryFactory.create(
         workspace,
@@ -66,3 +67,23 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
         execution_config=execution,
     )
     return orchestrator, connection
+
+
+@dataclass(frozen=True, slots=True)
+class Application:
+    """Fully wired application and its owned database connection."""
+
+    orchestrator: Orchestrator
+    connection: Any
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+class ApplicationFactory:
+    """Central composition root for configured harness applications."""
+
+    @staticmethod
+    def create(config_path: str | Path) -> Application:
+        orchestrator, connection = build_orchestrator(config_path)
+        return Application(orchestrator, connection)
