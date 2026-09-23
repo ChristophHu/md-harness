@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ def db(tmp_path):
 def test_database_transaction_health_version_and_backup(tmp_path):
     path = db(tmp_path)
     assert healthcheck(path) is True
-    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 5
+    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 8
     with transaction(path) as connection:
         connection.execute("INSERT INTO projects (name, path) VALUES ('p', '/p')")
     with transaction(path) as connection:
@@ -179,6 +180,61 @@ def test_list_ready_returns_only_ready_tasks(tmp_path):
         store.transition(ready, "ready")
         assert [row["id"] for row in store.list_ready()] == [ready]
         assert other not in [row["id"] for row in store.list_ready()]
+
+
+def test_task_claim_is_atomic_and_records_lease(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        store = TaskStore(connection)
+        task = store.create("Claimable")
+        store.transition(task, "ready")
+        store.approve(task, "reviewer")
+        assert store.claim(task, run_id="run-1") is True
+        assert store.claim(task, run_id="run-2") is False
+        row = store.get(task)
+        assert row["claim_token"] == "run-1"
+        assert row["claim_expires_at"]
+
+
+def test_task_claim_renewal_recovery_and_attempt_ownership(tmp_path):
+    path = db(tmp_path)
+    current = [datetime.now(UTC)]
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        store = TaskStore(connection, clock=lambda: current[0])
+        task = store.create("Recoverable")
+        store.transition(task, "ready")
+        store.approve(task, "reviewer")
+        assert store.claim(task, run_id="owner", lease_seconds=10)
+        assert store.renew_claim(task, "owner")
+        assert store.renew_claim(task, "other") is False
+        attempt = store.record_attempt(
+            task, "running", run_id="owner", claim_token="owner"
+        )
+        with pytest.raises(RuntimeError, match="active attempt"):
+            store.record_attempt(task, "running")
+        with pytest.raises(RuntimeError, match="not owned"):
+            store.complete_attempt(attempt, "done", claim_token="other")
+        store.complete_attempt(attempt, "done", claim_token="owner")
+        current[0] += timedelta(seconds=600)
+        assert store.claim(task, run_id="recovered") is True
+        with pytest.raises(RuntimeError, match="not owned"):
+            store.assert_claim(task, "owner")
+        recovery_attempt = store.record_attempt(
+            task, "running", run_id="recovered", claim_token="recovered"
+        )
+        current[0] += timedelta(seconds=600)
+        with pytest.raises(RuntimeError, match="expired"):
+            store.assert_claim(task, "recovered")
+        with pytest.raises(RuntimeError, match="expired"):
+            store.complete_attempt(recovery_attempt, "done", claim_token="recovered")
+        assert store.release_claim(task, "recovered") is True
+        assert store.release_claim(task, "recovered") is False
+        replan = store.record_replan(
+            task, "validation_failed", 2, parent_plan_version=1
+        )
+        assert store.replans(task)[0]["id"] == replan
 
 
 def test_approval_test_criteria_and_executable_tasks(tmp_path):

@@ -39,8 +39,10 @@ Das Schema umfasst:
 - `agents`
 - `task_assignments`
 - `task_attempts`
+- `task_replans`
 - `task_events`
 - `task_artifacts`
+- `task_checkpoints`
 
 Projekte können über `projects.parent_id` hierarchisch verschachtelt werden. Aufgaben können über `tasks.parent_id` in Epics, Features, Tasks und atomare Subtasks zerlegt werden. `approval_status` ist bewusst vom operativen `status` getrennt: Ein Task darf nur nach expliziter Freigabe ausführbar werden.
 
@@ -77,7 +79,13 @@ Neue Datenbanken werden aus `schema.sql` initialisiert. Danach werden ausstehend
 
 Bestehende Migrationen werden nicht verändert. Schemaänderungen erhalten eine neue Datei, beispielsweise `002_add_memory_table.sql`. Die aktuelle Modellversion wird als neue Ausgangsbasis initialisiert; eine automatische Konvertierung der verworfenen alten lokalen Struktur ist nicht vorgesehen.
 
-Schema-Version 3 ergänzt den Taskstatus `failed`. Der Orchestrator verwaltet außerdem `task_attempts`: Jeder Workflow-Zyklus wird begonnen, bei Retry/Replan als fehlgeschlagen abgeschlossen und bei Erfolg, Waiting oder endgültigem Fehler abgeschlossen.
+Schema-Version 3 ergänzt den Taskstatus `failed`. Schema-Version 6 ergänzt
+Task-/Attempt-Claims, Test-Timeouts und Arbeitsverzeichnisse. Schema-Version 7
+ergänzt `task_replans`; Schema-Version 8 erweitert Checkpoints um
+Resume-Schrittfortschritt und Plan-Fingerprints. Der Orchestrator verwaltet
+außerdem `task_attempts`: Jeder Workflow-Zyklus wird begonnen, bei
+Retry/Replan als fehlgeschlagen abgeschlossen und bei Erfolg, Waiting oder
+endgültigem Fehler abgeschlossen.
 
 ## Transaktionen und Sicherheit
 
@@ -105,4 +113,16 @@ Die aktuelle Storage- und Gesamt-Coverage beträgt 100 %.
 
 Die bisherige lokale Datenbankstruktur gilt für diese Modellversion als verworfen. Eine neue Datenbank wird aus dem aktuellen `schema.sql` initialisiert; bestehende lokale Datenbankdateien werden nicht automatisch migriert oder gelöscht.
 
-`CheckpointStore` persistiert Resume-Punkte wartender Tasks mit Phase, nächster Aktion, Attempt, Grund und Zeitpunkten. `Orchestrator.resume()` markiert einen vorhandenen Checkpoint als wieder aufgenommen und startet den Task erneut mit dem gespeicherten Kontext.
+`CheckpointStore` persistiert Resume-Punkte mit Phase, nächster Aktion,
+Planversion, Attempt, Grund, `next_step_id`, `completed_step_ids`,
+`plan_fingerprint` und optionalem Plan-Payload. `retry_execution` kann damit
+denselben Plan wiederherstellen und abgeschlossene Schritte überspringen.
+Die vollständige phasengenaue Resume-Semantik ist noch nicht abgeschlossen;
+offene Punkte stehen in `RESUME_TODO.md`.
+
+Für konkurrierende Läufe bietet `TaskStore.claim(task_id, run_id=...)` einen
+atomaren Claim mit Lease für freigegebene Tasks in aktiven Stati. Claims können
+verlängert, freigegeben und nach Ablauf übernommen werden. Attempts speichern
+Run-ID, Claim-Token und Ablaufzeit; ein zweiter aktiver Attempt je Task wird
+abgelehnt. `task_replans` speichert Grund, Planversion, Parent-Version,
+Attempt-Referenz und Fingerprints.

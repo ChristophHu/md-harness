@@ -1,5 +1,9 @@
 """Task persistence and state transition operations."""
 
+import json
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from sqlite3 import Connection, Row
 from typing import Any, ClassVar
 
@@ -33,8 +37,11 @@ class TaskStore:
         "assigned_agent",
     }
 
-    def __init__(self, connection: Connection):
+    def __init__(
+        self, connection: Connection, *, clock: Callable[[], datetime] | None = None
+    ):
         self.connection = connection
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def create(
         self, title: str, *, project_id: int | None = None, **fields: Any
@@ -67,6 +74,59 @@ class TaskStore:
         return self.connection.execute(
             "SELECT * FROM tasks WHERE status = 'ready' ORDER BY priority, id"
         ).fetchall()
+
+    def claim(
+        self, task_id: int, *, run_id: str | None = None, lease_seconds: int = 300
+    ) -> bool:
+        """Atomically claim an approved ready task for orchestration."""
+        token = run_id or str(uuid.uuid4())
+        expires = (self.clock() + timedelta(seconds=lease_seconds)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        cursor = self.connection.execute(
+            """UPDATE tasks SET status = CASE WHEN status = 'ready' THEN 'planning' ELSE status END,
+                planning_started_at = COALESCE(planning_started_at, CURRENT_TIMESTAMP),
+                claim_token = ?, claimed_at = CURRENT_TIMESTAMP, claim_expires_at = ?
+                WHERE id = ? AND status IN ('ready', 'planning', 'executing', 'validating')
+                AND approval_status = 'approved'
+                AND (claim_expires_at IS NULL OR claim_expires_at < ?)""",
+            (token, expires, task_id, self._now_sql()),
+        )
+        return cursor.rowcount == 1
+
+    def renew_claim(self, task_id: int, run_id: str, lease_seconds: int = 300) -> bool:
+        expires = (self.clock() + timedelta(seconds=lease_seconds)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        cursor = self.connection.execute(
+            """UPDATE tasks SET claim_expires_at = ?
+               WHERE id = ? AND claim_token = ?
+               AND claim_expires_at >= ?""",
+            (expires, task_id, run_id, self._now_sql()),
+        )
+        return cursor.rowcount == 1
+
+    def release_claim(self, task_id: int, run_id: str) -> bool:
+        cursor = self.connection.execute(
+            """UPDATE tasks SET claim_token = NULL, claimed_at = NULL,
+               claim_expires_at = NULL
+               WHERE id = ? AND claim_token = ?""",
+            (task_id, run_id),
+        )
+        return cursor.rowcount == 1
+
+    def assert_claim(self, task_id: int, run_id: str) -> None:
+        task = self.get(task_id)
+        if task is None or task["claim_token"] != run_id:
+            raise RuntimeError("task claim is not owned by this run")
+        if (
+            task["claim_expires_at"] is not None
+            and task["claim_expires_at"] < self._now_sql()
+        ):
+            raise RuntimeError("task claim has expired")
+
+    def _now_sql(self) -> str:
+        return self.clock().strftime("%Y-%m-%d %H:%M:%S")
 
     def approve(
         self, task_id: int, approved_by: str, reason: str | None = None
@@ -110,11 +170,20 @@ class TaskStore:
         criterion: str,
         *,
         test_type: str = "automated",
-        command: str | None = None,
+        command: str | list[str] | None = None,
+        timeout_seconds: float = 120.0,
+        working_directory: str | None = None,
     ) -> int:
         return self.connection.execute(
-            "INSERT INTO task_test_criteria (task_id, criterion, test_type, command) VALUES (?, ?, ?, ?)",
-            (task_id, criterion, test_type, command),
+            "INSERT INTO task_test_criteria (task_id, criterion, test_type, command, timeout_seconds, working_directory) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                criterion,
+                test_type,
+                json.dumps(command) if isinstance(command, list) else command,
+                timeout_seconds,
+                working_directory,
+            ),
         ).lastrowid
 
     def test_criteria(self, task_id: int) -> list[Row]:
@@ -208,10 +277,33 @@ class TaskStore:
         status: str,
         agent: str | None = None,
         error_message: str | None = None,
+        *,
+        run_id: str | None = None,
+        claim_token: str | None = None,
+        lease_seconds: int = 300,
     ) -> int:
+        if claim_token is not None:
+            self.assert_claim(task_id, claim_token)
+        active = self.connection.execute(
+            "SELECT 1 FROM task_attempts WHERE task_id = ? AND completed_at IS NULL AND status = 'running'",
+            (task_id,),
+        ).fetchone()
+        if active is not None:
+            raise RuntimeError("task already has an active attempt")
+        expires = (self.clock() + timedelta(seconds=lease_seconds)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         return self.connection.execute(
-            "INSERT INTO task_attempts (task_id, agent, status, error_message) VALUES (?, ?, ?, ?)",
-            (task_id, agent, status, error_message),
+            "INSERT INTO task_attempts (task_id, agent, status, error_message, run_id, claim_token, claim_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                agent,
+                status,
+                error_message,
+                run_id,
+                claim_token,
+                expires if run_id else None,
+            ),
         ).lastrowid
 
     def attempts(self, task_id: int) -> list[Row]:
@@ -221,10 +313,60 @@ class TaskStore:
         ).fetchall()
 
     def complete_attempt(
-        self, attempt_id: int, status: str, error_message: str | None = None
+        self,
+        attempt_id: int,
+        status: str,
+        error_message: str | None = None,
+        *,
+        claim_token: str | None = None,
     ) -> None:
         """Complete an execution attempt with its final status."""
+        if claim_token is not None:
+            attempt = self.connection.execute(
+                "SELECT claim_token, claim_expires_at FROM task_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt["claim_token"] != claim_token:
+                raise RuntimeError("attempt claim is not owned by this run")
+            if (
+                attempt["claim_expires_at"] is not None
+                and attempt["claim_expires_at"] < self._now_sql()
+            ):
+                raise RuntimeError("attempt claim has expired")
         self.connection.execute(
-            "UPDATE task_attempts SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ? WHERE id = ?",
-            (status, error_message, attempt_id),
+            "UPDATE task_attempts SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ? WHERE id = ? AND (? IS NULL OR claim_token = ?)",
+            (status, error_message, attempt_id, claim_token, claim_token),
         )
+
+    def record_replan(
+        self,
+        task_id: int,
+        reason_code: str,
+        plan_version: int,
+        *,
+        parent_plan_version: int | None = None,
+        attempt_id: int | None = None,
+        reason_fingerprint: str | None = None,
+        plan_fingerprint: str | None = None,
+    ) -> int:
+        fingerprint = reason_fingerprint or reason_code
+        return self.connection.execute(
+            """INSERT INTO task_replans
+               (task_id, attempt_id, parent_plan_version, plan_version,
+                reason_code, reason_fingerprint, plan_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task_id,
+                attempt_id,
+                parent_plan_version,
+                plan_version,
+                reason_code,
+                fingerprint,
+                plan_fingerprint,
+            ),
+        ).lastrowid
+
+    def replans(self, task_id: int) -> list[Row]:
+        return self.connection.execute(
+            "SELECT * FROM task_replans WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()

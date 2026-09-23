@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from harness.engine.context import ExecutionContext
 from harness.engine.plan import ExecutionPlan
 from harness.engine.result import (
@@ -58,7 +60,27 @@ class Executor:
             )
 
         executions: list[StepExecution] = []
+        checkpoint = context.resume_checkpoint or {}
+        completed_ids = checkpoint.get("completed_step_ids", [])
+        if isinstance(completed_ids, str):
+            try:
+                completed_ids = json.loads(completed_ids)
+            except json.JSONDecodeError:
+                completed_ids = []
+        completed = set(completed_ids or [])
         for step in plan.steps:
+            if step.id in completed:
+                executions.append(
+                    StepExecution(
+                        step.id,
+                        ExecutionStatus.SKIPPED,
+                        step.tool,
+                        result="resumed",
+                        acceptance_criteria=list(step.acceptance_criteria),
+                        test_criteria=list(step.test_criteria),
+                    )
+                )
+                continue
             if step.action == "skip":
                 executions.append(
                     StepExecution(step.id, ExecutionStatus.SKIPPED, result="skipped")
@@ -95,22 +117,68 @@ class Executor:
                     errors=execution.errors,
                     data={"execution": execution, "next_action": next_action},
                 )
+            normalized = (
+                ToolExecutionResult(data=result)
+                if step.tool == "test_runner" and isinstance(result, dict)
+                else result
+            )
+            if (
+                step.tool == "test_runner"
+                and isinstance(normalized, ToolExecutionResult)
+                and (
+                    normalized.data.get("timed_out")
+                    or normalized.data.get("exit_code") != 0
+                )
+            ):
+                executions.append(
+                    StepExecution(
+                        step.id,
+                        ExecutionStatus.FAILED,
+                        step.tool,
+                        result=normalized,
+                        test_criteria=list(step.test_criteria),
+                        changed_files=list(normalized.data.get("changed_files", [])),
+                    )
+                )
+                test_error = ExecutionError(
+                    ExecutionErrorType.TOOL_FAILURE,
+                    "test command failed",
+                    tool=step.tool,
+                    step_id=step.id,
+                    retryable=True,
+                )
+                failed = ExecutionResult(
+                    ExecutionStatus.FAILED,
+                    executions,
+                    errors=[test_error.message],
+                    error_details=[test_error],
+                    next_action=NextAction.RETRY_EXECUTION,
+                )
+                return EngineResult(
+                    ResultStatus.FAILED,
+                    "Test command failed.",
+                    errors=failed.errors,
+                    data={
+                        "execution": failed,
+                        "next_action": NextAction.RETRY_EXECUTION,
+                    },
+                )
             executions.append(
                 StepExecution(
                     step.id,
                     ExecutionStatus.SUCCESS,
                     step.tool,
-                    result=result,
+                    result=normalized,
                     acceptance_criteria=list(step.acceptance_criteria),
                     test_criteria=list(step.test_criteria),
                     artifacts=(
-                        list(result.data.get("artifacts", []))
-                        if isinstance(result, ToolExecutionResult)
+                        list(normalized.data.get("artifacts", []))
+                        if isinstance(normalized, ToolExecutionResult)
                         else []
                     ),
                     changed_files=(
-                        list(result.data.get("changed_files", []))
-                        if isinstance(result, ToolExecutionResult)
+                        list(normalized.data.get("changed_files", []))
+                        if isinstance(normalized, ToolExecutionResult)
                         else []
                     ),
                 )

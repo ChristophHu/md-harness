@@ -8,12 +8,13 @@ from harness.tools.base import ToolRegistry
 from harness.tools.filesystem import FilesystemTool
 from harness.tools.git import GitRepository
 from harness.tools.sqlite import SQLiteTool
+from harness.tools.test_runner import TestRunner
 
 
 class ToolRegistryFactory:
     """Create consistently configured registries for a workspace."""
 
-    DEFAULT_TOOLS = frozenset({"filesystem", "git", "sqlite"})
+    DEFAULT_TOOLS = frozenset({"filesystem", "git", "sqlite", "test_runner"})
 
     @classmethod
     def create(
@@ -45,4 +46,6 @@ class ToolRegistryFactory:
                 else root / "state/harness.sqlite"
             )
             registry.register(SQLiteTool(database_path))
+        if "test_runner" in selected:
+            registry.register(TestRunner(root))
         return registry

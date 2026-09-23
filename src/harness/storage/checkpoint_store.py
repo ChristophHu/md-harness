@@ -21,15 +21,46 @@ class CheckpointStore:
         attempt_id: int | None = None,
         reason: str | None = None,
         context_data: dict[str, Any] | None = None,
+        next_step_id: str | None = None,
+        completed_step_ids: list[str] | None = None,
+        plan_fingerprint: str | None = None,
     ) -> int:
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(task_checkpoints)")
+        }
+        if not {"next_step_id", "completed_step_ids", "plan_fingerprint"} <= columns:
+            cursor = self.connection.execute(
+                """INSERT INTO task_checkpoints
+                (task_id, phase, next_action, plan_version, attempt_id, reason, context_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET phase=excluded.phase,
+                next_action=excluded.next_action, plan_version=excluded.plan_version,
+                attempt_id=excluded.attempt_id, reason=excluded.reason,
+                context_data=excluded.context_data, created_at=CURRENT_TIMESTAMP,
+                resumed_at=NULL""",
+                (
+                    task_id,
+                    phase,
+                    next_action,
+                    plan_version,
+                    attempt_id,
+                    reason,
+                    json.dumps(context_data) if context_data is not None else None,
+                ),
+            )
+            return cursor.lastrowid
         cursor = self.connection.execute(
             """INSERT INTO task_checkpoints
-            (task_id, phase, next_action, plan_version, attempt_id, reason, context_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (task_id, phase, next_action, plan_version, attempt_id, reason, context_data,
+             next_step_id, completed_step_ids, plan_fingerprint)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET phase=excluded.phase,
             next_action=excluded.next_action, plan_version=excluded.plan_version,
             attempt_id=excluded.attempt_id, reason=excluded.reason,
-            context_data=excluded.context_data, created_at=CURRENT_TIMESTAMP,
+            context_data=excluded.context_data, next_step_id=excluded.next_step_id,
+            completed_step_ids=excluded.completed_step_ids,
+            plan_fingerprint=excluded.plan_fingerprint, created_at=CURRENT_TIMESTAMP,
             resumed_at=NULL""",
             (
                 task_id,
@@ -39,6 +70,9 @@ class CheckpointStore:
                 attempt_id,
                 reason,
                 json.dumps(context_data) if context_data is not None else None,
+                next_step_id,
+                json.dumps(completed_step_ids or []),
+                plan_fingerprint,
             ),
         )
         return cursor.lastrowid

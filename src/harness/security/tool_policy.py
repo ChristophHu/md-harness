@@ -39,7 +39,14 @@ class ToolSecurityPolicy:
                 ExecutionErrorType.TOOL_NOT_FOUND,
             )
         permission = tool.definition.permission
-        if permission is PermissionLevel.NETWORK and not self.allow_network:
+        local_git_read = tool.tool_name == "git" and plan_step.arguments.get(
+            "operation"
+        ) in {"status", "diff", "diff_stat", "changed_files", "branch", "log"}
+        if (
+            permission is PermissionLevel.NETWORK
+            and not self.allow_network
+            and not local_git_read
+        ):
             raise ToolError(
                 f"network permission denied for tool '{tool.tool_name}'",
                 ExecutionErrorType.UNAUTHORIZED_TOOL,

@@ -59,6 +59,18 @@ class ExecutionError:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class FailureRecord:
+    """Stable, persistence-friendly description of an unexpected failure."""
+
+    component: str
+    error_class: str
+    message: str
+    retryable: bool
+    recovery_action: NextAction
+    details: dict[str, Any] = field(default_factory=dict)
+
+
 class InvalidNextActionError(ValueError):
     """Raised when a stage returns an unsupported workflow action."""
 

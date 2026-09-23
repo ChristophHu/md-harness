@@ -22,8 +22,80 @@ class TestCriterion:
     id: int
     criterion: str
     test_type: str = "automated"
-    command: str | None = None
+    command: str | list[str] | None = None
+    timeout_seconds: float = 120.0
+    working_directory: str | None = None
     completed: bool = False
+
+
+@dataclass(slots=True)
+class FileChange:
+    path: str
+    operation: str
+    content: str | None = None
+    expected_content: str | None = None
+    search: str | None = None
+    replacement: str | None = None
+    acceptance_criteria: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TestRequest:
+    command: list[str]
+    timeout_seconds: float = 120.0
+    working_directory: str | None = None
+    test_criteria: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ChangeRequest:
+    files: list[FileChange] = field(default_factory=list)
+    tests: list[TestRequest] = field(default_factory=list)
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> ChangeRequest:
+        if not isinstance(value, dict):
+            raise TypeError("change must be a mapping")
+        files = []
+        for item in value.get("files", []):
+            if not isinstance(item, dict):
+                raise TypeError("file change must be a mapping")
+            files.append(
+                FileChange(
+                    **{
+                        key: item[key]
+                        for key in (
+                            "path",
+                            "operation",
+                            "content",
+                            "expected_content",
+                            "search",
+                            "replacement",
+                            "acceptance_criteria",
+                        )
+                        if key in item
+                    }
+                )
+            )
+        tests = []
+        for item in value.get("tests", []):
+            if not isinstance(item, dict) or not isinstance(item.get("command"), list):
+                raise TypeError("test request command must be a list")
+            tests.append(
+                TestRequest(
+                    **{
+                        key: item[key]
+                        for key in (
+                            "command",
+                            "timeout_seconds",
+                            "working_directory",
+                            "test_criteria",
+                        )
+                        if key in item
+                    }
+                )
+            )
+        return cls(files=files, tests=tests)
 
 
 @dataclass(slots=True)

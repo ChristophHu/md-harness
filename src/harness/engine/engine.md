@@ -58,11 +58,14 @@ Der Orchestrator verwendet zwei getrennte Grenzen aus der `execution`-Konfigurat
 execution:
   max_retries: 2
   max_cycles: 3
+  max_replans: 2
 ```
 
-`max_retries` begrenzt Wiederholungen der Ausführung desselben Plans. `max_cycles` begrenzt die gesamte Anzahl von Planner-/Executor-/Validator-Durchläufen und schützt vor Endlosschleifen durch wiederholtes Replanning. Beide Werte werden aus der normalen YAML-Konfiguration geladen; `.env` ist dafür nicht vorgesehen.
+`max_retries` begrenzt Wiederholungen der Ausführung desselben Plans. `max_cycles` begrenzt die gesamte Anzahl von Planner-/Executor-/Validator-Durchläufen. `max_replans` begrenzt neue Planerzeugungen. Alle Werte werden aus der normalen YAML-Konfiguration geladen; `.env` ist dafür nicht vorgesehen.
 
 Der Orchestrator verwaltet pro Zyklus zusätzlich einen Eintrag in `task_attempts`. Retries und Replans werden als fehlgeschlagene Attempts abgeschlossen; erfolgreiche Validierung, Waiting und endgültige Fehler schließen den Attempt mit dem jeweiligen Ergebnisstatus ab. Nicht behebbares Scheitern setzt den Taskstatus auf `failed` und erzeugt ein `task.failed`-Event.
+
+Ein freigegebener Task wird atomar mit Run-Token und Lease geclaimt. Claims gelten für `ready`, `planning`, `executing` und `validating`; abgelaufene Claims können übernommen, verlängert oder freigegeben werden. Task- und Attempt-Claims speichern Token und Ablaufzeit. Claim, Attempt und Planungs-Event werden gemeinsam transaktional angelegt.
 
 ### Replanning-Feedback und Events
 
@@ -122,6 +125,27 @@ success → Plan konnte erstellt werden
 
 Der Planner darf analysieren, strukturieren, zuordnen und Vorschläge machen. Er darf keine Dateien schreiben, keine Tools ausführen, keine Tests starten, keine SQLite-Status ändern und keine Akzeptanzkriterien als erfüllt markieren.
 
+Für den MVP unterstützt der Planner zusätzlich einen deterministischen Datei-Workflow. Ein Task mit dem Titel `Create file: <workspace-pfad>` oder `Update file: <workspace-pfad>` erzeugt konkrete Filesystem-Schritte:
+
+```text
+filesystem.list(.)
+filesystem.write(<pfad>, task_description)
+filesystem.read(<pfad>)
+git.status()
+git.diff()
+```
+
+Zusätzlich akzeptiert der Planner deklarative Änderungsdaten in
+`ExecutionContext.metadata["change"]`. Unterstützt werden die sicheren MVP-
+Operationen `create`, `update` und `read`. Jede deklarierte Änderung wird mit
+Readback, Criteria-Zuordnung, Abhängigkeiten und optionalen Test-/Git-Schritten
+in einen konkreten Plan übersetzt. `delete` und `move` werden weiterhin
+abgelehnt. Schreiboperationen dürfen nicht allein aus Freitext entstehen.
+
+Wenn `git` im Context verfügbar ist, ergänzt der Planner nach der Dateiänderung lokale Verifikationsschritte für `git status` und `git diff`. Diese Operationen lesen ausschließlich das lokale Repository und dürfen deshalb auch bei deaktiviertem Netzwerkzugriff ausgeführt werden. Netzwerkoperationen wie `pull`, `push` und `fetch` bleiben weiterhin durch die Policy gesperrt, sofern sie nicht ausdrücklich freigegeben sind.
+
+Die Argumente werden als Teil jedes `PlanStep` erzeugt und anschließend durch `ToolRegistry` und `ToolSecurityPolicy` geprüft. Relative Pfade bleiben auf den konfigurierten Workspace begrenzt. Der Schreibschritt wird bei `dry_run` durch die Security Policy verhindert; der Planner selbst führt keine Änderung aus.
+
 Das Ergebnis des Planners ist ein `ExecutionPlan` aus `src/harness/engine/plan.py`:
 
 ```text
@@ -167,7 +191,7 @@ Bereits vorhandene Tools sind:
 
 Der `ContextBuilder` liest über `tool_registry.list()` die verfügbaren Toolnamen und übernimmt sie in den `ExecutionContext`. Die Registry führt selbst keine automatische Auswahl durch; sie stellt nur die registrierten und berechtigten Tools bereit.
 
-Die zentrale Initialisierung erfolgt über `src/harness/application.py`. `build_orchestrator(...)` lädt die YAML-Konfiguration, initialisiert Datenbank und `StoreBundle`, erzeugt die `ToolRegistry` über `ToolRegistryFactory`, konfiguriert den `ContextBuilder` und verdrahtet anschließend Planner, Executor, Validator und Orchestrator. Dabei werden `dry_run`, `max_retries`, `max_cycles` und `persistence_mode` aus `ExecutionConfig` übernommen.
+Die zentrale Initialisierung erfolgt über `src/harness/application.py`. `build_orchestrator(...)` lädt die YAML-Konfiguration, initialisiert Datenbank und `StoreBundle`, erzeugt die `ToolRegistry` über `ToolRegistryFactory`, konfiguriert den `ContextBuilder` und verdrahtet anschließend Planner, Executor, Validator und Orchestrator. Dabei werden `dry_run`, `max_retries`, `max_cycles`, `max_replans` und `persistence_mode` aus `ExecutionConfig` übernommen.
 
 Der Anwendungseinstieg liegt in `src/harness/cli.py`. Ein produktiver Lauf kann über die folgenden Befehle gestartet oder gesteuert werden:
 
@@ -183,6 +207,17 @@ Die CLI hält keine eigene Engine- oder Persistenzlogik, sondern verwendet aussc
 ## Executor und Tool-Sicherheit
 
 Der Executor erhält den `ExecutionContext`, den `ExecutionPlan`, eine injizierte `ToolRegistry` und eine `ToolSecurityPolicy`. Die Registry enthält alle registrierten Tools, stellt aber keine pauschale Ausführungsfreigabe dar.
+
+Ein produktionsnaher MVP-Lauf verwendet `FilesystemTool` für die konkrete Dateiänderung und `GitRepository` für die lokale Nachkontrolle. Das Zielverzeichnis muss dafür bereits ein Git-Repository sein. Der Executor übergibt die Planargumente unverändert an die Registry, übernimmt geänderte Dateien und Toolresultate in `StepExecution` und persistiert das normalisierte Ergebnis als `task.execution.completed`. Der Validator prüft anschließend, dass alle Plan-Schritte erfolgreich ausgeführt wurden, die zugeordneten Acceptance- und Testkriterien durch die Schritte abgedeckt sind, der Read-back-Inhalt dem erwarteten Schreibinhalt entspricht und der erwartete Pfad in der lokalen Git-Status-/Diff-Evidenz vorkommt. Der End-to-End-Test unter `tests/integration/test_engine_sqlite_workflow.py` validiert diesen Ablauf mit temporärem Workspace und SQLite.
+
+Die fachliche Validierung erfasst zusätzlich Evidenz, geänderte Dateien,
+erlaubte Dateien sowie erforderliche und verbotene Diff-Inhalte. Unerwartete
+Datei- oder Diff-Änderungen führen zu `replan`; ein fachlicher Ausführungsfehler
+führt zu `retry_execution`.
+
+Tools verwenden gemeinsame Ressourcenlimits für maximale Ausgabe und Anzahl
+geänderter Dateien. Der `TestRunner` erzwingt diese Limits zusätzlich zu
+Allowlist, Timeout und Workspace-Grenzen.
 
 Für jeden Plan-Schritt gilt:
 
@@ -250,6 +285,15 @@ Die Engine koordiniert den Ablauf, besitzt aber nicht die zugrunde liegenden Dat
 Ausführungsfehler werden als `ExecutionError` mit einem stabilen `ExecutionErrorType`, optionalem Tool- und Step-Bezug sowie Retry- und Detailinformationen zurückgegeben. Die zentrale Klassifikation leitet daraus die nächste Aktion ab: Tool- und Policy-Fehler führen zu `replan`, temporäre Tool- oder Workspace-Fehler zu `retry_execution`, externe Blocker zu `wait` und eine fehlerfreie Ausführung zu `validate`. Workspace-Fehler mit erwarteter Berechtigungsfreigabe werden ebenfalls in `wait` überführt; fehlende oder ungültige Workspaces führen zu `replan`.
 
 Der Orchestrator wertet `ExecutionResult.next_action` nach jeder Ausführung aus. `validate` ruft den Validator auf, `retry_execution` wiederholt die Ausführung mit demselben Plan, `replan` startet die Planung mit aktualisiertem Kontext erneut, `wait` beendet den Lauf im Status `waiting` und `stop` beendet ihn erfolgreich im Status `done`. Jede Entscheidung wird als `task.execution.next_action` persistiert.
+
+Bei `wait` persistiert der `CheckpointStore` Phase, nächste Aktion, Attempt-ID,
+Planversion, Grund, nächsten Schritt, abgeschlossene Schritte und optional den
+serialisierten Plan. `resume()` markiert den Checkpoint als wieder aufgenommen
+und erzeugt ein `task.resumed`-Event. Ein gespeicherter Plan kann für
+`retry_execution` wiederhergestellt werden; bereits abgeschlossene Schritte
+werden übersprungen. Ein separater Dispatcher für `validate` und `replan`, echte
+Workspace-Hash-Idempotenz, vollständige Claim-/Attempt-Recovery und getrennte
+Prozessabbruch-E2E-Tests sind noch offen und in `RESUME_TODO.md` dokumentiert.
 
 Unbekannte `next_action`-Werte werden als `invalid_next_action` klassifiziert. Der aktuelle Attempt und Task werden auf `failed` gesetzt; zusätzlich werden `task.execution.invalid_next_action` beziehungsweise `task.validation.invalid_next_action` sowie `task.failed` persistiert.
 
@@ -373,3 +417,22 @@ created
 ```
 
 Die SQLite-Aufgabe verwendet dieselben Workflow-Statuswerte wie die Engine: `created`, `ready`, `planning`, `executing`, `validating`, `waiting`, `done` und `cancelled`. Jeder Statuswechsel wird über `TaskStore` geprüft und kann als Event protokolliert werden.
+
+## Fehler- und Sicherheitsmodell
+
+Unerwartete Exceptions aus Planner, Executor, Validator und Tools werden an der
+Orchestrator-Phasengrenze in einen `FailureRecord` normalisiert. Dieser enthält
+Komponente, Exception-Klasse, Meldung, Retryfähigkeit und die empfohlene
+Recovery-Aktion (`retry_execution` oder `replan`). Der Fehler wird als
+`task.<phase>.exception` und anschließend als fehlgeschlagener Lauf persistiert.
+
+Toolargumente werden vor der Ausführung zentral gegen die Tooldefinition
+geprüft. Typen, Pflicht- und unbekannte Argumente sowie Pfade werden validiert;
+absolute Pfade und Traversal mit `..` werden abgelehnt. Einzelne Tools dürfen
+zusätzliche Regeln wie Allowlist-Kommandos, Timeouts und Symlink-Prüfungen
+anwenden. Dadurch bleiben Workspace-Grenzen und Tool-Sicherheitsregeln auch
+für neu registrierte Tools konsistent.
+Tasks werden vor dem Lauf atomar mit einem Run-Token und Lease geclaimt. Ein
+zweiter Prozess erhält keinen Claim; abgelaufene Leases können kontrolliert
+übernommen werden. Replans sind über `max_replans` begrenzt und werden mit
+Planversion, Vorgänger-Version und Ursache als Events persistiert.

@@ -17,6 +17,8 @@ class PlanStep:
     arguments: dict[str, Any] = field(default_factory=dict)
     acceptance_criteria: list[int] = field(default_factory=list)
     test_criteria: list[int] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

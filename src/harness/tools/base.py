@@ -17,9 +17,12 @@ class ToolError(RuntimeError):
         self,
         message: str,
         error_type: ExecutionErrorType = ExecutionErrorType.TOOL_FAILURE,
+        *,
+        retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.retryable = retryable
 
 
 class PermissionLevel(StrEnum):
@@ -27,6 +30,18 @@ class PermissionLevel(StrEnum):
     WRITE = "write"
     DESTRUCTIVE = "destructive"
     NETWORK = "network"
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceLimits:
+    """Hard execution limits shared by tools."""
+
+    max_output_bytes: int = 20_000
+    max_changed_files: int = 100
+
+    def __post_init__(self) -> None:
+        if self.max_output_bytes <= 0 or self.max_changed_files < 1:
+            raise ValueError("resource limits must be positive")
 
 
 @dataclass(frozen=True)
@@ -50,6 +65,7 @@ class ToolContext:
     workspace: str | None = None
     dry_run: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    limits: ResourceLimits = field(default_factory=ResourceLimits)
 
 
 class Tool(ABC):
@@ -83,6 +99,48 @@ class Tool(ABC):
                 f"missing arguments for {self.tool_name}: {sorted(missing)}",
                 ExecutionErrorType.INVALID_ARGUMENTS,
             )
+        for parameter in self.definition.parameters:
+            if parameter.name not in arguments:
+                continue
+            value = arguments[parameter.name]
+            if parameter.type == "list" and not isinstance(value, list):
+                raise ToolError(
+                    f"{parameter.name} must be a list",
+                    ExecutionErrorType.INVALID_ARGUMENTS,
+                )
+            if parameter.type == "string" and not isinstance(value, str):
+                raise ToolError(
+                    f"{parameter.name} must be a string",
+                    ExecutionErrorType.INVALID_ARGUMENTS,
+                )
+            if parameter.type == "boolean" and not isinstance(value, bool):
+                raise ToolError(
+                    f"{parameter.name} must be a boolean",
+                    ExecutionErrorType.INVALID_ARGUMENTS,
+                )
+            if parameter.type == "number" and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                raise ToolError(
+                    f"{parameter.name} must be a number",
+                    ExecutionErrorType.INVALID_ARGUMENTS,
+                )
+            if parameter.type in {"path", "list[path]"}:
+                if parameter.type == "list[path]" and not isinstance(value, list):
+                    raise ToolError(
+                        f"{parameter.name} must be a list",
+                        ExecutionErrorType.INVALID_ARGUMENTS,
+                    )
+                paths = value if parameter.type == "list[path]" else [value]
+                for path in paths:
+                    from pathlib import Path
+
+                    candidate = Path(path)
+                    if candidate.is_absolute() or ".." in candidate.parts:
+                        raise ToolError(
+                            f"{parameter.name} is outside the workspace",
+                            ExecutionErrorType.WORKSPACE_ERROR,
+                        )
 
     @abstractmethod
     def execute(self, **arguments: Any) -> Any:

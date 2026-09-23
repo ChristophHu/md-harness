@@ -12,6 +12,7 @@ def test_factory_registers_default_tools_and_scopes_paths(tmp_path):
         "filesystem",
         "git",
         "sqlite",
+        "test_runner",
     ]
     assert registry.get("filesystem").root == tmp_path.resolve()
     assert registry.get("git").path == tmp_path.resolve()

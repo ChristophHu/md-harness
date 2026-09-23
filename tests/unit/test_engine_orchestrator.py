@@ -1,12 +1,13 @@
 """Tests for the engine orchestration boundary."""
 
+import json
 import sqlite3
 
 import pytest
 
 from harness.config import ConfigError, PersistenceMode
 from harness.engine.orchestrator import Orchestrator
-from harness.engine.result import EngineResult, ResultStatus
+from harness.engine.result import EngineResult, NextAction, ResultStatus
 from harness.storage.transaction import TransactionError, TransactionManager
 
 
@@ -121,6 +122,34 @@ def test_orchestrator_returns_planning_failure_without_execution():
     ).run(4)
 
     assert result.status is ResultStatus.FAILED
+
+
+@pytest.mark.parametrize("error", [RuntimeError("broken"), TimeoutError("slow")])
+def test_orchestrator_persists_unexpected_planner_failure_and_recovery(error):
+    events = []
+
+    class Events:
+        def record(self, task_id, event_type, payload=None):
+            events.append((task_id, event_type, payload))
+
+    class Planner:
+        def plan(self, _context):
+            raise error
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=object(),
+        validator=object(),
+        event_store=Events(),
+    ).run(44)
+
+    assert result.status is ResultStatus.FAILED
+    assert result.errors == [type(error).__name__]
+    failure = result.data["failure"]
+    assert failure.error_class == type(error).__name__
+    assert failure.retryable is isinstance(error, TimeoutError)
+    assert any(event[1] == "task.planning.exception" for event in events)
 
 
 def test_orchestrator_returns_executor_failure_without_validation():
@@ -242,6 +271,32 @@ def test_orchestrator_replans_until_success_and_marks_done():
     assert transitions[-1] == "done"
 
 
+def test_orchestrator_stops_after_replan_limit():
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "replan",
+                execution=ExecutionResult(
+                    ExecutionStatus.SUCCESS, next_action="replan"
+                ),
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=object(),
+        max_replans=0,
+    ).run(70)
+    assert result.message == "Maximum replans exceeded."
+
+
 def test_orchestrator_serializes_dataclasses_and_replanning_feedback():
     from dataclasses import dataclass
 
@@ -305,6 +360,11 @@ def test_orchestrator_rejects_negative_max_retries():
         Orchestrator(StubContextBuilder(object()), max_retries=-1)
 
 
+def test_orchestrator_rejects_negative_max_replans():
+    with pytest.raises(ValueError, match="max_replans"):
+        Orchestrator(StubContextBuilder(object()), max_replans=-1)
+
+
 def test_orchestrator_requires_all_stores_in_required_persistence_mode():
     with pytest.raises(ConfigError, match="required persistence"):
         Orchestrator(
@@ -318,6 +378,35 @@ def test_orchestrator_accepts_disabled_persistence_mode():
     )
 
     assert orchestrator.persistence_mode is PersistenceMode.DISABLED
+
+
+def test_orchestrator_claims_ready_and_rejects_active_or_missing_tasks():
+    class Tasks:
+        def __init__(self, status):
+            self.status = status
+            self.claimed = False
+
+        def get(self, _task_id):
+            return None if self.status == "missing" else {"status": self.status}
+
+        def claim(self, _task_id):
+            self.claimed = True
+            return True
+
+    ready = Tasks("ready")
+    orchestrator = Orchestrator(StubContextBuilder(object()), task_store=ready)
+    assert orchestrator._claim_task(1) is True
+    assert ready.claimed is True
+
+    active = Tasks("executing")
+    active_orchestrator = Orchestrator(StubContextBuilder(object()), task_store=active)
+    assert active_orchestrator._claim_task(1) is False
+    assert active_orchestrator.run(1).status is ResultStatus.WAITING
+    missing = Tasks("missing")
+    assert (
+        Orchestrator(StubContextBuilder(object()), task_store=missing)._claim_task(1)
+        is None
+    )
 
 
 def test_orchestrator_rejects_invalid_persistence_mode():
@@ -529,6 +618,78 @@ def test_resume_without_checkpoint_falls_back_to_run():
     )
     orchestrator.run = lambda _task_id: EngineResult.success("replanned")
     assert orchestrator.resume(1).message == "replanned"
+
+
+def test_resume_restores_persisted_retry_plan():
+    plan = {
+        "goal": "resume",
+        "version": 2,
+        "steps": [
+            {
+                "id": "step",
+                "description": "step",
+                "action": "read",
+                "tool": None,
+                "arguments": {},
+                "acceptance_criteria": [],
+                "test_criteria": [],
+                "depends_on": [],
+                "metadata": {},
+            }
+        ],
+        "assumptions": [],
+        "risks": [],
+    }
+
+    class Checkpoint:
+        def __init__(self):
+            self.marked = False
+
+        def get(self, _task_id):
+            return {
+                "resumed_at": None,
+                "next_action": "retry_execution",
+                "context_data": json.dumps({"plan": plan}),
+            }
+
+        def mark_resumed(self, _task_id):
+            self.marked = True
+
+    checkpoint = Checkpoint()
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=checkpoint
+    )
+    captured = []
+    orchestrator.run = lambda _task_id, **kwargs: (
+        captured.append(kwargs) or EngineResult.success("resumed")
+    )
+    result = orchestrator.resume(1)
+    assert result.successful
+    assert captured[0]["_resume_action"] is NextAction.RETRY_EXECUTION
+    assert captured[0]["_resume_plan"].goal == "resume"
+    assert checkpoint.marked is True
+
+
+def test_plan_deserialization_rejects_invalid_steps():
+    assert Orchestrator._deserialize_plan(None) is None
+    assert (
+        Orchestrator._deserialize_plan({"goal": "x", "steps": [{"bad": True}]}) is None
+    )
+
+
+def test_resume_ignores_corrupt_plan_payload():
+    class Checkpoint:
+        def get(self, _task_id):
+            return {"resumed_at": None, "next_action": "replan", "context_data": "{"}
+
+        def mark_resumed(self, _task_id):
+            pass
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=Checkpoint()
+    )
+    orchestrator.run = lambda _task_id, **_kwargs: EngineResult.success("replanned")
+    assert orchestrator.resume(1).successful
 
 
 def test_orchestrator_stops_after_maximum_cycles():
@@ -801,6 +962,35 @@ def test_orchestrator_replans_after_successful_execution_request():
 
     assert result.status is ResultStatus.SUCCESS
     assert len(plans) == 2
+
+
+def test_orchestrator_stops_after_validation_replan_limit():
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, _context, _plan):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed", execution=ExecutionResult(ExecutionStatus.SUCCESS)
+            )
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult(
+                ResultStatus.FAILED, message="bad", data={"next_action": "replan"}
+            )
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+        max_replans=0,
+    ).run(71)
+    assert result.message == "Maximum replans exceeded."
 
 
 def test_orchestrator_retries_after_successful_execution_request():

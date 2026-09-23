@@ -27,6 +27,22 @@ class EchoTool(Tool):
         return arguments
 
 
+class RunnerTool(Tool):
+    definition = ToolDefinition(
+        "test_runner",
+        "runner",
+        PermissionLevel.READ,
+        (ToolParameter("command", "list"),),
+    )
+
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+
+    def execute(self, **_arguments):
+        return self.result
+
+
 def context(**overrides):
     values = {
         "task_id": 1,
@@ -52,6 +68,19 @@ def test_executor_executes_only_plan_tools():
     execution = result.data["execution"]
     assert execution.status is ExecutionStatus.SUCCESS
     assert execution.steps[0].result == {"value": 1}
+
+
+def test_executor_normalizes_failed_test_runner_result():
+    registry = ToolRegistry()
+    registry.register(RunnerTool({"exit_code": 1, "passed": False, "timed_out": False}))
+    plan = ExecutionPlan(
+        "Task",
+        [PlanStep("tests", "Tests", "run_tests", "test_runner", {"command": ["x"]})],
+    )
+    result = Executor(registry).execute(context(available_tools=["test_runner"]), plan)
+    assert result.status is ResultStatus.FAILED
+    assert result.data["execution"].next_action.value == "retry_execution"
+    assert isinstance(result.data["execution"].steps[0].result, ToolExecutionResult)
 
 
 def test_executor_supports_noop_steps():
@@ -116,6 +145,38 @@ def test_executor_replans_when_tool_is_not_in_context():
     assert result.status is ResultStatus.FAILED
     assert result.data["next_action"] == "replan"
     assert result.data["execution"].next_action == "replan"
+
+
+def test_executor_skips_completed_resume_steps():
+    from harness.engine.plan import ExecutionPlan, PlanStep
+    from harness.engine.result import ExecutionStatus
+
+    registry = ToolRegistry()
+    registry.register(RunnerTool({"passed": True, "exit_code": 0, "timed_out": False}))
+    context_value = context(available_tools=["test_runner"])
+    context_value.resume_checkpoint = {"completed_step_ids": '["first"]'}
+    result = Executor(registry).execute(
+        context_value,
+        ExecutionPlan(
+            "resume",
+            [
+                PlanStep("first", "First", "run", "test_runner", {"command": []}),
+                PlanStep("second", "Second", "run", "test_runner", {"command": []}),
+            ],
+        ),
+    )
+    assert result.successful
+    assert result.data["execution"].steps[0].status is ExecutionStatus.SKIPPED
+    assert result.data["execution"].steps[0].result == "resumed"
+    context_value.resume_checkpoint = {"completed_step_ids": "not-json"}
+    fresh = Executor(registry).execute(
+        context_value,
+        ExecutionPlan(
+            "resume",
+            [PlanStep("second", "Second", "run", "test_runner", {"command": []})],
+        ),
+    )
+    assert fresh.successful
 
 
 def test_executor_replans_when_tool_is_not_registered():

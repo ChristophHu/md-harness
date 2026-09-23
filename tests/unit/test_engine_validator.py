@@ -127,3 +127,129 @@ def test_validator_requests_retry_for_unsatisfied_criteria():
     assert result.status is ResultStatus.FAILED
     assert result.data["validation"].acceptance_criteria == {1: False}
     assert result.data["next_action"] is NextAction.RETRY_EXECUTION
+
+
+def test_validator_maps_test_runner_results_to_criteria():
+    test_plan = ExecutionPlan(
+        "Task",
+        [PlanStep("tests", "Tests", "run_tests", "test_runner", test_criteria=[2])],
+    )
+    successful = execution(
+        steps=[
+            StepExecution(
+                "tests",
+                ExecutionStatus.SUCCESS,
+                tool="test_runner",
+                test_criteria=[2],
+                result={"exit_code": 0, "passed": True, "timed_out": False},
+            )
+        ]
+    )
+    result = Validator().validate(context(), test_plan, successful)
+    assert result.data["validation"].test_results == {2: True}
+
+    empty = execution(
+        steps=[
+            StepExecution(
+                "tests",
+                ExecutionStatus.SUCCESS,
+                tool="test_runner",
+                test_criteria=[2],
+                result="raw",
+            )
+        ]
+    )
+    assert Validator()._test_results(empty) == {}
+
+
+def test_validator_checks_file_content_and_git_evidence():
+    concrete_plan = ExecutionPlan(
+        "Create file",
+        [
+            PlanStep(
+                "write",
+                "Write",
+                "implement",
+                "filesystem",
+                {"operation": "write", "path": "a.txt", "content": "expected"},
+                acceptance_criteria=[1],
+            ),
+            PlanStep(
+                "read",
+                "Read",
+                "validate",
+                "filesystem",
+                {"operation": "read", "path": "a.txt"},
+                test_criteria=[2],
+            ),
+            PlanStep("status", "Status", "git_status", "git", {"operation": "status"}),
+        ],
+    )
+    successful = execution(
+        steps=[
+            StepExecution(
+                "write",
+                ExecutionStatus.SUCCESS,
+                result="written",
+                acceptance_criteria=[1],
+            ),
+            StepExecution(
+                "read", ExecutionStatus.SUCCESS, result="expected", test_criteria=[2]
+            ),
+            StepExecution("status", ExecutionStatus.SUCCESS, result="?? a.txt"),
+        ]
+    )
+    result = Validator().validate(context(), concrete_plan, successful)
+    assert result.status is ResultStatus.SUCCESS
+    assert result.data["validation"].content_checks == {"a.txt": True}
+    assert result.data["validation"].diff_checks == {"a.txt": True}
+
+    mismatch = execution(
+        steps=[
+            StepExecution("write", ExecutionStatus.SUCCESS, acceptance_criteria=[1]),
+            StepExecution(
+                "read", ExecutionStatus.SUCCESS, result="wrong", test_criteria=[2]
+            ),
+            StepExecution("status", ExecutionStatus.SUCCESS, result=""),
+        ]
+    )
+    failed = Validator().validate(context(), concrete_plan, mismatch)
+    assert failed.status is ResultStatus.FAILED
+    assert "content_mismatch:a.txt" in failed.errors
+    assert failed.data["validation"].diff_checks == {}
+
+
+def test_validator_rejects_unexpected_files_and_diff_rules():
+    plan = ExecutionPlan(
+        "Change",
+        [
+            PlanStep(
+                "diff",
+                "Diff",
+                "validate",
+                "git",
+                {"operation": "diff"},
+                metadata={
+                    "allowed_files": ["src/ok.py"],
+                    "required_in_diff": ["expected line"],
+                    "forbidden_in_diff": ["secret"],
+                },
+            )
+        ],
+    )
+    result = Validator().validate(
+        context(),
+        plan,
+        execution(
+            steps=[
+                StepExecution(
+                    "diff", ExecutionStatus.SUCCESS, result="expected line secret"
+                ),
+            ],
+            changed_files=["src/ok.py", "src/unexpected.py"],
+        ),
+    )
+    assert result.status is ResultStatus.FAILED
+    assert "unexpected_file:src/unexpected.py" in result.errors
+    assert "forbidden_diff:secret" in result.errors
+    assert result.data["validation"].next_action is NextAction.REPLAN

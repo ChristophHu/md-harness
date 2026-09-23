@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from harness.config import ConfigError, ExecutionConfig, PersistenceMode
 from harness.engine.context import ExecutionContext
@@ -11,6 +14,7 @@ from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
 from harness.engine.result import (
     EngineResult,
+    FailureRecord,
     InvalidNextActionError,
     NextAction,
     ResultStatus,
@@ -41,6 +45,7 @@ class Orchestrator:
         artifact_store: Any | None = None,
         max_cycles: int = 3,
         max_retries: int = 2,
+        max_replans: int = 2,
         persistence_mode: PersistenceMode | str = PersistenceMode.OPTIONAL,
         transaction_manager: TransactionManager | None = None,
         stores: StoreBundle | None = None,
@@ -50,6 +55,7 @@ class Orchestrator:
         if execution_config is not None:
             max_cycles = execution_config.max_cycles
             max_retries = execution_config.max_retries
+            max_replans = execution_config.max_replans
             persistence_mode = execution_config.persistence_mode
         if stores is not None:
             if any(
@@ -119,8 +125,12 @@ class Orchestrator:
             raise ValueError("max_cycles must be positive")
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
+        if max_replans < 0:
+            raise ValueError("max_replans must be non-negative")
         self.max_cycles = max_cycles
         self.max_retries = max_retries
+        self.max_replans = max_replans
+        self.run_id = str(uuid4())
 
     @staticmethod
     def _validate_builder_stores(
@@ -140,35 +150,95 @@ class Orchestrator:
         """Build the consistent context used by all engine stages."""
         return self.context_builder.build(task_id)
 
-    def run(self, task_id: int) -> EngineResult:
+    def _claim_task(self, task_id: int) -> bool | None:
+        """Claim a ready task, or identify an already active concurrent run."""
+        if self.task_store is None or not hasattr(self.task_store, "claim"):
+            return None
+        task = self.task_store.get(task_id)
+        if task is None:
+            return None
+        if task["status"] == "ready":
+            if self.transaction_manager is None:
+                return self._claim_with_identity(task_id)
+            with self.transaction_manager.atomic():
+                return self._claim_with_identity(task_id)
+        if task["status"] in {"planning", "executing", "validating"}:
+            return False
+        return None
+
+    def _claim_with_identity(self, task_id: int) -> bool:
+        try:
+            return self.task_store.claim(task_id, run_id=self.run_id)
+        except TypeError:
+            return self.task_store.claim(task_id)
+
+    def run(
+        self,
+        task_id: int,
+        *,
+        _resume_plan: Any | None = None,
+        _resume_action: NextAction | None = None,
+    ) -> EngineResult:
         """Run the complete pipeline once the stage components are available."""
+        claimed = self._claim_task(task_id)
+        if claimed is False:
+            return EngineResult.waiting("Task is already claimed by another run.")
         context = self.build_context(task_id)
         if not all((self.planner, self.executor, self.validator)):
             return EngineResult.waiting(
                 "Planner, executor and validator must be configured before execution."
             )
 
-        action = NextAction.REPLAN
+        action = _resume_action or NextAction.REPLAN
+        plan = _resume_plan
         retries = 0
+        replans = 0
         for _ in range(self.max_cycles):
             context = self.build_context(task_id)
             attempt_id = None
             if action is NextAction.REPLAN:
                 if self.unit_of_work is not None:
-                    attempt_id = self.unit_of_work.start_cycle(
-                        task_id, "planning", "task.planning"
-                    )
+                    if claimed:
+                        with self.unit_of_work.phase():
+                            attempt_id = self.task_store.record_attempt(
+                                task_id, "running"
+                            )
+                            self.event_store.record(task_id, "task.planning")
+                    else:
+                        attempt_id = self.unit_of_work.start_cycle(
+                            task_id, "planning", "task.planning"
+                        )
                 else:
                     attempt_id = self._start_attempt(task_id)
                     self._transition(task_id, "planning")
                     self._event(task_id, "task.planning")
-                planning = self.planner.plan(context)
+                try:
+                    planning = self.planner.plan(context)
+                except Exception as error:  # noqa: BLE001 - stage boundary
+                    return self._handle_stage_exception(
+                        task_id, attempt_id, "planning", error
+                    )
                 if not planning.successful:
                     self._finish_attempt(attempt_id, "failed", planning.message)
                     self._fail_task(task_id, planning.message, "task.planning.failed")
                     return planning
                 plan = planning.data["plan"]
                 self._event(task_id, "task.plan.created", self._serialize(plan))
+                if _resume_plan is None:
+                    self._save_checkpoint(
+                        task_id,
+                        "executing",
+                        NextAction.VALIDATE,
+                        attempt_id,
+                        "plan persisted for resumability",
+                        context_data={"plan": self._serialize(plan)},
+                        plan_version=getattr(plan, "version", None),
+                        next_step_id=(
+                            plan.steps[0].id
+                            if hasattr(plan, "steps") and plan.steps
+                            else None
+                        ),
+                    )
 
             if self.unit_of_work is not None:
                 if attempt_id is None:  # pragma: no cover - defensive invariant
@@ -189,7 +259,12 @@ class Orchestrator:
                 attempt_id = self._start_attempt(task_id)
                 self._transition(task_id, "executing")
                 self._event(task_id, "task.executing")
-            execution_result = self.executor.execute(context, plan)
+            try:
+                execution_result = self.executor.execute(context, plan)
+            except Exception as error:  # noqa: BLE001 - stage boundary
+                return self._handle_stage_exception(
+                    task_id, attempt_id, "execution", error
+                )
             self._persist_execution(task_id, execution_result)
             execution = execution_result.data.get("execution")
             try:
@@ -254,6 +329,14 @@ class Orchestrator:
                             self._fail_task(task_id, result.message, "task.failed")
                             return result
                     self._finish_attempt(attempt_id, "failed", execution_result.message)
+                    if next_action is NextAction.REPLAN:
+                        replans += 1
+                        if replans > self.max_replans:
+                            result = EngineResult.failure("Maximum replans exceeded.")
+                            self._fail_task(
+                                task_id, result.message, "task.replan.exhausted"
+                            )
+                            return result
                     self._event(
                         task_id,
                         "task.retrying",
@@ -306,9 +389,18 @@ class Orchestrator:
                 action = NextAction.RETRY_EXECUTION
                 continue
             if next_action is NextAction.REPLAN:
+                replans += 1
+                if replans > self.max_replans:
+                    result = EngineResult.failure("Maximum replans exceeded.")
+                    self._finish_attempt(attempt_id, "failed", result.message)
+                    self._fail_task(task_id, result.message, "task.replan.exhausted")
+                    return result
                 self._finish_attempt(attempt_id, "failed", execution_result.message)
                 self._event(
                     task_id, "task.replanning", {"reason": "execution requested replan"}
+                )
+                self._record_replan(
+                    task_id, plan, attempt_id, "execution_requested_replan"
                 )
                 action = NextAction.REPLAN
                 continue
@@ -316,7 +408,12 @@ class Orchestrator:
             self._transition(task_id, "validating")
             self._event(task_id, "task.validating")
             execution = execution_result.data["execution"]
-            validation = self.validator.validate(context, plan, execution)
+            try:
+                validation = self.validator.validate(context, plan, execution)
+            except Exception as error:  # noqa: BLE001 - stage boundary
+                return self._handle_stage_exception(
+                    task_id, attempt_id, "validation", error
+                )
             self._event(
                 task_id, "task.validation.completed", self._serialize(validation)
             )
@@ -361,12 +458,21 @@ class Orchestrator:
                         {"retry_number": retries, "max_retries": self.max_retries},
                     )
                 if action is NextAction.REPLAN:
+                    replans += 1
+                    if replans > self.max_replans:
+                        result = EngineResult.failure("Maximum replans exceeded.")
+                        self._finish_attempt(attempt_id, "failed", result.message)
+                        self._fail_task(
+                            task_id, result.message, "task.replan.exhausted"
+                        )
+                        return result
                     self._finish_attempt(attempt_id, "failed", validation.message)
                     self._event(
                         task_id,
                         "task.replanning",
                         self._replanning_payload(plan, validation),
                     )
+                    self._record_replan(task_id, plan, attempt_id, "validation_failed")
                 continue
             self._finish_attempt(attempt_id, "failed", validation.message)
             self._event(
@@ -459,6 +565,37 @@ class Orchestrator:
             data={"error": self._serialize(error.error)},
         )
 
+    def _handle_stage_exception(
+        self,
+        task_id: int,
+        attempt_id: int | None,
+        phase: str,
+        error: Exception,
+    ) -> EngineResult:
+        """Convert an unexpected stage exception into a persisted failure."""
+        retryable = isinstance(error, (TimeoutError, ConnectionError)) or bool(
+            getattr(error, "retryable", False)
+        )
+        recovery = NextAction.RETRY_EXECUTION if retryable else NextAction.REPLAN
+        record = FailureRecord(
+            component=phase,
+            error_class=type(error).__name__,
+            message=str(error) or type(error).__name__,
+            retryable=retryable,
+            recovery_action=recovery,
+        )
+        message = f"Unexpected error during {phase}: {record.message}"
+        event_type = f"task.{phase}.exception"
+        self._finish_attempt(attempt_id, "failed", message)
+        self._event(task_id, event_type, self._serialize(record))
+        self._fail_task(task_id, message, event_type)
+        return EngineResult(
+            status=ResultStatus.FAILED,
+            message=message,
+            errors=[record.error_class],
+            data={"failure": record, "recovery_action": recovery.value},
+        )
+
     def _register_artifacts(self, task_id: int, result: EngineResult) -> None:
         """Persist artifacts reported by the executor."""
         if self.artifact_store is None:
@@ -497,11 +634,38 @@ class Orchestrator:
         action: NextAction,
         attempt_id: int | None,
         reason: str,
+        *,
+        context_data: dict[str, Any] | None = None,
+        plan_version: int | None = None,
+        next_step_id: str | None = None,
+        completed_step_ids: list[str] | None = None,
     ) -> None:
         if self.checkpoint_store is not None:
             self.checkpoint_store.save(
-                task_id, phase, action.value, attempt_id=attempt_id, reason=reason
+                task_id,
+                phase,
+                action.value,
+                attempt_id=attempt_id,
+                reason=reason,
+                context_data=context_data,
+                plan_version=plan_version,
+                next_step_id=next_step_id,
+                completed_step_ids=completed_step_ids,
             )
+
+    def _record_replan(
+        self, task_id: int, plan: Any, attempt_id: int | None, reason_code: str
+    ) -> None:
+        if self.task_store is None or not hasattr(self.task_store, "record_replan"):
+            return
+        version = getattr(plan, "version", 1)
+        self.task_store.record_replan(
+            task_id,
+            reason_code,
+            version + 1,
+            parent_plan_version=version,
+            attempt_id=attempt_id,
+        )
 
     def resume(self, task_id: int) -> EngineResult:
         """Resume a task with a persisted waiting checkpoint."""
@@ -512,7 +676,45 @@ class Orchestrator:
             return self.run(task_id)
         if checkpoint["resumed_at"] is None:
             self.checkpoint_store.mark_resumed(task_id)
-        return self.run(task_id)
+            try:
+                next_action = checkpoint["next_action"]
+            except (KeyError, IndexError):
+                next_action = None
+            self._event(
+                task_id,
+                "task.resumed",
+                {"next_action": next_action},
+            )
+        plan = None
+        try:
+            context_data = checkpoint["context_data"]
+        except (KeyError, IndexError):
+            context_data = None
+        if context_data:
+            try:
+                payload = (
+                    json.loads(context_data)
+                    if isinstance(context_data, str)
+                    else context_data
+                )
+                plan = (
+                    self._deserialize_plan(payload.get("plan"))
+                    if isinstance(payload, dict)
+                    else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                plan = None
+        try:
+            action = NextAction(checkpoint["next_action"])
+        except (KeyError, ValueError):
+            action = NextAction.REPLAN
+        if action is NextAction.RETRY_EXECUTION and plan is not None:
+            result = self.run(task_id, _resume_plan=plan, _resume_action=action)
+        else:
+            result = self.run(task_id)
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.mark_resumed(task_id)
+        return result
 
     def cancel(self, task_id: int, reason: str = "Cancelled by user.") -> EngineResult:
         """Cancel a task and record the cancellation event."""
@@ -525,8 +727,35 @@ class Orchestrator:
     @staticmethod
     def _serialize(value: Any) -> Any:
         if is_dataclass(value):
-            return asdict(value)
+            return Orchestrator._serialize(asdict(value))
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: Orchestrator._serialize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [Orchestrator._serialize(item) for item in value]
         return value
+
+    @staticmethod
+    def _deserialize_plan(value: Any) -> Any | None:
+        if not isinstance(value, dict) or not isinstance(value.get("goal"), str):
+            return None
+        from harness.engine.plan import ExecutionPlan, PlanStep
+
+        steps = []
+        for item in value.get("steps", []):
+            if not isinstance(item, dict) or "id" not in item:
+                return None
+            steps.append(PlanStep(**item))
+        return ExecutionPlan(
+            goal=value["goal"],
+            steps=steps,
+            assumptions=list(value.get("assumptions", [])),
+            risks=list(value.get("risks", [])),
+            version=value.get("version", 1),
+            replanned_from=value.get("replanned_from"),
+            reason=value.get("reason"),
+        )
 
     @classmethod
     def _replanning_payload(cls, plan: Any, validation: EngineResult) -> dict[str, Any]:

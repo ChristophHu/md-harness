@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 8
 _STORAGE_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = _STORAGE_DIR / "schema.sql"
 MIGRATIONS_PATH = _STORAGE_DIR / "migrations"

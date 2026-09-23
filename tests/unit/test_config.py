@@ -22,6 +22,8 @@ def test_execution_config_rejects_invalid_limits():
         ExecutionConfig(max_retries=-1)
     with pytest.raises(ConfigError, match="max_cycles"):
         ExecutionConfig(max_cycles=0)
+    with pytest.raises(ConfigError, match="max_replans"):
+        ExecutionConfig(max_replans=-1)
 
 
 def test_execution_config_rejects_invalid_persistence_mode():
@@ -29,9 +31,11 @@ def test_execution_config_rejects_invalid_persistence_mode():
         ExecutionConfig(persistence_mode="invalid")
 
 
-@pytest.mark.parametrize("field", ["dry_run", "max_retries", "max_cycles"])
+@pytest.mark.parametrize(
+    "field", ["dry_run", "max_retries", "max_cycles", "max_replans"]
+)
 def test_execution_config_rejects_wrong_scalar_types(field):
-    values = {"dry_run": True, "max_retries": 1, "max_cycles": 1}
+    values = {"dry_run": True, "max_retries": 1, "max_cycles": 1, "max_replans": 1}
     values[field] = "invalid"
     with pytest.raises(ConfigError, match=field):
         ExecutionConfig(**values)

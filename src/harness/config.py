@@ -30,6 +30,7 @@ class ExecutionConfig:
     max_retries: int = 2
     max_cycles: int = 3
     persistence_mode: PersistenceMode = PersistenceMode.OPTIONAL
+    max_replans: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.dry_run, bool):
@@ -38,6 +39,8 @@ class ExecutionConfig:
             raise ConfigError("max_retries must be an integer")
         if not isinstance(self.max_cycles, int) or isinstance(self.max_cycles, bool):
             raise ConfigError("max_cycles must be an integer")
+        if not isinstance(self.max_replans, int) or isinstance(self.max_replans, bool):
+            raise ConfigError("max_replans must be an integer")
         if not isinstance(self.persistence_mode, PersistenceMode):
             try:
                 object.__setattr__(
@@ -51,6 +54,8 @@ class ExecutionConfig:
             raise ConfigError("max_retries must be non-negative")
         if self.max_cycles < 1:
             raise ConfigError("max_cycles must be positive")
+        if self.max_replans < 0:
+            raise ConfigError("max_replans must be non-negative")
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -68,7 +73,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
     settings = ExecutionConfig(
         **{
             key: execution[key]
-            for key in ("dry_run", "max_retries", "max_cycles", "persistence_mode")
+            for key in (
+                "dry_run",
+                "max_retries",
+                "max_cycles",
+                "max_replans",
+                "persistence_mode",
+            )
             if key in execution
         }
     )

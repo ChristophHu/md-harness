@@ -12,6 +12,14 @@ from harness.storage.project_store import ProjectStore
 from harness.storage.task_store import TaskStore
 
 
+def test_context_builder_normalizes_structured_test_commands():
+    assert ContextBuilder._command(["uv", "run", "pytest"]) == ["uv", "run", "pytest"]
+    assert ContextBuilder._command('["uv", "run", "pytest"]') == ["uv", "run", "pytest"]
+    assert ContextBuilder._command("pytest") == "pytest"
+    assert ContextBuilder._command("null") is None
+    assert ContextBuilder._command(42) is None
+
+
 def test_context_builder_loads_all_context_sources(tmp_path):
     path = initialize_database(tmp_path / "harness.sqlite")
     with connect(path) as connection:
@@ -32,7 +40,12 @@ def test_context_builder_loads_all_context_sources(tmp_path):
         acceptance_id = tasks.add_criterion(task_id, "Feature works")
         tasks.complete_criterion(acceptance_id)
         test_id = tasks.add_test_criterion(
-            task_id, "Run tests", test_type="pytest", command="pytest"
+            task_id,
+            "Run tests",
+            test_type="pytest",
+            command=["uv", "run", "pytest"],
+            timeout_seconds=45,
+            working_directory="tests",
         )
         tasks.add_dependency(task_id, dependency_id)
         tasks.record_attempt(task_id, "failed", "developer", "first failure")
@@ -66,7 +79,9 @@ def test_context_builder_loads_all_context_sources(tmp_path):
     assert context.acceptance_criteria[0].id == acceptance_id
     assert context.acceptance_criteria[0].completed is True
     assert context.test_criteria[0].id == test_id
-    assert context.test_criteria[0].command == "pytest"
+    assert context.test_criteria[0].command == ["uv", "run", "pytest"]
+    assert context.test_criteria[0].timeout_seconds == 45
+    assert context.test_criteria[0].working_directory == "tests"
     assert context.dependencies[0].task_id == dependency_id
     assert context.dependencies[0].status == "created"
     assert context.dependencies[0].resolved is False

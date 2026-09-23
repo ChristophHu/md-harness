@@ -1,0 +1,10 @@
+ALTER TABLE tasks ADD COLUMN claim_token TEXT;
+ALTER TABLE tasks ADD COLUMN claimed_at TEXT;
+ALTER TABLE tasks ADD COLUMN claim_expires_at TEXT;
+ALTER TABLE task_attempts ADD COLUMN run_id TEXT;
+ALTER TABLE task_attempts ADD COLUMN claim_token TEXT;
+ALTER TABLE task_attempts ADD COLUMN claim_expires_at TEXT;
+ALTER TABLE task_test_criteria ADD COLUMN timeout_seconds REAL NOT NULL DEFAULT 120.0;
+ALTER TABLE task_test_criteria ADD COLUMN working_directory TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_claim_token ON tasks(claim_token);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_run_id ON task_attempts(run_id);

@@ -76,11 +76,13 @@ class ContextBuilder:
             ],
             test_criteria=[
                 TestCriterion(
-                    row["id"],
-                    row["criterion"],
-                    row["test_type"],
-                    row["command"],
-                    bool(row["completed"]),
+                    id=row["id"],
+                    criterion=row["criterion"],
+                    test_type=row["test_type"],
+                    command=self._command(row["command"]),
+                    timeout_seconds=float(row["timeout_seconds"] or 120.0),
+                    working_directory=row["working_directory"],
+                    completed=bool(row["completed"]),
                 )
                 for row in self.task_store.test_criteria(task_id)
             ],
@@ -106,6 +108,18 @@ class ContextBuilder:
         if self.knowledge_loader is not None:
             context.knowledge_documents.extend(self.knowledge_loader(task_id))
         return context
+
+    @staticmethod
+    def _command(value: Any) -> str | list[str] | None:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return value
+            return parsed if isinstance(parsed, list) else None
+        return None
 
     def _project(self, project_id: int | None) -> Any:
         return self.project_store.get(project_id) if project_id is not None else None
