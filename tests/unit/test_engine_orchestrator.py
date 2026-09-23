@@ -34,6 +34,129 @@ def test_orchestrator_builds_context_and_waits_for_engine_components():
     assert result.status is ResultStatus.WAITING
 
 
+@pytest.mark.parametrize("stage", ["planning", "execution", "validation"])
+def test_orchestrator_stops_without_persisting_when_stage_loses_ownership(stage):
+    class Planner:
+        def plan(self, _context):
+            if stage == "planning":
+                raise TransactionError("lost")
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, *_args):
+            if stage == "execution":
+                raise TransactionError("lost")
+            return EngineResult.success("executed", execution="execution")
+
+    class Validator:
+        def validate(self, *_args):
+            raise TransactionError("lost")
+
+    result = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+    ).run(1)
+    assert result.status is ResultStatus.WAITING
+    assert "ownership was lost" in result.message
+
+
+def test_record_replan_uses_fenced_transaction_when_available():
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE replans (task_id INTEGER, version INTEGER)")
+
+    class Tasks:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def record_replan(self, task_id, _reason, version, **_kwargs):
+            self.connection.execute(
+                "INSERT INTO replans VALUES (?, ?)", (task_id, version)
+            )
+
+    tasks = Tasks(connection)
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=tasks,
+        transaction_manager=TransactionManager(connection, tasks),
+    )
+    orchestrator._record_replan(1, SimpleNamespace(version=2), None, "retry")
+    assert connection.execute("SELECT * FROM replans").fetchone() == (1, 3)
+
+
+def test_resume_returns_waiting_when_claim_is_revoked_during_dispatch():
+    class Checkpoint:
+        def get(self, _task_id):
+            return {"next_action": "wait", "reason": "external information"}
+
+        def claim_resume_lease(self, _task_id, **kwargs):
+            return kwargs["token"]
+
+        def release_resume_lease(self, *_args):
+            return True
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=Checkpoint()
+    )
+
+    def revoke(*_args):
+        raise TransactionError("revoked")
+
+    orchestrator._resume_wait = revoke
+    result = orchestrator.resume(1)
+    assert result.status is ResultStatus.WAITING
+    assert "ownership was lost" in result.message
+
+
+def test_resume_reports_cancellation_when_claim_is_revoked_during_dispatch():
+    state = {"status": "waiting"}
+
+    class TaskStore:
+        def get(self, _task_id):
+            return state
+
+    class Checkpoint:
+        def get(self, _task_id):
+            return {"next_action": "wait", "reason": "external information"}
+
+        def claim_resume_lease(self, _task_id, **kwargs):
+            return kwargs["token"]
+
+        def release_resume_lease(self, *_args):
+            return True
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=TaskStore(),
+        checkpoint_store=Checkpoint(),
+    )
+
+    def revoke(*_args):
+        state["status"] = "cancelled"
+        raise TransactionError("revoked")
+
+    orchestrator._resume_wait = revoke
+    result = orchestrator.resume(1)
+    assert result.status is ResultStatus.FAILED
+    assert "cancelled" in result.message
+
+
+def test_resumed_validation_propagates_claim_revocation():
+    from harness.engine.plan import ExecutionPlan
+
+    class Validator:
+        def validate(self, *_args):
+            raise TransactionError("revoked")
+
+    orchestrator = Orchestrator(StubContextBuilder(object()), validator=Validator())
+    checkpoint = {
+        "context_data": {"execution": {"status": "success", "steps": []}},
+    }
+    with pytest.raises(TransactionError, match="revoked"):
+        orchestrator._resume_validation(1, checkpoint, ExecutionPlan("goal"))
+
+
 def test_orchestrator_passes_context_through_all_stages():
     context = object()
     builder = StubContextBuilder(context)
@@ -1743,7 +1866,7 @@ def test_resume_reloads_checkpoint_after_claim_and_handles_retirement():
     class Uow:
         released = False
 
-        def claim_resume_lease(self, *_args):
+        def claim_resume_lease(self, *_args, **_kwargs):
             return True
 
         def release_resume_lease(self, *_args):

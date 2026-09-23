@@ -99,6 +99,11 @@ class CheckpointStore:
             "resolved_by",
             "information_ref",
         } <= columns:
+            revision_assignment = (
+                ", revision=task_checkpoints.revision + 1"
+                if "revision" in columns
+                else ""
+            )
             cursor = self.connection.execute(
                 """INSERT INTO task_checkpoints
                 (task_id, phase, next_action, plan_version, attempt_id, reason, context_data,
@@ -121,7 +126,8 @@ class CheckpointStore:
                 resolved_by=CASE WHEN excluded.next_action = 'wait' THEN NULL
                     ELSE task_checkpoints.resolved_by END,
                 information_ref=CASE WHEN excluded.next_action = 'wait' THEN NULL
-                    ELSE task_checkpoints.information_ref END""",
+                    ELSE task_checkpoints.information_ref END"""
+                + revision_assignment,
                 (
                     task_id,
                     phase,

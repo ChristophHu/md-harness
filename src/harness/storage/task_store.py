@@ -86,7 +86,8 @@ class TaskStore:
         cursor = self.connection.execute(
             """UPDATE tasks SET status = CASE WHEN status = 'ready' THEN 'planning' ELSE status END,
                 planning_started_at = COALESCE(planning_started_at, CURRENT_TIMESTAMP),
-                claim_token = ?, claimed_at = CURRENT_TIMESTAMP, claim_expires_at = ?
+                claim_token = ?, claimed_at = CURRENT_TIMESTAMP, claim_expires_at = ?,
+                execution_epoch = execution_epoch + 1
                 WHERE id = ? AND status IN ('ready', 'planning', 'executing', 'validating')
                 AND approval_status = 'approved'
                 AND (claim_expires_at IS NULL OR claim_expires_at < ?)""",
@@ -135,6 +136,7 @@ class TaskStore:
         self.cancel_active_attempts(task_id, reason)
         cursor = self.connection.execute(
             """UPDATE tasks SET status = 'cancelled', claim_token = NULL,
+               execution_epoch = execution_epoch + 1,
                claimed_at = NULL, claim_expires_at = NULL
                WHERE id = ?""",
             (task_id,),

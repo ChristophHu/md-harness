@@ -1,5 +1,7 @@
 """Tests for plan-authorized execution."""
 
+import pytest
+
 from harness.engine.context import ExecutionContext
 from harness.engine.executor import Executor
 from harness.engine.plan import ExecutionPlan, PlanStep
@@ -68,6 +70,38 @@ def test_executor_executes_only_plan_tools():
     execution = result.data["execution"]
     assert execution.status is ExecutionStatus.SUCCESS
     assert execution.steps[0].result == {"value": 1}
+
+
+def test_executor_checks_ownership_before_and_after_each_tool():
+    calls = []
+
+    class RevokingTool(EchoTool):
+        def execute(self, **arguments):
+            calls.append("tool")
+            return arguments
+
+    registry = ToolRegistry()
+    registry.register(RevokingTool())
+    checks = 0
+
+    def guard():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("claim revoked during tool")
+
+    execution_context = context(ownership_guard=guard)
+    plan = ExecutionPlan(
+        "Task",
+        [
+            PlanStep("first", "First", "execute", "echo", {"value": 1}),
+            PlanStep("second", "Second", "execute", "echo", {"value": 2}),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="claim revoked"):
+        Executor(registry).execute(execution_context, plan)
+    assert checks == 2
+    assert calls == ["tool"]
 
 
 def test_executor_normalizes_failed_test_runner_result():

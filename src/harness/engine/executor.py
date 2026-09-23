@@ -94,10 +94,14 @@ class Executor:
                     StepExecution(step.id, ExecutionStatus.SUCCESS, result="no-op")
                 )
                 continue
+            if context.ownership_guard is not None:
+                context.ownership_guard()
             try:
                 tool = self.tool_registry.get(step.tool)
                 self.security_policy.authorize(step, tool, context)
                 result = self.tool_registry.execute(step.tool, **step.arguments)
+                if context.ownership_guard is not None:
+                    context.ownership_guard()
             except ToolError as error:
                 structured = ExecutionError(
                     error.error_type,

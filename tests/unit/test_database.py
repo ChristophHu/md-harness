@@ -4,6 +4,8 @@ import pytest
 
 from harness.storage.database import (
     CURRENT_SCHEMA_VERSION,
+    SCHEMA_PATH,
+    apply_migrations,
     connect,
     initialize_database,
 )
@@ -29,14 +31,31 @@ def test_initialize_database_creates_parent_directory_and_file(tmp_path):
     assert path.exists()
 
 
-def test_current_schema_version_is_five(tmp_path):
+def test_current_schema_version_is_thirteen(tmp_path):
     path = initialize_database(tmp_path / "harness.sqlite")
     with connect(path) as connection:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == CURRENT_SCHEMA_VERSION
-            == 12
+            == 13
         )
+
+
+def test_resume_fencing_migration_upgrades_existing_database(tmp_path):
+    path = tmp_path / "version-twelve.sqlite"
+    with connect(path) as connection:
+        connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        assert apply_migrations(connection, target=12) == 12
+        assert apply_migrations(connection) == 13
+        assert apply_migrations(connection) == 13
+        task_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(tasks)")
+        }
+        checkpoint_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(task_checkpoints)")
+        }
+        assert "execution_epoch" in task_columns
+        assert "revision" in checkpoint_columns
 
 
 def test_initialize_database_creates_all_tables(tmp_path):

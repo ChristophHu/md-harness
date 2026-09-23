@@ -4,6 +4,7 @@ import pytest
 
 from harness.storage.transaction import (
     EngineUnitOfWork,
+    ExecutionOwner,
     TransactionError,
     TransactionManager,
 )
@@ -12,6 +13,15 @@ from harness.storage.transaction import (
 class Store:
     def __init__(self, connection):
         self.connection = connection
+
+
+def test_heartbeat_is_noop_without_owner_or_file_database():
+    manager = TransactionManager(sqlite3.connect(":memory:"))
+    with manager.keep_lease_alive():
+        pass
+    manager.owner = ExecutionOwner(1, "owner", 1)
+    with manager.keep_lease_alive():
+        pass
 
 
 def test_transaction_manager_commits_and_validates_shared_connection():

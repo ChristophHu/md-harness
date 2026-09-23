@@ -167,6 +167,56 @@ def build_orchestrator(tmp_path, validator, planner=None, executor=None):
     return orchestrator, connection, task_id
 
 
+def test_resume_replan_uses_existing_claim_when_task_is_executing(tmp_path):
+    planning_statuses = []
+
+    class Planner:
+        def plan(self, context):
+            planning_statuses.append(context.task_status)
+            return EngineResult.success("replanned", plan=ExecutionPlan("Task"))
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("validated", next_action="stop")
+
+    orchestrator, connection, task_id = build_orchestrator(
+        tmp_path, Validator(), planner=Planner()
+    )
+    tasks = orchestrator.task_store
+    tasks.transition(task_id, "planning")
+    tasks.transition(task_id, "executing")
+    old_attempt_id = tasks.record_attempt(task_id, "running")
+    tasks.complete_attempt(old_attempt_id, "failed", "replan required")
+    orchestrator.checkpoint_store.save(
+        task_id,
+        "executing",
+        "replan",
+        attempt_id=old_attempt_id,
+        reason="replan required",
+        context_data={
+            "plan": Orchestrator._serialize(ExecutionPlan("Old plan")),
+            "validation_progress": {"retries": 0, "replans": 1, "cycles": 1},
+        },
+    )
+    connection.commit()
+
+    result = orchestrator.resume(task_id)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert planning_statuses == ["executing"]
+    assert tasks.get(task_id)["status"] == "done"
+    assert [row["status"] for row in tasks.attempts(task_id)] == [
+        "failed",
+        "completed",
+    ]
+    assert _event_types(connection, task_id).count("task.resumed") == 1
+    assert _event_types(connection, task_id).count("task.planning") == 1
+    assert orchestrator.checkpoint_store.get_active(task_id) is None
+    events_before = _event_types(connection, task_id)
+    assert orchestrator.resume(task_id).data["already_completed"] is True
+    assert _event_types(connection, task_id) == events_before
+
+
 @pytest.mark.parametrize(
     ("outcome", "failure_at"),
     [
@@ -388,6 +438,13 @@ def test_validation_decision_recovers_after_post_commit_process_crash(tmp_path, 
     assert [row["status"] for row in TaskStore(connection).attempts(task_id)] == [
         "failed"
     ]
+    # A process death does not prove that another worker is gone. Recovery
+    # takes over only after the old task lease has expired.
+    connection.execute(
+        "UPDATE tasks SET claim_expires_at = '2000-01-01 00:00:00' WHERE id = ?",
+        (task_id,),
+    )
+    connection.commit()
     connection.close()
 
     recovered = subprocess.run(

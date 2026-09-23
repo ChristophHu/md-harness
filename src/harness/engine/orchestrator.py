@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,8 @@ from harness.engine.result import (
 from harness.storage.factory import StoreBundle
 from harness.storage.transaction import (
     EngineUnitOfWork,
+    ExecutionOwner,
+    TransactionError,
     TransactionManager,
     ValidationWrite,
 )
@@ -176,7 +179,20 @@ class Orchestrator:
 
     def build_context(self, task_id: int) -> ExecutionContext:
         """Build the consistent context used by all engine stages."""
-        return self.context_builder.build(task_id)
+        context = self.context_builder.build(task_id)
+        if self.transaction_manager is not None and isinstance(
+            context, ExecutionContext
+        ):
+            context.ownership_guard = self._check_ownership
+        return context
+
+    def _check_ownership(self) -> None:
+        if (
+            self.transaction_manager is not None
+            and self.transaction_manager.owner is not None
+        ):
+            with self.transaction_manager.atomic():
+                pass
 
     def _claim_task(self, task_id: int) -> bool | None:
         """Claim a ready task, or identify an already active concurrent run."""
@@ -189,7 +205,14 @@ class Orchestrator:
             if self.transaction_manager is None:
                 return self._claim_with_identity(task_id)
             with self.transaction_manager.atomic():
-                return self._claim_with_identity(task_id)
+                claimed = self._claim_with_identity(task_id)
+            if claimed:
+                current = self.task_store.get(task_id)
+                if "execution_epoch" in set(current.keys()):
+                    self.transaction_manager.owner = ExecutionOwner(
+                        task_id, current["claim_token"], current["execution_epoch"]
+                    )
+            return claimed
         if task["status"] in {"planning", "executing", "validating"}:
             return False
         return None
@@ -201,6 +224,41 @@ class Orchestrator:
             return self.task_store.claim(task_id)
 
     def run(
+        self,
+        task_id: int,
+        *,
+        _resume_plan: Any | None = None,
+        _resume_action: NextAction | None = None,
+        _resume_claimed: bool = False,
+        _resume_retries: int = 0,
+        _resume_replans: int = 0,
+        _resume_cycles: int = 0,
+    ) -> EngineResult:
+        """Run a pipeline while retaining and releasing its fencing identity."""
+        try:
+            return self._run_pipeline(
+                task_id,
+                _resume_plan=_resume_plan,
+                _resume_action=_resume_action,
+                _resume_claimed=_resume_claimed,
+                _resume_retries=_resume_retries,
+                _resume_replans=_resume_replans,
+                _resume_cycles=_resume_cycles,
+            )
+        except TransactionError:
+            terminal = self._terminal_resume_result(task_id)
+            if terminal is not None:
+                return terminal
+            return EngineResult.waiting("Task execution ownership was lost.")
+        finally:
+            if not _resume_claimed and self.transaction_manager is not None:
+                owner = self.transaction_manager.owner
+                self.transaction_manager.owner = None
+                if owner is not None and owner.task_id == task_id:
+                    with self.transaction_manager.atomic():
+                        self.task_store.release_claim(task_id, owner.token)
+
+    def _run_pipeline(
         self,
         task_id: int,
         *,
@@ -245,7 +303,16 @@ class Orchestrator:
                     self._transition(task_id, "planning")
                     self._event(task_id, "task.planning")
                 try:
-                    planning = self.planner.plan(context)
+                    self._check_ownership()
+                    with (
+                        self.transaction_manager.keep_lease_alive()
+                        if self.transaction_manager is not None
+                        else nullcontext()
+                    ):
+                        planning = self.planner.plan(context)
+                    self._check_ownership()
+                except TransactionError:
+                    raise
                 except Exception as error:  # noqa: BLE001 - stage boundary
                     return self._handle_stage_exception(
                         task_id, attempt_id, "planning", error
@@ -302,7 +369,16 @@ class Orchestrator:
                 self._transition(task_id, "executing")
                 self._event(task_id, "task.executing")
             try:
-                execution_result = self.executor.execute(context, plan)
+                self._check_ownership()
+                with (
+                    self.transaction_manager.keep_lease_alive()
+                    if self.transaction_manager is not None
+                    else nullcontext()
+                ):
+                    execution_result = self.executor.execute(context, plan)
+                self._check_ownership()
+            except TransactionError:
+                raise
             except Exception as error:  # noqa: BLE001 - stage boundary
                 return self._handle_stage_exception(
                     task_id, attempt_id, "execution", error
@@ -479,7 +555,16 @@ class Orchestrator:
             self._event(task_id, "task.validating")
             execution = execution_result.data["execution"]
             try:
-                validation = self.validator.validate(context, plan, execution)
+                self._check_ownership()
+                with (
+                    self.transaction_manager.keep_lease_alive()
+                    if self.transaction_manager is not None
+                    else nullcontext()
+                ):
+                    validation = self.validator.validate(context, plan, execution)
+                self._check_ownership()
+            except TransactionError:
+                raise
             except Exception as error:  # noqa: BLE001 - stage boundary
                 return self._handle_stage_exception(
                     task_id, attempt_id, "validation", error
@@ -903,24 +988,28 @@ class Orchestrator:
         wait_reason: WaitReason | None = None,
     ) -> None:
         if self.checkpoint_store is not None:
-            self.checkpoint_store.save(
-                task_id,
-                phase,
-                action.value,
-                attempt_id=attempt_id,
-                reason=reason,
-                context_data=context_data,
-                plan_version=plan_version,
-                next_step_id=next_step_id,
-                completed_step_ids=completed_step_ids,
-                execution_result=execution_result,
-                validation_result=validation_result,
-                waiting_reason_code=(
+            checkpoint = {
+                "attempt_id": attempt_id,
+                "reason": reason,
+                "context_data": context_data,
+                "plan_version": plan_version,
+                "next_step_id": next_step_id,
+                "completed_step_ids": completed_step_ids,
+                "execution_result": execution_result,
+                "validation_result": validation_result,
+                "waiting_reason_code": (
                     self._coerce_wait_reason(wait_reason).value
                     if action is NextAction.WAIT
                     else None
                 ),
-            )
+            }
+            if self.transaction_manager is None:
+                self.checkpoint_store.save(task_id, phase, action.value, **checkpoint)
+            else:
+                with self.transaction_manager.atomic():
+                    self.checkpoint_store.save(
+                        task_id, phase, action.value, **checkpoint
+                    )
 
     @staticmethod
     def _coerce_wait_reason(value: WaitReason | str | None) -> WaitReason:
@@ -953,13 +1042,23 @@ class Orchestrator:
         if self.task_store is None or not hasattr(self.task_store, "record_replan"):
             return
         version = getattr(plan, "version", 1)
-        self.task_store.record_replan(
-            task_id,
-            reason_code,
-            version + 1,
-            parent_plan_version=version,
-            attempt_id=attempt_id,
-        )
+        if self.transaction_manager is None:
+            self.task_store.record_replan(
+                task_id,
+                reason_code,
+                version + 1,
+                parent_plan_version=version,
+                attempt_id=attempt_id,
+            )
+        else:
+            with self.transaction_manager.atomic():
+                self.task_store.record_replan(
+                    task_id,
+                    reason_code,
+                    version + 1,
+                    parent_plan_version=version,
+                    attempt_id=attempt_id,
+                )
 
     def resume(self, task_id: int) -> EngineResult:
         """Resume a task with a persisted waiting checkpoint."""
@@ -983,7 +1082,12 @@ class Orchestrator:
         lease_token = str(uuid4())
         if self.unit_of_work is not None:
             claimed = self.unit_of_work.claim_resume_lease(
-                task_id, lease_token, self.resume_lease_seconds
+                task_id,
+                lease_token,
+                self.resume_lease_seconds,
+                expected_revision=self._checkpoint_value(checkpoint, "revision"),
+                expected_action=next_action,
+                expected_attempt_id=self._checkpoint_value(checkpoint, "attempt_id"),
             )
         else:
             lease_claim = getattr(self.checkpoint_store, "claim_resume_lease", None)
@@ -1052,6 +1156,11 @@ class Orchestrator:
             else:
                 result = self._resume_from_checkpoint(task_id, checkpoint, action, plan)
             return result
+        except TransactionError:
+            terminal = self._terminal_resume_result(task_id)
+            if terminal is not None:
+                return terminal
+            return EngineResult.waiting("Task execution ownership was lost.")
         finally:
             if self.unit_of_work is not None:
                 release = getattr(self.unit_of_work, "release_resume_lease", None)
@@ -1253,7 +1362,16 @@ class Orchestrator:
             attempt_id = self._start_attempt(task_id)
             self._event(task_id, "task.validating")
         try:
-            validation = self.validator.validate(context, plan, execution)
+            self._check_ownership()
+            with (
+                self.transaction_manager.keep_lease_alive()
+                if self.transaction_manager is not None
+                else nullcontext()
+            ):
+                validation = self.validator.validate(context, plan, execution)
+            self._check_ownership()
+        except TransactionError:
+            raise
         except Exception as error:  # noqa: BLE001 - stage boundary
             return self._handle_stage_exception(
                 task_id, attempt_id, "validation", error

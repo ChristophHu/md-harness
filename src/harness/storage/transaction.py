@@ -5,12 +5,29 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from threading import Event, Thread
 from typing import Any
 
 
 class TransactionError(RuntimeError):
     """Raised when stores cannot participate in one transaction."""
+
+
+_UNSET = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionOwner:
+    """Fencing identity for one task execution or resume."""
+
+    task_id: int
+    token: str
+    epoch: int
+    lease_seconds: int = 300
+    resume_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +50,110 @@ class TransactionManager:
 
     def __init__(self, connection: sqlite3.Connection, *stores: Any) -> None:
         self.connection = connection
+        self._owner: ContextVar[ExecutionOwner | None] = ContextVar(
+            "execution_owner", default=None
+        )
         self._validate_connections(stores)
+
+    @property
+    def owner(self) -> ExecutionOwner | None:
+        return self._owner.get()
+
+    @owner.setter
+    def owner(self, value: ExecutionOwner | None) -> None:
+        self._owner.set(value)
+
+    def assert_owner(self) -> None:
+        """Renew the lease and reject a superseded or cancelled worker."""
+        owner = self.owner
+        if owner is None:
+            return
+        now = datetime.now(UTC)
+        current = now.strftime("%Y-%m-%d %H:%M:%S")
+        expires = (now + timedelta(seconds=owner.lease_seconds)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        cursor = self.connection.execute(
+            """UPDATE tasks SET claim_expires_at = ?
+               WHERE id = ? AND claim_token = ? AND execution_epoch = ?
+               AND status NOT IN ('done', 'failed', 'cancelled')
+               AND claim_expires_at >= ?""",
+            (expires, owner.task_id, owner.token, owner.epoch, current),
+        )
+        if cursor.rowcount != 1:
+            raise TransactionError("task execution claim was lost")
+        if owner.resume_token is not None:
+            cursor = self.connection.execute(
+                """UPDATE task_checkpoints SET resume_claim_expires_at = ?
+                   WHERE task_id = ? AND resume_claim_token = ?
+                   AND invalidated_at IS NULL AND resume_claim_expires_at >= ?""",
+                (expires, owner.task_id, owner.resume_token, current),
+            )
+            if cursor.rowcount != 1:
+                raise TransactionError("resume checkpoint claim was lost")
+
+    @contextmanager
+    def keep_lease_alive(self) -> Iterator[None]:
+        """Renew a file-backed lease while a stage can block outside SQLite."""
+        owner = self.owner
+        if owner is None:
+            yield
+            return
+        database_path = self.connection.execute("PRAGMA database_list").fetchone()[2]
+        if not database_path:
+            yield
+            return
+        stop = Event()
+        lost = Event()
+
+        def renew() -> None:
+            while not stop.wait(max(owner.lease_seconds / 3, 0.1)):
+                connection: sqlite3.Connection | None = None
+                try:
+                    connection = sqlite3.connect(database_path, timeout=5)
+                    now = datetime.now(UTC)
+                    current = now.strftime("%Y-%m-%d %H:%M:%S")
+                    expires = (now + timedelta(seconds=owner.lease_seconds)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    cursor = connection.execute(
+                        """UPDATE tasks SET claim_expires_at = ? WHERE id = ?
+                           AND claim_token = ? AND execution_epoch = ?
+                           AND status NOT IN ('done', 'failed', 'cancelled')
+                           AND claim_expires_at >= ?""",
+                        (expires, owner.task_id, owner.token, owner.epoch, current),
+                    )
+                    if cursor.rowcount != 1:
+                        lost.set()
+                        return
+                    if owner.resume_token is not None:
+                        cursor = connection.execute(
+                            """UPDATE task_checkpoints SET resume_claim_expires_at = ?
+                               WHERE task_id = ? AND resume_claim_token = ?
+                               AND invalidated_at IS NULL
+                               AND resume_claim_expires_at >= ?""",
+                            (expires, owner.task_id, owner.resume_token, current),
+                        )
+                        if cursor.rowcount != 1:
+                            lost.set()
+                            return
+                    connection.commit()
+                except sqlite3.Error:
+                    lost.set()
+                    return
+                finally:
+                    if connection is not None:
+                        connection.close()
+
+        thread = Thread(target=renew, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join()
+        if lost.is_set():
+            raise TransactionError("task execution lease renewal failed")
 
     def _validate_connections(self, stores: tuple[Any, ...]) -> None:
         for store in stores:
@@ -46,9 +166,13 @@ class TransactionManager:
                 )
 
     @contextmanager
-    def atomic(self) -> Iterator[sqlite3.Connection]:
+    def atomic(self, *, fenced: bool = True) -> Iterator[sqlite3.Connection]:
         """Commit the block or roll it back when an exception escapes."""
         try:
+            if not self.connection.in_transaction:
+                self.connection.execute("BEGIN IMMEDIATE")
+            if fenced:
+                self.assert_owner()
             yield self.connection
             self.connection.commit()
         except Exception:
@@ -107,16 +231,79 @@ class EngineUnitOfWork:
             return resumed
 
     def claim_resume_lease(
-        self, task_id: int, token: str, lease_seconds: int = 300
+        self,
+        task_id: int,
+        token: str,
+        lease_seconds: int = 300,
+        *,
+        expected_revision: int | None = None,
+        expected_action: str | None = None,
+        expected_attempt_id: int | None | object = _UNSET,
     ) -> bool:
         """Acquire a resumable lease and record the resume event atomically."""
         if self.checkpoint_store is None:
             return False
+        owner: ExecutionOwner | None = None
         with self.phase():
             get_task = getattr(self.task_store, "get", None)
             task = get_task(task_id) if get_task is not None else None
             if task is not None and task["status"] in {"done", "failed", "cancelled"}:
                 return False
+            get_active = getattr(self.checkpoint_store, "get_active", None)
+            checkpoint = get_active(task_id) if get_active is not None else None
+            if get_active is not None and checkpoint is None:
+                return False
+            if (
+                checkpoint is not None
+                and expected_action is not None
+                and checkpoint["next_action"] != expected_action
+            ):
+                return False
+            if (
+                checkpoint is not None
+                and expected_revision is not None
+                and checkpoint["revision"] != expected_revision
+            ):
+                return False
+            if (
+                checkpoint is not None
+                and expected_attempt_id is not _UNSET
+                and checkpoint["attempt_id"] != expected_attempt_id
+            ):
+                return False
+            if task is not None and "execution_epoch" in set(task.keys()):
+                if checkpoint is None:
+                    return False
+                allowed = {
+                    "wait": {"waiting", "executing", "validating"},
+                    "validate": {"executing", "validating", "waiting"},
+                    "retry_execution": {"executing", "validating"},
+                    "replan": {"planning", "executing", "validating"},
+                }
+                if task["status"] not in allowed.get(checkpoint["next_action"], set()):
+                    return False
+                attempt_id = checkpoint["attempt_id"]
+                if attempt_id is not None:
+                    attempt = self.manager.connection.execute(
+                        "SELECT task_id, status FROM task_attempts WHERE id = ?",
+                        (attempt_id,),
+                    ).fetchone()
+                    if attempt is None or attempt["task_id"] != task_id:
+                        return False
+                    if (
+                        checkpoint["next_action"] == "wait"
+                        and attempt["status"] == "running"
+                    ):
+                        return False
+                now = datetime.now(UTC)
+                current = now.strftime("%Y-%m-%d %H:%M:%S")
+                if (
+                    task["status"] != "waiting"
+                    and task["claim_token"] is not None
+                    and task["claim_expires_at"] is not None
+                    and task["claim_expires_at"] >= current
+                ):
+                    return False
             claim = getattr(self.checkpoint_store, "claim_resume_lease", None)
             if claim is None:
                 legacy_claim = getattr(self.checkpoint_store, "claim_resume", None)
@@ -133,15 +320,52 @@ class EngineUnitOfWork:
             claimed = claim(task_id, token=token, lease_seconds=lease_seconds)
             if claimed is None:
                 return False
+            if task is not None and "execution_epoch" in set(task.keys()):
+                if task["status"] != "waiting":
+                    self.manager.connection.execute(
+                        """UPDATE task_attempts SET status = 'failed',
+                           completed_at = CURRENT_TIMESTAMP,
+                           error_message = 'resume lease takeover'
+                           WHERE task_id = ? AND status = 'running'
+                           AND completed_at IS NULL""",
+                        (task_id,),
+                    )
+                expires = (
+                    datetime.now(UTC) + timedelta(seconds=lease_seconds)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                cursor = self.manager.connection.execute(
+                    """UPDATE tasks SET claim_token = ?, claimed_at = CURRENT_TIMESTAMP,
+                       claim_expires_at = ?, execution_epoch = execution_epoch + 1
+                       WHERE id = ? AND execution_epoch = ?""",
+                    (token, expires, task_id, task["execution_epoch"]),
+                )
+                if cursor.rowcount != 1:
+                    raise TransactionError("task changed during resume claim")
+                owner = ExecutionOwner(
+                    task_id, token, task["execution_epoch"] + 1, lease_seconds, token
+                )
             self.event_store.record(task_id, "task.resumed", {"claim_token": token})
-            return True
+        self.manager.owner = owner
+        return True
 
     def release_resume_lease(self, task_id: int, token: str) -> bool:
         """Release a lease after the resumed workflow returns."""
         if self.checkpoint_store is None:
             return False
+        owner = self.manager.owner
+        if (
+            owner is not None
+            and owner.task_id == task_id
+            and owner.resume_token == token
+        ):
+            self.manager.owner = None
         with self.phase():
-            return self.checkpoint_store.release_resume_lease(task_id, token)
+            released = self.checkpoint_store.release_resume_lease(task_id, token)
+            if owner is not None and owner.task_id == task_id and owner.token == token:
+                release_claim = getattr(self.task_store, "release_claim", None)
+                if release_claim is not None:
+                    release_claim(task_id, token)
+            return released
 
     def resolve_external_wait(
         self, task_id: int, wait_token: str, actor: str, information_ref: str
@@ -352,7 +576,7 @@ class EngineUnitOfWork:
 
     def cancel(self, task_id: int, reason: str) -> None:
         """Atomically cancel the task and clean up all resumable state."""
-        with self.phase():
+        with self.manager.atomic(fenced=False):
             self.task_store.cancel(task_id, reason)
             if self.checkpoint_store is not None:
                 self.checkpoint_store.invalidate(task_id, reason)
