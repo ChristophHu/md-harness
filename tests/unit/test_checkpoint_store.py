@@ -59,3 +59,22 @@ def test_checkpoint_store_supports_intermediate_schema_on_save():
     store = CheckpointStore(connection)
     assert store.save(1, "waiting", "wait", reason="intermediate") == 1
     assert store.get(1)["reason"] == "intermediate"
+
+
+def test_checkpoint_store_invalidates_extended_checkpoint():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """CREATE TABLE task_checkpoints (
+        id INTEGER PRIMARY KEY, task_id INTEGER UNIQUE, phase TEXT,
+        next_action TEXT, plan_version INTEGER, attempt_id INTEGER, reason TEXT,
+        context_data TEXT, created_at TEXT, resumed_at TEXT,
+        invalidated_at TEXT)"""
+    )
+    store = CheckpointStore(connection)
+    store.save(1, "waiting", "wait", reason="approval")
+    assert store.invalidate(1, "cancelled") is True
+    checkpoint = store.get(1)
+    assert checkpoint["invalidated_at"] is not None
+    assert checkpoint["reason"] == "cancelled"
+    assert store.invalidate(1, "again") is False

@@ -45,6 +45,26 @@ def test_database_transaction_health_version_and_backup(tmp_path):
     assert healthcheck(restored)
 
 
+def test_task_cancel_finishes_attempt_and_releases_claim(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        tasks = TaskStore(connection)
+        task_id = tasks.create("Task")
+        tasks.approve(task_id, "tester")
+        tasks.transition(task_id, "ready")
+        assert tasks.claim(task_id, run_id="run-1") is True
+        attempt_id = tasks.record_attempt(task_id, "running", run_id="run-1")
+        tasks.cancel(task_id, "user cancelled")
+        task = tasks.get(task_id)
+        attempt = tasks.attempts(task_id)[0]
+        assert task["status"] == "cancelled"
+        assert task["claim_token"] is None
+        assert attempt["id"] == attempt_id
+        assert attempt["status"] == "cancelled"
+        assert attempt["completed_at"] is not None
+
+
 def test_schema_file_and_migration_are_applied(tmp_path):
     path = db(tmp_path)
     assert SCHEMA_PATH.exists()

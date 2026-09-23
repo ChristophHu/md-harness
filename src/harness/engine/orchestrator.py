@@ -784,9 +784,19 @@ class Orchestrator:
         return self.run(task_id)
 
     def cancel(self, task_id: int, reason: str = "Cancelled by user.") -> EngineResult:
-        """Cancel a task and record the cancellation event."""
-        self._transition(task_id, "cancelled")
-        self._event(task_id, "task.cancelled", {"reason": reason})
+        """Cancel a task and clean up its active execution state atomically."""
+        if self.unit_of_work is not None:
+            self.unit_of_work.cancel(task_id, reason)
+        else:
+            if self.task_store is not None and hasattr(self.task_store, "cancel"):
+                self.task_store.cancel(task_id, reason)
+            else:
+                self._transition(task_id, "cancelled")
+            if self.checkpoint_store is not None and hasattr(
+                self.checkpoint_store, "invalidate"
+            ):
+                self.checkpoint_store.invalidate(task_id, reason)
+            self._event(task_id, "task.cancelled", {"reason": reason})
         return EngineResult(
             status=ResultStatus.SUCCESS, message=reason, data={"cancelled": True}
         )

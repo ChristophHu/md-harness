@@ -143,3 +143,23 @@ class CheckpointStore:
                 (task_id,),
             )
         return cursor.rowcount == 1
+
+    def invalidate(self, task_id: int, reason: str | None = None) -> bool:
+        """Invalidate a checkpoint so it cannot be resumed after cancellation."""
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(task_checkpoints)")
+        }
+        if "invalidated_at" in columns:
+            cursor = self.connection.execute(
+                """UPDATE task_checkpoints
+                   SET invalidated_at = CURRENT_TIMESTAMP,
+                       reason = COALESCE(?, reason)
+                   WHERE task_id = ? AND invalidated_at IS NULL""",
+                (reason, task_id),
+            )
+        else:
+            cursor = self.connection.execute(
+                "DELETE FROM task_checkpoints WHERE task_id = ?", (task_id,)
+            )
+        return cursor.rowcount == 1

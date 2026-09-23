@@ -15,6 +15,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --extra dev
+      - name: Configure Git identity for repository tests
+        run: |
+          git config --global user.name "md-harness CI"
+          git config --global user.email "md-harness-ci@users.noreply.github.com"
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src

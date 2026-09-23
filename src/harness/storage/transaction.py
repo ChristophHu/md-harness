@@ -133,3 +133,11 @@ class EngineUnitOfWork:
             self.task_store.complete_attempt(attempt_id, attempt_status)
             self.task_store.transition(task_id, status)
             self.event_store.record(task_id, event_type, payload)
+
+    def cancel(self, task_id: int, reason: str) -> None:
+        """Atomically cancel the task and clean up all resumable state."""
+        with self.phase():
+            self.task_store.cancel(task_id, reason)
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.invalidate(task_id, reason)
+            self.event_store.record(task_id, "task.cancelled", {"reason": reason})

@@ -115,6 +115,32 @@ class TaskStore:
         )
         return cursor.rowcount == 1
 
+    def cancel_active_attempts(self, task_id: int, reason: str) -> int:
+        """Finish every still-running attempt as cancelled."""
+        cursor = self.connection.execute(
+            """UPDATE task_attempts
+               SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                   error_message = ?
+               WHERE task_id = ? AND completed_at IS NULL
+               AND status = 'running'""",
+            (reason, task_id),
+        )
+        return cursor.rowcount
+
+    def cancel(self, task_id: int, reason: str) -> int:
+        """Cancel a task after validating its state transition."""
+        task = self._require_task(task_id)
+        if "cancelled" not in self.TRANSITIONS.get(task["status"], set()):
+            raise ValueError(f"invalid transition: {task['status']} -> cancelled")
+        self.cancel_active_attempts(task_id, reason)
+        cursor = self.connection.execute(
+            """UPDATE tasks SET status = 'cancelled', claim_token = NULL,
+               claimed_at = NULL, claim_expires_at = NULL
+               WHERE id = ?""",
+            (task_id,),
+        )
+        return cursor.rowcount
+
     def assert_claim(self, task_id: int, run_id: str) -> None:
         task = self.get(task_id)
         if task is None or task["claim_token"] != run_id:
