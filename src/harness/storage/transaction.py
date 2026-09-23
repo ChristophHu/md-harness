@@ -78,12 +78,41 @@ class EngineUnitOfWork:
         if self.checkpoint_store is None:
             return False
         with self.phase():
-            resumed = self.checkpoint_store.mark_resumed(task_id)
+            claim = getattr(self.checkpoint_store, "claim_resume", None)
+            resumed = (
+                claim(task_id)
+                if claim is not None
+                else self.checkpoint_store.mark_resumed(task_id)
+            )
             if resumed:
                 self.event_store.record(
                     task_id, "task.resumed", {"next_action": next_action}
                 )
             return resumed
+
+    def execution_wait(
+        self,
+        task_id: int,
+        attempt_id: int,
+        checkpoint: dict[str, Any],
+        execution: Any,
+        next_action: str,
+    ) -> None:
+        """Persist an execution wait checkpoint and waiting decision atomically."""
+        with self.phase():
+            self.checkpoint_store.save(task_id, **checkpoint)
+            self.event_store.record(
+                task_id,
+                "task.execution.next_action",
+                {"next_action": next_action},
+            )
+            self.task_store.complete_attempt(
+                attempt_id, "waiting", checkpoint["reason"]
+            )
+            self.task_store.transition(task_id, "waiting")
+            self.event_store.record(
+                task_id, "task.waiting", {"reason": checkpoint["reason"]}
+            )
 
     @contextmanager
     def phase(self) -> Iterator[sqlite3.Connection]:

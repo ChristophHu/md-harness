@@ -144,6 +144,35 @@ class CheckpointStore:
             )
         return cursor.rowcount == 1
 
+    def claim_resume(self, task_id: int) -> bool:
+        """Atomically claim an unconsumed checkpoint for one resumer."""
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(task_checkpoints)")
+        }
+        predicate = "task_id = ? AND resumed_at IS NULL"
+        parameters: tuple[Any, ...] = (task_id,)
+        if "invalidated_at" in columns:
+            predicate += " AND invalidated_at IS NULL"
+        if "resume_count" in columns:
+            cursor = self.connection.execute(
+                f"UPDATE task_checkpoints SET resumed_at = CURRENT_TIMESTAMP, resume_count = resume_count + 1 WHERE {predicate}",
+                parameters,
+            )
+        else:
+            cursor = self.connection.execute(
+                f"UPDATE task_checkpoints SET resumed_at = CURRENT_TIMESTAMP WHERE {predicate}",
+                parameters,
+            )
+        return cursor.rowcount == 1
+
+    def ensure_resumed(self, task_id: int) -> None:
+        """Retain the resume audit timestamp if a resumed run rewrote its row."""
+        self.connection.execute(
+            "UPDATE task_checkpoints SET resumed_at = COALESCE(resumed_at, CURRENT_TIMESTAMP) WHERE task_id = ?",
+            (task_id,),
+        )
+
     def invalidate(self, task_id: int, reason: str | None = None) -> bool:
         """Invalidate a checkpoint so it cannot be resumed after cancellation."""
         columns = {

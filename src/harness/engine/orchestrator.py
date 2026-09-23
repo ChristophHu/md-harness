@@ -287,6 +287,16 @@ class Orchestrator:
                 NextAction.WAIT,
                 NextAction.STOP,
             }:
+                if next_action is NextAction.WAIT:
+                    self._persist_execution_wait(
+                        task_id, attempt_id, plan, execution_result
+                    )
+                    return EngineResult(
+                        status=ResultStatus.WAITING,
+                        message=execution_result.message,
+                        errors=execution_result.errors,
+                        data=execution_result.data,
+                    )
                 self._event(
                     task_id,
                     "task.execution.next_action",
@@ -296,19 +306,8 @@ class Orchestrator:
                     attempt_id,
                     "waiting" if next_action is NextAction.WAIT else "completed",
                 )
-                if next_action is NextAction.WAIT:
-                    self._transition(task_id, "waiting")
-                    self._event(task_id, "task.waiting")
-                else:
-                    self._transition(task_id, "done")
-                    self._event(task_id, "task.done")
-                if next_action is NextAction.WAIT:
-                    return EngineResult(
-                        status=ResultStatus.WAITING,
-                        message=execution_result.message,
-                        errors=execution_result.errors,
-                        data=execution_result.data,
-                    )
+                self._transition(task_id, "done")
+                self._event(task_id, "task.done")
                 return execution_result
             if not execution_result.successful:
                 self._event(
@@ -352,11 +351,9 @@ class Orchestrator:
                     action = next_action
                     continue
                 if next_action is NextAction.WAIT:
-                    self._finish_attempt(
-                        attempt_id, "waiting", execution_result.message
+                    self._persist_execution_wait(
+                        task_id, attempt_id, plan, execution_result
                     )
-                    self._transition(task_id, "waiting")
-                    self._event(task_id, "task.waiting")
                     return EngineResult(
                         status=ResultStatus.WAITING,
                         message=execution_result.message,
@@ -642,6 +639,46 @@ class Orchestrator:
                 for path in sorted(paths):
                     self.artifact_store.register(task_id, path, "execution-artifact")
 
+    def _persist_execution_wait(
+        self, task_id: int, attempt_id: int | None, plan: Any, result: EngineResult
+    ) -> None:
+        """Persist execution progress before putting the task into waiting."""
+        execution = result.data.get("execution")
+        completed = {
+            step.step_id
+            for step in getattr(execution, "steps", [])
+            if step.status in {ExecutionStatus.SUCCESS, ExecutionStatus.SKIPPED}
+        }
+        plan_steps = getattr(plan, "steps", [])
+        next_step = next(
+            (step.id for step in plan_steps if step.id not in completed), None
+        )
+        checkpoint = {
+            "phase": "waiting",
+            "next_action": NextAction.WAIT.value,
+            "attempt_id": attempt_id,
+            "reason": result.message,
+            "context_data": {
+                "plan": self._serialize(plan),
+                "execution": self._serialize(execution),
+            },
+            "plan_version": getattr(plan, "version", None),
+            "next_step_id": next_step,
+            "completed_step_ids": sorted(completed),
+            "execution_result": self._serialize(result),
+        }
+        if self.unit_of_work is not None and attempt_id is not None:
+            self.unit_of_work.execution_wait(
+                task_id, attempt_id, checkpoint, execution, NextAction.WAIT.value
+            )
+            return
+        if self.checkpoint_store is not None:
+            self.checkpoint_store.save(task_id, **checkpoint)
+        self._event(task_id, "task.execution.next_action", {"next_action": "wait"})
+        self._finish_attempt(attempt_id, "waiting", result.message)
+        self._transition(task_id, "waiting")
+        self._event(task_id, "task.waiting", {"reason": result.message})
+
     def _save_checkpoint(
         self,
         task_id: int,
@@ -654,6 +691,8 @@ class Orchestrator:
         plan_version: int | None = None,
         next_step_id: str | None = None,
         completed_step_ids: list[str] | None = None,
+        execution_result: Any | None = None,
+        validation_result: Any | None = None,
     ) -> None:
         if self.checkpoint_store is not None:
             self.checkpoint_store.save(
@@ -666,6 +705,8 @@ class Orchestrator:
                 plan_version=plan_version,
                 next_step_id=next_step_id,
                 completed_step_ids=completed_step_ids,
+                execution_result=execution_result,
+                validation_result=validation_result,
             )
 
     def _record_replan(
@@ -693,12 +734,20 @@ class Orchestrator:
             next_action = checkpoint["next_action"]
         except (KeyError, IndexError):
             next_action = None
-        if checkpoint["resumed_at"] is None and self.unit_of_work is not None:
-            self.unit_of_work.resume(task_id, next_action)
-        elif checkpoint["resumed_at"] is None:
-            resumed = self.checkpoint_store.mark_resumed(task_id)
-            if resumed:
-                self._event(task_id, "task.resumed", {"next_action": next_action})
+        if checkpoint["resumed_at"] is None:
+            if self.unit_of_work is not None:
+                resumed = self.unit_of_work.resume(task_id, next_action)
+            else:
+                claim = getattr(self.checkpoint_store, "claim_resume", None)
+                resumed = claim(task_id) if claim is not None else True
+                if claim is None:
+                    self.checkpoint_store.mark_resumed(task_id)
+                if resumed:
+                    self._event(task_id, "task.resumed", {"next_action": next_action})
+            if resumed is False:
+                return EngineResult.waiting("Checkpoint is already being resumed.")
+        else:
+            return EngineResult.waiting("Checkpoint has already been resumed.")
         plan = None
         try:
             context_data = checkpoint["context_data"]
@@ -723,8 +772,10 @@ class Orchestrator:
         except (KeyError, ValueError):
             action = NextAction.REPLAN
         result = self._resume_from_checkpoint(task_id, checkpoint, action, plan)
-        if self.checkpoint_store is not None:
-            self.checkpoint_store.mark_resumed(task_id)
+        if result.successful and self.checkpoint_store is not None:
+            ensure_resumed = getattr(self.checkpoint_store, "ensure_resumed", None)
+            if ensure_resumed is not None:
+                ensure_resumed(task_id)
         return result
 
     def _resume_from_checkpoint(
