@@ -90,6 +90,43 @@ class EngineUnitOfWork:
                 )
             return resumed
 
+    def claim_resume_lease(
+        self, task_id: int, token: str, lease_seconds: int = 300
+    ) -> bool:
+        """Acquire a resumable lease and record the resume event atomically."""
+        if self.checkpoint_store is None:
+            return False
+        with self.phase():
+            get_task = getattr(self.task_store, "get", None)
+            task = get_task(task_id) if get_task is not None else None
+            if task is not None and task["status"] in {"done", "failed", "cancelled"}:
+                return False
+            claim = getattr(self.checkpoint_store, "claim_resume_lease", None)
+            if claim is None:
+                legacy_claim = getattr(self.checkpoint_store, "claim_resume", None)
+                claimed = (
+                    legacy_claim(task_id)
+                    if legacy_claim is not None
+                    else self.checkpoint_store.mark_resumed(task_id)
+                )
+                if claimed:
+                    self.event_store.record(
+                        task_id, "task.resumed", {"claim_token": token}
+                    )
+                return claimed
+            claimed = claim(task_id, token=token, lease_seconds=lease_seconds)
+            if claimed is None:
+                return False
+            self.event_store.record(task_id, "task.resumed", {"claim_token": token})
+            return True
+
+    def release_resume_lease(self, task_id: int, token: str) -> bool:
+        """Release a lease after the resumed workflow returns."""
+        if self.checkpoint_store is None:
+            return False
+        with self.phase():
+            return self.checkpoint_store.release_resume_lease(task_id, token)
+
     def execution_wait(
         self,
         task_id: int,
@@ -162,6 +199,16 @@ class EngineUnitOfWork:
             self.task_store.complete_attempt(attempt_id, attempt_status)
             self.task_store.transition(task_id, status)
             self.event_store.record(task_id, event_type, payload)
+
+    def complete_done(self, task_id: int, attempt_id: int | None) -> None:
+        """Complete a successful task and retire its checkpoint atomically."""
+        with self.phase():
+            if attempt_id is not None:
+                self.task_store.complete_attempt(attempt_id, "completed")
+            self.task_store.transition(task_id, "done")
+            self.event_store.record(task_id, "task.done")
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.invalidate(task_id)
 
     def cancel(self, task_id: int, reason: str) -> None:
         """Atomically cancel the task and clean up all resumable state."""

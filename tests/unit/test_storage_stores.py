@@ -30,7 +30,7 @@ def db(tmp_path):
 def test_database_transaction_health_version_and_backup(tmp_path):
     path = db(tmp_path)
     assert healthcheck(path) is True
-    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 10
+    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 11
     with transaction(path) as connection:
         connection.execute("INSERT INTO projects (name, path) VALUES ('p', '/p')")
     with transaction(path) as connection:
@@ -63,6 +63,17 @@ def test_task_cancel_finishes_attempt_and_releases_claim(tmp_path):
         assert attempt["id"] == attempt_id
         assert attempt["status"] == "cancelled"
         assert attempt["completed_at"] is not None
+
+
+def test_task_cancel_rejects_terminal_task(tmp_path):
+    path = db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        tasks = TaskStore(connection)
+        task_id = tasks.create("Task")
+        connection.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+        with pytest.raises(ValueError, match="invalid transition"):
+            tasks.cancel(task_id, "too late")
 
 
 def test_schema_file_and_migration_are_applied(tmp_path):

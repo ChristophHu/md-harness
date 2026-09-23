@@ -2,7 +2,13 @@
 
 import pytest
 
-from harness.config import ConfigError, ExecutionConfig, PersistenceMode, load_config
+from harness.config import (
+    ConfigError,
+    ExecutionConfig,
+    PersistenceMode,
+    SecretConfig,
+    load_config,
+)
 
 
 def test_execution_config_defaults_and_load(tmp_path):
@@ -60,3 +66,44 @@ def test_load_config_handles_defaults_and_invalid_shapes(tmp_path):
 def test_load_config_reports_missing_file(tmp_path):
     with pytest.raises(ConfigError, match="could not load"):
         load_config(tmp_path / "missing.yaml")
+
+
+def test_secret_config_loads_keychain_mapping(tmp_path):
+    path = tmp_path / "secrets.yaml"
+    path.write_text(
+        "secrets:\n  provider: keychain_then_environment\n"
+        "  service_prefix: local-harness\n  account: alice\n"
+        "  names:\n    github_token: GITHUB_TOKEN\n",
+        encoding="utf-8",
+    )
+    assert load_config(path)["secrets"] == SecretConfig(
+        service_prefix="local-harness",
+        account="alice",
+        names={"github_token": "GITHUB_TOKEN"},
+    )
+
+
+@pytest.mark.parametrize(
+    "contents, message",
+    [
+        ("secrets: []", "secrets configuration"),
+        ("secrets:\n  provider: unknown", "secrets.provider"),
+        ("secrets:\n  service_prefix: ' '", "service_prefix"),
+        ("secrets:\n  account: ' '", "account"),
+        ("secrets:\n  names: []", "secrets.names"),
+        ("secrets:\n  names:\n    logical: 12", "secrets.names"),
+        ("secrets:\n  names:\n    ' ': ENV", "names keys and values"),
+    ],
+)
+def test_load_config_rejects_invalid_secret_settings(tmp_path, contents, message):
+    path = tmp_path / "invalid-secrets.yaml"
+    path.write_text(contents, encoding="utf-8")
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+def test_secret_config_defaults():
+    assert SecretConfig().provider == "keychain_then_environment"
+    assert SecretConfig().service_prefix == "dev-harness"
+    assert SecretConfig().account is None
+    assert SecretConfig().names is None

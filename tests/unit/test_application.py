@@ -26,6 +26,10 @@ execution:
         assert orchestrator.max_cycles == 7
         assert orchestrator.persistence_mode is PersistenceMode.REQUIRED
         assert orchestrator.context_builder.dry_run is False
+        assert orchestrator.secret_provider.providers[0].service_prefix == "dev-harness"
+        assert orchestrator.secret_provider.providers[0]._service("github_token") == (
+            "dev-harness/github-token"
+        )
         assert (
             orchestrator.executor.registry is orchestrator.context_builder.tool_registry
         )

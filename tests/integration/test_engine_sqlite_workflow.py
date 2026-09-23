@@ -1,5 +1,11 @@
 """End-to-end orchestration tests using real SQLite stores."""
 
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
 from harness.engine.orchestrator import Orchestrator
@@ -206,6 +212,24 @@ def test_sqlite_workflow_persists_success_attempt_and_events(tmp_path):
             "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'task.execution.completed'",
             (task_id,),
         ).fetchone()[0]
+    )
+    checkpoint = CheckpointStore(connection)
+    assert checkpoint.get(task_id)["invalidated_at"] is not None
+    assert checkpoint.get_active(task_id) is None
+    event_count = len(_event_types(connection, task_id))
+    attempt_count = connection.execute(
+        "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
+    ).fetchone()[0]
+    repeated = orchestrator.resume(task_id)
+    assert repeated.status is ResultStatus.SUCCESS
+    assert repeated.data["already_completed"] is True
+    assert orchestrator.unit_of_work.claim_resume_lease(task_id, "late") is False
+    assert len(_event_types(connection, task_id)) == event_count
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        == attempt_count
     )
 
 
@@ -510,3 +534,266 @@ def test_sqlite_workflow_persists_wait_checkpoint_and_resume(tmp_path):
         is not None
     )
     assert _event_types(connection, task_id).count("task.waiting") == 1
+    assert CheckpointStore(connection).get_active(task_id) is None
+    checkpoint = CheckpointStore(connection).get(task_id)
+    assert checkpoint["invalidated_at"] is not None
+    assert checkpoint["reason"] == "approval required"
+    events_before = _event_types(connection, task_id)
+    attempts_before = connection.execute(
+        "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
+    ).fetchone()[0]
+    assert orchestrator.resume(task_id).data["already_completed"] is True
+    assert _event_types(connection, task_id) == events_before
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        == attempts_before
+    )
+
+
+def test_terminal_checkpoint_failure_rolls_back_task_attempt_and_event(tmp_path):
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("validated", next_action="stop")
+
+    class FailingCheckpointStore(CheckpointStore):
+        def invalidate(self, task_id, reason=None):
+            super().invalidate(task_id, reason)
+            raise RuntimeError("checkpoint write failed")
+
+    orchestrator, connection, task_id = build_orchestrator(tmp_path, Validator())
+    orchestrator.unit_of_work.checkpoint_store = FailingCheckpointStore(connection)
+    with pytest.raises(RuntimeError, match="checkpoint write failed"):
+        orchestrator.run(task_id)
+
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "validating"
+    )
+    assert (
+        connection.execute(
+            "SELECT status FROM task_attempts WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        == "running"
+    )
+    assert CheckpointStore(connection).get_active(task_id) is not None
+    assert "task.done" not in _event_types(connection, task_id)
+
+
+def test_validation_resume_retires_checkpoint_and_is_idempotent(tmp_path):
+    class Validator:
+        calls = 0
+
+        def validate(self, *_args):
+            self.calls += 1
+            return EngineResult.success("validated", next_action="stop")
+
+    validator = Validator()
+    orchestrator, connection, task_id = build_orchestrator(tmp_path, validator)
+    tasks = orchestrator.task_store
+    tasks.transition(task_id, "planning")
+    tasks.transition(task_id, "executing")
+    tasks.transition(task_id, "validating")
+    tasks.transition(task_id, "waiting")
+    checkpoints = CheckpointStore(connection)
+    checkpoints.save(
+        task_id,
+        "waiting",
+        "validate",
+        reason="resume validation",
+        plan_version=1,
+        context_data={
+            "plan": Orchestrator._serialize(ExecutionPlan("Task")),
+            "execution": Orchestrator._serialize(
+                ExecutionResult(ExecutionStatus.SUCCESS)
+            ),
+        },
+    )
+    connection.commit()
+
+    assert orchestrator.resume(task_id).status is ResultStatus.SUCCESS
+    assert validator.calls == 1
+    assert checkpoints.get(task_id)["invalidated_at"] is not None
+    assert checkpoints.get_active(task_id) is None
+    events_before = _event_types(connection, task_id)
+    assert orchestrator.resume(task_id).data["already_completed"] is True
+    assert validator.calls == 1
+    assert _event_types(connection, task_id) == events_before
+
+
+def test_sqlite_resume_recovers_after_process_crash_and_restart(tmp_path):
+    database = initialize_database(tmp_path / "crash-recovery.sqlite")
+    connection = connect(database)
+    projects = ProjectStore(connection)
+    tasks = TaskStore(connection)
+    project_id = projects.create("Crash recovery", str(tmp_path))
+    task_id = tasks.create("Resume me", project_id=project_id)
+    tasks.transition(task_id, "ready")
+    tasks.approve(task_id, "integration-test")
+    tasks.transition(task_id, "planning")
+    tasks.transition(task_id, "waiting")
+    plan = ExecutionPlan("Resume me")
+    checkpoint = CheckpointStore(connection)
+    checkpoint.save(
+        task_id,
+        "waiting",
+        "wait",
+        reason="approval required",
+        waiting_reason_code="approval",
+        context_data={
+            "plan": Orchestrator._serialize(plan),
+            "execution": Orchestrator._serialize(
+                ExecutionResult(ExecutionStatus.SUCCESS)
+            ),
+        },
+    )
+    connection.commit()
+    connection.close()
+
+    worker = textwrap.dedent(
+        """
+        import os
+        import sys
+        from harness.engine.context_builder import ContextBuilder
+        from harness.engine.orchestrator import Orchestrator
+        from harness.engine.result import EngineResult, ExecutionResult, ExecutionStatus, ResultStatus
+        from harness.storage.artifact_store import ArtifactStore
+        from harness.storage.checkpoint_store import CheckpointStore
+        from harness.storage.database import connect
+        from harness.storage.event_store import EventStore
+        from harness.storage.project_store import ProjectStore
+        from harness.storage.task_store import TaskStore
+        from harness.storage.transaction import TransactionManager
+
+        database, task_id, mode, marker = sys.argv[1:]
+        connection = connect(database)
+        tasks = TaskStore(connection)
+        events = EventStore(connection)
+        artifacts = ArtifactStore(connection)
+        checkpoints = CheckpointStore(connection)
+        projects = ProjectStore(connection)
+        builder = ContextBuilder(
+            tasks, events, artifacts, projects, checkpoint_store=checkpoints
+        )
+
+        class Executor:
+            def execute(self, *_args):
+                with open(marker, "a", encoding="utf-8") as stream:
+                    stream.write("executed\\n")
+                execution = ExecutionResult(
+                    ExecutionStatus.SUCCESS, next_action="validate"
+                )
+                return EngineResult.success("executed", execution=execution)
+
+        class Validator:
+            def validate(self, *_args):
+                return EngineResult(ResultStatus.SUCCESS, data={"next_action": "stop"})
+
+        class CrashAfterClaim(Orchestrator):
+            def _resume_from_checkpoint(self, *_args):
+                os._exit(73)
+
+        manager = TransactionManager(connection, tasks, events, artifacts)
+        orchestrator_type = CrashAfterClaim if mode == "crash" else Orchestrator
+        orchestrator = orchestrator_type(
+            builder,
+            planner=object(),
+            executor=Executor(),
+            validator=Validator(),
+            task_store=tasks,
+            event_store=events,
+            artifact_store=artifacts,
+            checkpoint_store=checkpoints,
+            transaction_manager=manager,
+            resume_lease_seconds=1,
+        )
+        result = orchestrator.resume(int(task_id))
+        if mode == "recover" and result.status is not ResultStatus.SUCCESS:
+            raise SystemExit(f"resume failed: {result.status}: {result.message}")
+        connection.close()
+        """
+    )
+    marker = tmp_path / "execution-count.txt"
+    crash = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            worker,
+            str(database),
+            str(task_id),
+            "crash",
+            str(marker),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert crash.returncode == 73, crash.stderr
+
+    connection = connect(database)
+    row = connection.execute(
+        "SELECT resume_claim_token, resume_claim_expires_at FROM task_checkpoints WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert row["resume_claim_token"] is not None
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "waiting"
+    )
+    connection.execute(
+        "UPDATE task_checkpoints SET resume_claim_expires_at = '2000-01-01 00:00:00' WHERE task_id = ?",
+        (task_id,),
+    )
+    connection.commit()
+    connection.close()
+
+    recovery = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            worker,
+            str(database),
+            str(task_id),
+            "recover",
+            str(marker),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert recovery.returncode == 0, recovery.stderr
+
+    connection = connect(database)
+    assert (
+        connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        == "done"
+    )
+    assert (
+        connection.execute(
+            "SELECT status FROM task_attempts WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()[0]
+        == "completed"
+    )
+    assert (
+        connection.execute(
+            "SELECT resume_claim_token FROM task_checkpoints WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        is None
+    )
+    assert _event_types(connection, task_id).count("task.resumed") == 2
+    assert _event_types(connection, task_id).count("task.done") == 1
+    connection.close()
+    assert marker.read_text(encoding="utf-8").splitlines() == ["executed"]

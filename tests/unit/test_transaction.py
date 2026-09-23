@@ -227,3 +227,165 @@ def test_engine_unit_of_work_resume_without_checkpoint_store_returns_false():
     store = Store(connection)
     work = EngineUnitOfWork(TransactionManager(connection), store, store, store)
     assert work.resume(1, "wait") is False
+
+
+def test_engine_unit_of_work_persists_execution_wait_atomically():
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE tasks (id INTEGER, status TEXT)")
+    connection.execute("CREATE TABLE attempts (id INTEGER, status TEXT, error TEXT)")
+    connection.execute("CREATE TABLE events (task_id INTEGER, event_type TEXT)")
+    connection.execute("CREATE TABLE checkpoints (task_id INTEGER, reason TEXT)")
+    connection.execute("INSERT INTO tasks VALUES (1, 'executing')")
+    connection.execute("INSERT INTO attempts VALUES (4, 'running', NULL)")
+
+    class Tasks(Store):
+        def complete_attempt(self, attempt_id, status, error=None):
+            self.connection.execute(
+                "UPDATE attempts SET status = ?, error = ? WHERE id = ?",
+                (status, error, attempt_id),
+            )
+
+        def transition(self, task_id, status):
+            self.connection.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id)
+            )
+
+    class Events(Store):
+        def record(self, task_id, event_type, _payload=None):
+            self.connection.execute(
+                "INSERT INTO events VALUES (?, ?)", (task_id, event_type)
+            )
+
+    class Checkpoints(Store):
+        def save(self, task_id, **payload):
+            self.connection.execute(
+                "INSERT INTO checkpoints VALUES (?, ?)", (task_id, payload["reason"])
+            )
+
+    work = EngineUnitOfWork(
+        TransactionManager(connection),
+        Tasks(connection),
+        Events(connection),
+        Store(connection),
+        Checkpoints(connection),
+    )
+    work.execution_wait(
+        1,
+        4,
+        {"reason": "approval", "phase": "waiting", "next_action": "wait"},
+        None,
+        "wait",
+    )
+    assert connection.execute("SELECT status FROM tasks").fetchone()[0] == "waiting"
+    assert connection.execute("SELECT status FROM attempts").fetchone()[0] == "waiting"
+    assert (
+        connection.execute("SELECT reason FROM checkpoints").fetchone()[0] == "approval"
+    )
+
+
+def test_engine_unit_of_work_claims_and_releases_resume_lease():
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE events (task_id INTEGER, event_type TEXT)")
+
+    class Events(Store):
+        def record(self, task_id, event_type, _payload=None):
+            self.connection.execute(
+                "INSERT INTO events VALUES (?, ?)", (task_id, event_type)
+            )
+
+    class Checkpoints(Store):
+        available = True
+
+        def claim_resume_lease(self, _task_id, *, token, lease_seconds=300):
+            assert lease_seconds in {17, 300}
+            return token if self.available else None
+
+        def release_resume_lease(self, _task_id, token):
+            return token == "lease"
+
+    events = Events(connection)
+    checkpoints = Checkpoints(connection)
+    work = EngineUnitOfWork(
+        TransactionManager(connection), events, events, events, checkpoints
+    )
+    assert work.claim_resume_lease(1, "lease", 17) is True
+    assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert work.release_resume_lease(1, "lease") is True
+    checkpoints.available = False
+    assert work.claim_resume_lease(1, "other") is False
+    assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+
+
+def test_engine_unit_of_work_resume_lease_supports_legacy_store():
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE events (task_id INTEGER, event_type TEXT)")
+
+    class Events(Store):
+        def record(self, task_id, event_type, _payload=None):
+            self.connection.execute(
+                "INSERT INTO events VALUES (?, ?)", (task_id, event_type)
+            )
+
+    class Checkpoints(Store):
+        def claim_resume(self, _task_id):
+            return True
+
+    events = Events(connection)
+    work = EngineUnitOfWork(
+        TransactionManager(connection), events, events, events, Checkpoints(connection)
+    )
+    assert work.claim_resume_lease(1, "legacy") is True
+
+
+def test_engine_unit_of_work_resume_lease_without_checkpoint_store():
+    connection = sqlite3.connect(":memory:")
+    store = Store(connection)
+    work = EngineUnitOfWork(TransactionManager(connection), store, store, store)
+    assert work.claim_resume_lease(1, "lease") is False
+    assert work.release_resume_lease(1, "lease") is False
+
+
+def test_engine_unit_of_work_legacy_resume_and_start_cycle():
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE tasks (id INTEGER, status TEXT)")
+    connection.execute("CREATE TABLE attempts (task_id INTEGER, status TEXT)")
+    connection.execute("CREATE TABLE events (task_id INTEGER, event_type TEXT)")
+    connection.execute("INSERT INTO tasks VALUES (1, 'ready')")
+
+    class Tasks(Store):
+        def transition(self, task_id, status):
+            self.connection.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id)
+            )
+
+        def record_attempt(self, task_id, status):
+            self.connection.execute(
+                "INSERT INTO attempts VALUES (?, ?)", (task_id, status)
+            )
+            return 42
+
+    class Events(Store):
+        def record(self, task_id, event_type, _payload=None):
+            self.connection.execute(
+                "INSERT INTO events VALUES (?, ?)", (task_id, event_type)
+            )
+
+    tasks, events = Tasks(connection), Events(connection)
+    work = EngineUnitOfWork(
+        TransactionManager(connection), tasks, events, Store(connection)
+    )
+    assert work.start_cycle(1, "planning", "task.planning") == 42
+
+    class Checkpoints(Store):
+        def mark_resumed(self, _task_id):
+            return True
+
+    work = EngineUnitOfWork(
+        TransactionManager(connection),
+        tasks,
+        events,
+        Store(connection),
+        Checkpoints(connection),
+    )
+    assert work.resume(1, "replan") is True
+    assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2

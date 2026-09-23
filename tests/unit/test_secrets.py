@@ -49,6 +49,11 @@ def test_keychain_provider_builds_normalized_service_name():
     assert provider._account() == "alice"
 
 
+def test_keychain_provider_maps_logical_names_to_service_names():
+    provider = MacOSKeychainSecretProvider(names={"github_token": "GITHUB_TOKEN"})
+    assert provider._service("github_token") == "dev-harness/github-token"
+
+
 def test_keychain_provider_reads_secret():
     provider = MacOSKeychainSecretProvider(service_prefix="dev", account="alice")
     result = type("Result", (), {"returncode": 0, "stdout": "  value\n"})()
@@ -67,12 +72,48 @@ def test_keychain_provider_reads_secret():
 
 def test_keychain_provider_returns_none_when_entry_is_missing():
     provider = MacOSKeychainSecretProvider()
-    result = type("Result", (), {"returncode": 44, "stdout": ""})()
+    result = type(
+        "Result",
+        (),
+        {
+            "returncode": 44,
+            "stdout": "",
+            "stderr": "The specified item could not be found in the keychain.",
+        },
+    )()
+    with (
+        patch("harness.security.secrets.platform.system", return_value="Darwin"),
+        patch("harness.security.secrets.subprocess.run", return_value=result) as run,
+    ):
+        assert provider.get("MISSING") is None
+    run.assert_called_once()
+
+
+def test_keychain_provider_raises_on_access_denied_without_leaking_output():
+    provider = MacOSKeychainSecretProvider()
+    result = type(
+        "Result", (), {"returncode": 36, "stdout": "", "stderr": "denied secret-value"}
+    )()
     with (
         patch("harness.security.secrets.platform.system", return_value="Darwin"),
         patch("harness.security.secrets.subprocess.run", return_value=result),
     ):
-        assert provider.get("MISSING") is None
+        with pytest.raises(SecretError, match="Keychain access failed") as error:
+            provider.get("TOKEN")
+    assert "secret-value" not in str(error.value)
+
+
+def test_keychain_provider_wraps_command_start_failure():
+    provider = MacOSKeychainSecretProvider()
+    with (
+        patch("harness.security.secrets.platform.system", return_value="Darwin"),
+        patch(
+            "harness.security.secrets.subprocess.run", side_effect=OSError("private")
+        ),
+    ):
+        with pytest.raises(SecretError, match="lookup failed") as error:
+            provider.get("TOKEN")
+    assert "private" not in str(error.value)
 
 
 def test_keychain_provider_returns_none_for_empty_secret():
@@ -110,10 +151,11 @@ def test_keychain_set_succeeds_on_successful_command():
         "alice",
         "-s",
         "dev-harness/api-key",
-        "-w",
-        "value",
         "-U",
+        "-w",
     ]
+    assert run.call_args.kwargs["input"] == "value\n"
+    assert "value" not in run.call_args.args[0]
 
 
 def test_keychain_set_raises_on_command_failure():
@@ -125,6 +167,17 @@ def test_keychain_set_raises_on_command_failure():
     ):
         with pytest.raises(SecretError, match="rotation failed"):
             provider.set("TOKEN", "value")
+
+
+def test_keychain_set_wraps_command_start_failure_without_leaking_secret():
+    provider = MacOSKeychainSecretProvider()
+    with (
+        patch("harness.security.secrets.platform.system", return_value="Darwin"),
+        patch("harness.security.secrets.subprocess.run", side_effect=OSError("value")),
+    ):
+        with pytest.raises(SecretError, match="rotation failed") as error:
+            provider.set("TOKEN", "value")
+    assert "value" not in str(error.value)
 
 
 def test_chained_provider_uses_first_non_empty_value():
@@ -149,7 +202,22 @@ def test_chained_provider_require_returns_value_or_raises():
 
 
 def test_default_provider_prefers_keychain_then_environment():
-    provider = default_secret_provider()
+    provider = default_secret_provider(
+        service_prefix="local-harness",
+        account="alice",
+        names={"github_token": "GITHUB_TOKEN"},
+    )
     assert isinstance(provider, ChainedSecretProvider)
     assert isinstance(provider.providers[0], MacOSKeychainSecretProvider)
     assert isinstance(provider.providers[1], EnvironmentSecretProvider)
+    assert provider.providers[0]._service("github_token") == (
+        "local-harness/github-token"
+    )
+    assert provider.providers[0]._account() == "alice"
+
+
+def test_default_provider_maps_logical_name_to_environment_variable(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "from-environment")
+    provider = default_secret_provider(names={"github_token": "GITHUB_TOKEN"})
+    with patch("harness.security.secrets.platform.system", return_value="Linux"):
+        assert provider.get("github_token") == "from-environment"

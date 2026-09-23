@@ -12,6 +12,7 @@ from harness.engine.executor import Executor
 from harness.engine.orchestrator import Orchestrator
 from harness.engine.planner import Planner
 from harness.engine.validator import Validator
+from harness.security.secrets import default_secret_provider
 from harness.security.tool_policy import ToolSecurityPolicy
 from harness.storage.database import connect, initialize_database
 from harness.storage.factory import StoreFactory
@@ -24,6 +25,7 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
     path = Path(config_path).expanduser().resolve()
     raw = load_config(path)
     execution: ExecutionConfig = raw["execution"]
+    secret_settings = raw["secrets"]
     project = raw.get("project", {})
     storage = raw.get("storage", {})
     workspace = Path(project.get("workspace_dir", ".")).expanduser()
@@ -65,6 +67,11 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
         validator=Validator(),
         stores=stores,
         execution_config=execution,
+        secret_provider=default_secret_provider(
+            service_prefix=secret_settings.service_prefix,
+            account=secret_settings.account,
+            names=secret_settings.names,
+        ),
     )
     return orchestrator, connection
 

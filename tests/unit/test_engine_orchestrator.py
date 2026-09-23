@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -621,6 +622,85 @@ def test_resume_without_checkpoint_falls_back_to_run():
     assert orchestrator.resume(1).message == "replanned"
 
 
+@pytest.mark.parametrize("status", ["done", "failed", "cancelled"])
+def test_resume_does_not_run_terminal_task(status):
+    class Tasks:
+        def get(self, _task_id):
+            return {"status": status}
+
+    class Checkpoints:
+        def get_active(self, _task_id):
+            raise AssertionError("terminal task must not load a checkpoint")
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=Tasks(),
+        checkpoint_store=Checkpoints(),
+    )
+    result = orchestrator.resume(1)
+    assert result.status is (
+        ResultStatus.SUCCESS if status == "done" else ResultStatus.FAILED
+    )
+    if status == "done":
+        assert result.data["already_completed"] is True
+
+
+def test_resume_returns_completed_when_task_finishes_during_claim():
+    class Tasks:
+        calls = 0
+
+        def get(self, _task_id):
+            self.calls += 1
+            return {"status": "waiting" if self.calls == 1 else "done"}
+
+    class Checkpoints:
+        def get_active(self, _task_id):
+            return {"next_action": "wait"}
+
+        def claim_resume(self, _task_id):
+            return False
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=Tasks(),
+        checkpoint_store=Checkpoints(),
+    )
+    assert orchestrator.resume(1).data["already_completed"] is True
+
+
+def test_done_fallback_retires_checkpoint_without_unit_of_work():
+    calls = []
+
+    class Tasks:
+        def complete_attempt(self, attempt_id, status, _error=None):
+            calls.append(("attempt", attempt_id, status))
+
+        def transition(self, task_id, status):
+            calls.append(("task", task_id, status))
+
+    class Events:
+        def record(self, task_id, event_type, _payload=None):
+            calls.append(("event", task_id, event_type))
+
+    class Checkpoints:
+        def invalidate(self, task_id):
+            calls.append(("checkpoint", task_id))
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=Tasks(),
+        event_store=Events(),
+        checkpoint_store=Checkpoints(),
+    )
+    orchestrator._complete_done(1, 7)
+    assert calls == [
+        ("attempt", 7, "completed"),
+        ("task", 1, "done"),
+        ("event", 1, "task.done"),
+        ("checkpoint", 1),
+    ]
+
+
 def test_resume_restores_persisted_retry_plan():
     plan = {
         "goal": "resume",
@@ -1173,3 +1253,416 @@ def test_orchestrator_limits_successful_execution_retry():
     ).run(20)
 
     assert result.status is ResultStatus.FAILED
+
+
+def test_execution_wait_uses_atomic_unit_of_work():
+    calls = []
+
+    class UnitOfWork:
+        def execution_wait(self, *args):
+            calls.append(args)
+
+    plan = SimpleNamespace(version=3, steps=[SimpleNamespace(id="next")])
+    orchestrator = Orchestrator(StubContextBuilder(object()), checkpoint_store=object())
+    orchestrator.unit_of_work = UnitOfWork()
+    orchestrator._persist_execution_wait(
+        1,
+        4,
+        plan,
+        EngineResult.waiting("blocked"),
+    )
+    assert calls[0][0:2] == (1, 4)
+    assert calls[0][2]["next_step_id"] == "next"
+
+
+def test_resume_rejects_checkpoint_claim_conflict():
+    class Checkpoint:
+        def get(self, _task_id):
+            return {"resumed_at": None, "next_action": "replan", "context_data": None}
+
+        def claim_resume(self, _task_id):
+            return False
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=Checkpoint()
+    )
+    assert orchestrator.resume(1).status is ResultStatus.WAITING
+
+
+def test_resume_rejects_checkpoint_already_resumed():
+    class Checkpoint:
+        def get(self, _task_id):
+            return {"resumed_at": "now", "next_action": "replan", "context_data": None}
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=Checkpoint()
+    )
+    assert orchestrator.resume(1).status is ResultStatus.WAITING
+
+
+def test_cancel_fallback_without_task_cancel_method():
+    transitions = []
+    events = []
+
+    class Tasks:
+        def transition(self, _task_id, status):
+            transitions.append(status)
+
+    class Events:
+        def record(self, _task_id, event_type, _payload=None):
+            events.append(event_type)
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), task_store=Tasks(), event_store=Events()
+    )
+    assert orchestrator.cancel(1).successful
+    assert transitions == ["cancelled"]
+    assert events == ["task.cancelled"]
+
+
+def test_execution_wait_fallback_persists_checkpoint_without_unit_of_work():
+    calls = []
+
+    class Checkpoint:
+        def save(self, task_id, **payload):
+            calls.append((task_id, payload))
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()), checkpoint_store=Checkpoint()
+    )
+    orchestrator._persist_execution_wait(
+        1, None, SimpleNamespace(version=1, steps=[]), EngineResult.waiting("blocked")
+    )
+    assert calls[0][1]["reason"] == "blocked"
+
+
+def test_cancel_fallback_invalidates_checkpoint_and_uses_task_cancel():
+    calls = []
+
+    class Tasks:
+        def cancel(self, task_id, reason):
+            calls.append(("cancel", task_id, reason))
+
+    class Checkpoint:
+        def invalidate(self, task_id, reason):
+            calls.append(("invalidate", task_id, reason))
+
+    class Events:
+        def record(self, *_args):
+            calls.append(("event",))
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=Tasks(),
+        checkpoint_store=Checkpoint(),
+        event_store=Events(),
+    )
+    orchestrator.cancel(1, "stop")
+    assert calls == [("cancel", 1, "stop"), ("invalidate", 1, "stop"), ("event",)]
+
+
+@pytest.mark.parametrize(
+    ("status", "next_action", "expected"),
+    [
+        (ResultStatus.SUCCESS, "stop", ResultStatus.SUCCESS),
+        (ResultStatus.WAITING, "wait", ResultStatus.WAITING),
+        (ResultStatus.FAILED, "retry_execution", ResultStatus.SUCCESS),
+        (ResultStatus.FAILED, "replan", ResultStatus.SUCCESS),
+        (ResultStatus.FAILED, "stop", ResultStatus.FAILED),
+        (ResultStatus.FAILED, "invalid", ResultStatus.FAILED),
+    ],
+)
+def test_validation_resume_routes_each_decision(status, next_action, expected):
+    from harness.engine.plan import ExecutionPlan
+    from harness.engine.result import ExecutionStatus
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult(
+                status, "validation result", data={"next_action": next_action}
+            )
+
+    class Tasks:
+        def complete_attempt(self, *_args):
+            return None
+
+        def transition(self, *_args):
+            return None
+
+    class Events:
+        def record(self, *_args):
+            return None
+
+    plan = ExecutionPlan("goal")
+    checkpoint = {
+        "attempt_id": 9,
+        "context_data": json.dumps(
+            {"execution": {"status": ExecutionStatus.SUCCESS.value, "steps": []}}
+        ),
+    }
+    orchestrator = Orchestrator(
+        StubContextBuilder("context"),
+        validator=Validator(),
+        task_store=Tasks(),
+        event_store=Events(),
+        checkpoint_store=type("Checkpoints", (), {"save": lambda *_a, **_k: 1})(),
+    )
+    if next_action in {"retry_execution", "replan"}:
+        orchestrator.run = lambda *_args, **_kwargs: EngineResult.success("continued")
+    result = orchestrator._resume_validation(1, checkpoint, plan)
+    assert result.status is expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "code", "expected"),
+    [
+        ("Approval required", "approval", "approval"),
+        ("workspace missing", "workspace_missing", "workspace_missing"),
+        ("temporary timeout", "temporary_error", "temporary_error"),
+        ("please replan", "manual_replan", "manual_replan"),
+        ("waiting for details", "external_information", "external_information"),
+    ],
+)
+def test_waiting_reason_codes_are_classified(reason, code, expected):
+    assert Orchestrator._waiting_reason_code(reason) == expected == code
+
+
+def test_resume_uses_and_releases_resume_lease():
+    calls = []
+
+    class Checkpoint:
+        def get(self, _task_id):
+            return {
+                "resumed_at": None,
+                "next_action": "wait",
+                "reason": "external info needed",
+                "context_data": None,
+            }
+
+        def claim_resume_lease(self, _task_id, **kwargs):
+            calls.append(("claim", kwargs["lease_seconds"]))
+            return kwargs["token"]
+
+        def release_resume_lease(self, _task_id, _token):
+            calls.append(("release",))
+            return True
+
+    checkpoint = Checkpoint()
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        checkpoint_store=checkpoint,
+        resume_lease_seconds=19,
+    )
+    result = orchestrator.resume(1)
+    assert result.status is ResultStatus.WAITING
+    assert calls == [("claim", 19), ("release",)]
+
+
+def test_resume_validation_dispatches_from_checkpoint():
+    from harness.engine.plan import ExecutionPlan
+    from harness.engine.result import ExecutionStatus
+
+    plan = ExecutionPlan("goal")
+
+    class Checkpoint:
+        def get(self, _task_id):
+            return {
+                "resumed_at": None,
+                "next_action": "validate",
+                "attempt_id": 5,
+                "context_data": json.dumps(
+                    {
+                        "plan": Orchestrator._serialize(plan),
+                        "execution": {
+                            "status": ExecutionStatus.SUCCESS.value,
+                            "steps": [],
+                        },
+                    }
+                ),
+            }
+
+        def claim_resume(self, _task_id):
+            return True
+
+        def mark_resumed(self, _task_id):
+            return True
+
+    class Validator:
+        def validate(self, _context, resumed_plan, execution):
+            assert resumed_plan.goal == "goal"
+            assert execution.status is ExecutionStatus.SUCCESS
+            return EngineResult.success("validated", next_action="stop")
+
+    orchestrator = Orchestrator(
+        StubContextBuilder("context"),
+        validator=Validator(),
+        checkpoint_store=Checkpoint(),
+    )
+    assert orchestrator.resume(1).successful
+
+
+def test_resume_validation_records_unexpected_validator_exception():
+    from harness.engine.plan import ExecutionPlan
+    from harness.engine.result import ExecutionStatus
+
+    checkpoint = {
+        "attempt_id": 7,
+        "context_data": json.dumps(
+            {"execution": {"status": ExecutionStatus.SUCCESS.value, "steps": []}}
+        ),
+    }
+
+    class Validator:
+        def validate(self, *_args):
+            raise RuntimeError("validator failure")
+
+    class Tasks:
+        def complete_attempt(self, *_args):
+            return None
+
+        def transition(self, *_args):
+            return None
+
+    class Events:
+        def record(self, *_args):
+            return None
+
+    orchestrator = Orchestrator(
+        StubContextBuilder("context"),
+        validator=Validator(),
+        task_store=Tasks(),
+        event_store=Events(),
+    )
+
+    class UnitOfWork:
+        def start_cycle(self, *_args):
+            return 8
+
+    orchestrator.unit_of_work = UnitOfWork()
+    result = orchestrator._resume_validation(1, checkpoint, ExecutionPlan("goal"))
+    assert result.status is ResultStatus.FAILED
+    assert "validator failure" in result.message
+
+
+def test_resume_wait_replans_malformed_stored_payload():
+    orchestrator = Orchestrator(StubContextBuilder(object()))
+    orchestrator.run = lambda *_args, **_kwargs: EngineResult.success("replanned")
+    result = orchestrator._resume_wait(
+        1,
+        {
+            "reason": "timeout; retry later",
+            "waiting_reason_code": "temporary_error",
+            "context_data": "{malformed",
+        },
+    )
+    assert result.successful
+
+
+def test_resume_wait_replans_when_saved_plan_is_invalid():
+    orchestrator = Orchestrator(StubContextBuilder(object()))
+    orchestrator.run = lambda *_args, **_kwargs: EngineResult.success("replanned")
+    result = orchestrator._resume_wait(
+        1,
+        {
+            "reason": "temporary timeout",
+            "waiting_reason_code": "temporary_error",
+            "context_data": json.dumps({"plan": {"invalid": True}}),
+        },
+    )
+    assert result.successful
+
+
+def test_resume_validation_replans_from_serialized_plan():
+    from harness.engine.plan import ExecutionPlan
+    from harness.engine.result import ExecutionStatus
+
+    plan = ExecutionPlan("goal")
+
+    class Checkpoint:
+        def get(self, _task_id):
+            return {
+                "context_data": json.dumps(
+                    {
+                        "plan": Orchestrator._serialize(plan),
+                        "execution": {
+                            "status": ExecutionStatus.SUCCESS.value,
+                            "steps": [],
+                        },
+                    }
+                )
+            }
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("valid")
+
+    orchestrator = Orchestrator(
+        StubContextBuilder("context"),
+        validator=Validator(),
+        checkpoint_store=Checkpoint(),
+    )
+    assert orchestrator._resume_validation(1, None).successful
+
+
+def test_orchestrator_rejects_nonpositive_resume_lease():
+    with pytest.raises(ValueError, match="resume_lease_seconds"):
+        Orchestrator(StubContextBuilder(object()), resume_lease_seconds=0)
+
+
+def test_orchestrator_starts_unclaimed_cycle_through_unit_of_work():
+    from contextlib import nullcontext
+
+    calls = []
+
+    class UnitOfWork:
+        phase = staticmethod(nullcontext)
+
+        def start_cycle(self, task_id, status, event_type):
+            calls.append((task_id, status, event_type))
+            return 3
+
+        def complete_done(self, task_id, attempt_id):
+            calls.append((task_id, attempt_id, "done"))
+
+    class Tasks:
+        def record_attempt(self, *_args):
+            return 3
+
+        def complete_attempt(self, *_args):
+            return None
+
+        def transition(self, *_args):
+            return None
+
+    class Events:
+        def record(self, *_args):
+            return None
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, *_args):
+            from harness.engine.result import ExecutionResult, ExecutionStatus
+
+            return EngineResult.success(
+                "executed", execution=ExecutionResult(ExecutionStatus.SUCCESS)
+            )
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("validated")
+
+    orchestrator = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+        task_store=Tasks(),
+        event_store=Events(),
+        artifact_store=object(),
+    )
+    orchestrator.unit_of_work = UnitOfWork()
+    assert orchestrator.run(1).successful
+    assert calls == [(1, "planning", "task.planning"), (1, 3, "done")]

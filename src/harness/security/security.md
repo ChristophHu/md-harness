@@ -27,7 +27,23 @@ Secrets werden ausschließlich über `SecretProvider` aufgelöst:
   auf die Umgebung zurück.
 
 `default_secret_provider()` ist die Standardverdrahtung für lokale Harness-
-Läufe. Secrets dürfen niemals im `ExecutionContext`, in SQLite, Events,
+Läufe. Das Mapping lautet standardmäßig `dev-harness/<secret-name>` als
+Keychain-Service und der aktuelle macOS-Benutzer als Account. Es kann unter
+`secrets.service_prefix` und `secrets.account` überschrieben werden. Ein
+logischer Name aus `secrets.names`, zum Beispiel `github_token`, wird auf den
+konfigurierten Namen `GITHUB_TOKEN` abgebildet; derselbe Zielname wird für den
+Keychain-Service (`dev-harness/github-token`) und den Umgebungs-Fallback
+verwendet.
+
+Ein Keychain-Eintrag lässt sich mit
+`security add-generic-password -a "$USER" -s "dev-harness/github-token" -U -w`
+anlegen. Das Secret wird interaktiv abgefragt und steht nicht als
+Prozessargument zur Verfügung. Das Harness verwendet dieselbe Form und reicht
+den Wert über stdin. Nicht gefundene Einträge erlauben den Environment-
+Fallback; verweigerter Zugriff und andere Keychain-Fehler werden als
+`SecretError` gemeldet und nicht als „fehlt“ verschleiert.
+
+Secrets dürfen niemals im `ExecutionContext`, in SQLite, Events,
 Artefakten, Logs oder Git landen. Auch Fehlermeldungen dürfen Secret-Werte
 nicht enthalten.
 

@@ -41,6 +41,9 @@ knowledge:
 
 secrets:
   provider: keychain_then_environment
+  service_prefix: dev-harness
+  # Defaults to the current macOS user when omitted.
+  # account: christoph
   names:
     codex_api_key: CODEX_API_KEY
     qdrant_api_key: QDRANT_API_KEY

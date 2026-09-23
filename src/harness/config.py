@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -20,6 +21,39 @@ class PersistenceMode(StrEnum):
     REQUIRED = "required"
     OPTIONAL = "optional"
     DISABLED = "disabled"
+
+
+@dataclass(frozen=True, slots=True)
+class SecretConfig:
+    """Secret source and logical-name mapping for local/CI providers."""
+
+    provider: str = "keychain_then_environment"
+    service_prefix: str = "dev-harness"
+    account: str | None = None
+    names: Mapping[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider, str) or (
+            self.provider != "keychain_then_environment"
+        ):
+            raise ConfigError("secrets.provider must be keychain_then_environment")
+        if not isinstance(self.service_prefix, str) or not self.service_prefix.strip():
+            raise ConfigError("secrets.service_prefix must not be empty")
+        if self.account is not None and (
+            not isinstance(self.account, str) or not self.account.strip()
+        ):
+            raise ConfigError("secrets.account must not be empty")
+        if self.names is not None and (
+            not isinstance(self.names, Mapping)
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key.strip()
+                or not value.strip()
+                for key, value in self.names.items()
+            )
+        ):
+            raise ConfigError("secrets.names keys and values must be non-empty strings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +101,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ConfigError(f"could not load config: {config_path}") from error
     if not isinstance(data, dict):
         raise ConfigError("configuration must be a mapping")
+    secrets = data.get("secrets", {})
+    if not isinstance(secrets, dict):
+        raise ConfigError("secrets configuration must be a mapping")
+    names = secrets.get("names", {})
+    if not isinstance(names, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in names.items()
+    ):
+        raise ConfigError("secrets.names must map strings to strings")
+    secret_settings = SecretConfig(
+        provider=secrets.get("provider", "keychain_then_environment"),
+        service_prefix=secrets.get("service_prefix", "dev-harness"),
+        account=secrets.get("account"),
+        names=names,
+    )
     execution = data.get("execution", {})
     if not isinstance(execution, dict):
         raise ConfigError("execution configuration must be a mapping")
@@ -84,4 +133,5 @@ def load_config(path: str | Path) -> dict[str, Any]:
         }
     )
     data["execution"] = settings
+    data["secrets"] = secret_settings
     return data

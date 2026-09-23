@@ -441,8 +441,13 @@ Planversion, Vorgänger-Version und Ursache als Events persistiert.
 
 `resume()` dispatcht anhand des persistierten `Checkpoint.next_action` und
 startet nicht mehr implizit immer den normalen Replan-Ablauf. Vor dem Dispatch
-wird der Checkpoint atomar als verarbeitet markiert und ein `task.resumed`-
-Event geschrieben.
+wird ein tokenisierter Resume-Lease atomar beansprucht und zusammen mit dem
+`task.resumed`-Event persistiert. Abgelaufene Leases können erneut beansprucht
+werden; der aktuelle Lauf gibt seinen Lease anschließend frei.
+Nach erfolgreicher Validierung werden Task und Attempt abgeschlossen, das
+`task.done`-Event geschrieben und der Checkpoint in derselben Transaktion
+invalidiert. Ein erneutes `resume()` auf einem `done`-Task liefert den
+abgeschlossenen Zustand zurück, ohne weitere Stages oder Events auszuführen.
 
 ### `retry_execution`
 
@@ -471,7 +476,9 @@ Der Planner erhält den letzten Plan, die letzte Validierung und strukturierte
 Replanning-Gründe. Die Planversion wird erhöht; der alte und der neue Plan
 bleiben als Events nachvollziehbar.
 
-Alle vier Pfade prüfen Taskstatus, Checkpoint, Planversion, Workspace,
-Attempt-Zuordnung und die jeweiligen Retry-/Replan-Limits. Ungültige
-Checkpoints werden als strukturierter Workflow-Fehler behandelt und führen zu
-`failed`.
+Diese Pfade sind noch nicht vollständig gegen Taskstatus, Planversion,
+Workspace und Attempt-Zuordnung validiert. Der feste Lease wird während eines
+langen Laufs nicht erneuert und verhindert daher nicht, dass nach Ablauf ein
+zweiter Worker übernimmt. Cancellation invalidiert zwar den Checkpoint, stellt
+aber noch kein Fencing gegen Schreibvorgänge eines bereits laufenden Resumers
+bereit. Weitere offene Punkte und Recovery-Arbeit stehen in `RESUME_TODO.md`.
