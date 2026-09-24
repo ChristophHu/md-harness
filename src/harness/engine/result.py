@@ -45,6 +45,7 @@ class WaitReason(StrEnum):
     MANUAL_REPLAN = "manual_replan"
     HUMAN_INPUT = "human_input"
     PLAN_REVIEW = "plan_review"
+    TOOL_OUTCOME_UNKNOWN = "tool_outcome_unknown"
 
 
 class ExecutionErrorType(StrEnum):

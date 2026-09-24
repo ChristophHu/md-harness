@@ -133,6 +133,22 @@ class Application:
     def publish_vault_decisions(self, *, limit: int = 100) -> int:
         return self.orchestrator.publish_vault_decisions(limit=limit)
 
+    def resolve_tool_invocation(
+        self,
+        task_id: int,
+        wait_token: str,
+        invocation_id: str,
+        actor: str,
+        outcome: str,
+        evidence_ref: str,
+    ) -> bool:
+        return self.orchestrator.resolve_tool_invocation(
+            task_id, wait_token, invocation_id, actor, outcome, evidence_ref
+        )
+
+    def list_tool_reconciliations(self, task_id: int) -> list[dict[str, Any]]:
+        return self.orchestrator.list_tool_reconciliations(task_id)
+
     def close(self) -> None:
         self.connection.close()
 

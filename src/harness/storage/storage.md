@@ -95,6 +95,11 @@ ist an genau einen WAIT-Token gebunden; Antwort, Actor und Audit-Event werden
 atomar geschrieben. `task_step_approvals` bleibt separat die Autorisierungsquelle
 für konkrete Tool-Aufrufe.
 
+Schema-Version 17 ergänzt `task_tool_invocations`. Die Journalzeile wird vor
+einem potenziell wirkenden Tool-Aufruf angelegt und enthält dessen gebundene
+Identität. Ein gespeicherter Erfolg wird beim Resume übernommen; `started`
+ohne Ergebnis verlangt eine explizite, auditierte Prüfung des externen Effekts.
+
 ## Transaktionen und Sicherheit
 
 Transaktionen werden über `database.transaction()` ausgeführt. Bei einem SQLite-Fehler erfolgt ein Rollback; nach erfolgreichem Abschluss wird committed. SQL-Zugriffe der Stores verwenden gebundene Parameter. Dynamische Spaltennamen werden gegen erlaubte Feldlisten geprüft.

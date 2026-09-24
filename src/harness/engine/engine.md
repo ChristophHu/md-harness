@@ -499,6 +499,24 @@ Projekts stehen im Planner-Context und als Vorschläge mit Quellenverweis in
 `list_human_interactions()` bereit. Vorschläge sind niemals eine automatische
 Freigabe des aktuellen WAIT oder eines Tools.
 
+Für Tools mit `write`-, `destructive`- oder `network`-Berechtigung sowie den
+potenziell schreibenden `test_runner` reserviert
+der Executor vor dem Aufruf einen plan-, step-, tool-, argument- und
+scope-gebundenen Eintrag in `task_tool_invocations`. Nach einem bestätigten
+Ergebnis wird der Step dort vor der weiteren Workflow-Entscheidung als
+`completed` persistiert. Beim Wiederanlauf wird ein solcher Step nicht erneut
+ausgeführt. Bleibt der Aufruf bei einem Crash oder Schreibfehler auf `started`,
+wechselt der Task zu `WAIT` mit `tool_outcome_unknown`; automatisches Retry ist
+gesperrt. `resolve_tool_invocation(task_id, wait_token, invocation_id, actor,
+outcome, evidence_ref)` akzeptiert nach unabhängiger Prüfung `completed`
+(Wirkung belegt) oder `no_effect` (Wirkung nachweislich ausgeblieben) und
+protokolliert die Entscheidung. Nur `no_effect` erlaubt einen erneuten Aufruf.
+`list_tool_reconciliations(task_id)` liefert die aktuelle Anfrage mit Token,
+Step, Tool und Argument-Fingerprint, ohne rohe Argumente offenzulegen.
+Der API-Adapter muss den Actor authentisieren und die Evidenz überprüfbar
+halten. Ohne Idempotenz-Unterstützung des externen Tools ist dies keine
+mathematische Exactly-once-Garantie; es verhindert die blinde Wiederholung.
+
 `execution.hitl.mode` konfiguriert optionale Interaktionspunkte:
 
 ```yaml

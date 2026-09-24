@@ -202,6 +202,18 @@ class Orchestrator:
             context.approval_checker = lambda step, tool: self._approval_allowed(
                 context, step, tool
             )
+            if self.unit_of_work is not None and self.checkpoint_store is not None:
+                context.tool_invocation_begin = lambda plan, step, scope: (
+                    self.unit_of_work.begin_tool_invocation(task_id, plan, step, scope)
+                )
+                context.tool_invocation_complete = lambda invocation_id, step: (
+                    self.unit_of_work.complete_tool_invocation(
+                        task_id, invocation_id, step
+                    )
+                )
+                context.tool_invocation_pending = lambda: (
+                    self.unit_of_work.tool_invocation_store.pending_for_task(task_id)
+                )
         return context
 
     def _approval_allowed(
@@ -280,6 +292,20 @@ class Orchestrator:
         _resume_cycles: int = 0,
     ) -> EngineResult:
         """Run a pipeline while retaining and releasing its fencing identity."""
+        if (
+            not _resume_claimed
+            and _resume_plan is None
+            and self.unit_of_work is not None
+            and self.checkpoint_store is not None
+            and self.unit_of_work.tool_invocation_store.has_for_task(task_id)
+        ):
+            task = self.task_store.get(task_id)
+            if (
+                task is not None
+                and task["status"] == "waiting"
+                and self.checkpoint_store.get_active(task_id) is not None
+            ):
+                return self.resume(task_id)
         try:
             return self._run_pipeline(
                 task_id,
@@ -816,6 +842,7 @@ class Orchestrator:
             "context_data": {
                 "plan": self._serialize(plan),
                 "execution": self._serialize(execution),
+                "tool_invocation_id": result.data.get("tool_invocation_id"),
                 "validation_progress": {
                     "retries": retries,
                     "replans": replans,
@@ -1707,6 +1734,60 @@ class Orchestrator:
         vault = getattr(self, "decision_vault", None)
         return vault.publish_pending(limit=limit) if vault else 0
 
+    def resolve_tool_invocation(
+        self,
+        task_id: int,
+        wait_token: str,
+        invocation_id: str,
+        actor: str,
+        outcome: str,
+        evidence_ref: str,
+    ) -> bool:
+        """Resolve an uncertain tool effect after independent inspection."""
+        if self.unit_of_work is None:
+            raise ConfigError(
+                "tool reconciliation requires transactional SQLite stores"
+            )
+        return self.unit_of_work.resolve_tool_invocation(
+            task_id, wait_token, invocation_id, actor, outcome, evidence_ref
+        )
+
+    def list_tool_reconciliations(self, task_id: int) -> list[dict[str, Any]]:
+        """Expose only the current uncertain call and its wait token."""
+        if self.unit_of_work is None or self.checkpoint_store is None:
+            return []
+        with self.unit_of_work.phase():
+            task = self.task_store.get(task_id)
+            checkpoint = self.checkpoint_store.get_active(task_id)
+            if (
+                task is None
+                or task["status"] != "waiting"
+                or checkpoint is None
+                or checkpoint["waiting_reason_code"]
+                != WaitReason.TOOL_OUTCOME_UNKNOWN.value
+            ):
+                return []
+            payload = json.loads(checkpoint["context_data"] or "{}")
+            invocation_id = payload.get("tool_invocation_id")
+            row = (
+                self.unit_of_work.tool_invocation_store.get(invocation_id)
+                if invocation_id
+                else None
+            )
+            if row is None or row["task_id"] != task_id or row["status"] != "started":
+                return []
+            return [
+                {
+                    "invocation_id": invocation_id,
+                    "wait_token": checkpoint["wait_token"],
+                    "step_id": row["step_id"],
+                    "tool": row["tool_name"],
+                    "plan_version": row["plan_version"],
+                    "arguments_fingerprint": row["arguments_fingerprint"],
+                    "started_at": row["started_at"],
+                }
+            ]
+
     def answer_human_interaction(
         self, task_id: int, interaction_id: str, actor: str, response: Any
     ) -> bool:
@@ -2007,6 +2088,16 @@ class Orchestrator:
             and self._approval_checkpoint_ready(task_id, checkpoint, plan, payload)
             or reason_code == "external_information"
             and self._checkpoint_value(checkpoint, "external_resolved_at") is not None
+            or reason_code == WaitReason.TOOL_OUTCOME_UNKNOWN.value
+            and self.unit_of_work is not None
+            and isinstance(payload, dict)
+            and (
+                invocation := self.unit_of_work.tool_invocation_store.get(
+                    payload.get("tool_invocation_id", "")
+                )
+            )
+            is not None
+            and invocation["status"] in {"completed", "no_effect"}
         )
         if should_continue:
             if plan is None and isinstance(payload, dict):
@@ -2130,6 +2221,19 @@ class Orchestrator:
             payload.get("execution") if isinstance(payload, dict) else None
         )
         if execution is None or self.validator is None:
+            if (
+                execution is None
+                and plan is not None
+                and self.unit_of_work is not None
+                and self.unit_of_work.tool_invocation_store.has_for_plan(
+                    task_id, fingerprint(self._serialize(plan))
+                )
+            ):
+                return self._resume_retry_execution(
+                    task_id,
+                    plan,
+                    progress=progress or self._checkpoint_progress(checkpoint),
+                )
             return self._resume_replan(
                 task_id, progress=progress or self._checkpoint_progress(checkpoint)
             )

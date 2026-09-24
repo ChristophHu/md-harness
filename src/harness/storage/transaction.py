@@ -12,8 +12,10 @@ from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 from typing import Any
 
+from harness.security.approval import fingerprint, request_for_step
 from harness.storage.approval_store import ApprovalStore
 from harness.storage.human_interaction_store import HumanInteractionStore
+from harness.storage.tool_invocation_store import ToolInvocationStore
 
 
 class TransactionError(RuntimeError):
@@ -234,6 +236,7 @@ class EngineUnitOfWork:
         self.checkpoint_store = checkpoint_store
         self.approval_store = ApprovalStore(manager.connection)
         self.human_interaction_store = HumanInteractionStore(manager.connection)
+        self.tool_invocation_store = ToolInvocationStore(manager.connection)
         manager._validate_connections(
             (task_store, event_store, artifact_store, checkpoint_store)
         )
@@ -658,6 +661,129 @@ class EngineUnitOfWork:
                        WHERE t.id = ? AND p.project_key IS NOT NULL""",
                     (interaction_id, task_id),
                 )
+            return True
+
+    def begin_tool_invocation(
+        self, task_id: int, plan: Any, step: Any, permission_scope: str
+    ) -> tuple[str, Any]:
+        """Durably reserve an effectful step before its external call."""
+        binding = request_for_step(plan, step, permission_scope)
+        binding["tool_name"] = binding.pop("tool")
+        with self.phase():
+            task = self.task_store.get(task_id)
+            if task is None or task["status"] != "executing":
+                raise TransactionError("tool invocation task is not executing")
+            state, value = self.tool_invocation_store.reserve(task_id, binding)
+            if state == "new":
+                self.event_store.record(
+                    task_id,
+                    "task.tool.started",
+                    {"invocation_id": value, "step_id": step.id, "tool": step.tool},
+                )
+            return state, value
+
+    def complete_tool_invocation(
+        self, task_id: int, invocation_id: str, step: Any
+    ) -> None:
+        """Persist the verified step result before execution can move on."""
+        result = {
+            "step_id": step.step_id,
+            "status": step.status.value,
+            "tool": step.tool,
+            "artifacts": list(step.artifacts),
+            "changed_files": list(step.changed_files),
+            "acceptance_criteria": list(step.acceptance_criteria),
+            "test_criteria": list(step.test_criteria),
+        }
+        with self.phase():
+            if not self.tool_invocation_store.complete(task_id, invocation_id, result):
+                raise TransactionError("tool invocation completion lost ownership")
+            self.event_store.record(
+                task_id,
+                "task.tool.completed",
+                {"invocation_id": invocation_id, "step_id": step.step_id},
+            )
+
+    def resolve_tool_invocation(
+        self,
+        task_id: int,
+        wait_token: str,
+        invocation_id: str,
+        actor: str,
+        outcome: str,
+        evidence_ref: str,
+    ) -> bool:
+        """Audit a human-verified effect or a verified absence of effect."""
+        if not wait_token.strip() or not actor.strip() or not evidence_ref.strip():
+            raise ValueError("wait_token, actor and evidence_ref are required")
+        if outcome not in {"completed", "no_effect"}:
+            raise ValueError("outcome must be completed or no_effect")
+        with self.manager.atomic(fenced=False):
+            task = self.task_store.get(task_id)
+            checkpoint = self.checkpoint_store.get_active(task_id)
+            if task is None or task["status"] != "waiting" or checkpoint is None:
+                raise ValueError("task is not waiting for tool reconciliation")
+            if checkpoint["waiting_reason_code"] != "tool_outcome_unknown":
+                raise ValueError("checkpoint is not a tool reconciliation wait")
+            if checkpoint["wait_token"] != wait_token:
+                raise ValueError("stale tool reconciliation token")
+            payload = json.loads(checkpoint["context_data"] or "{}")
+            if payload.get("tool_invocation_id") != invocation_id:
+                raise ValueError("stale tool invocation")
+            row = self.tool_invocation_store.get(invocation_id)
+            if row is None or row["task_id"] != task_id:
+                raise ValueError("tool invocation not found for task")
+            if row["status"] != "started":
+                if (
+                    row["status"] == outcome
+                    and row["resolved_by"] == actor
+                    and row["evidence_ref"] == evidence_ref
+                ):
+                    return False
+                raise ValueError("tool invocation already has another resolution")
+            plan = payload.get("plan")
+            if (
+                not isinstance(plan, dict)
+                or fingerprint(plan) != row["plan_fingerprint"]
+            ):
+                raise ValueError("tool invocation plan binding is stale")
+            step = next(
+                (
+                    item
+                    for item in plan.get("steps", [])
+                    if item.get("id") == row["step_id"]
+                ),
+                None,
+            )
+            if step is None or step.get("tool") != row["tool_name"]:
+                raise ValueError("tool invocation step binding is stale")
+            result = (
+                {
+                    "step_id": row["step_id"],
+                    "status": "success",
+                    "tool": row["tool_name"],
+                    "artifacts": [],
+                    "changed_files": [],
+                    "acceptance_criteria": step.get("acceptance_criteria", []),
+                    "test_criteria": step.get("test_criteria", []),
+                }
+                if outcome == "completed"
+                else None
+            )
+            if not self.tool_invocation_store.resolve(
+                task_id, invocation_id, actor, outcome, evidence_ref, result
+            ):
+                raise TransactionError("tool invocation resolution lost a race")
+            self.event_store.record(
+                task_id,
+                "task.tool.reconciled",
+                {
+                    "invocation_id": invocation_id,
+                    "outcome": outcome,
+                    "actor": actor,
+                    "evidence_ref": evidence_ref,
+                },
+            )
             return True
 
     @staticmethod

@@ -143,6 +143,9 @@ class ExecutionContext:
     resume_checkpoint: dict[str, Any] | None = None
     external_information_ref: str | None = None
     ownership_guard: Callable[[], None] | None = None
+    tool_invocation_begin: Callable[[Any, Any, str], tuple[str, Any]] | None = None
+    tool_invocation_complete: Callable[[str, Any], None] | None = None
+    tool_invocation_pending: Callable[[], str | None] | None = None
     approval_checker: Callable[[Any, Any], bool] | None = None
     active_plan: Any | None = None
     hitl_mode: str = "minimal"

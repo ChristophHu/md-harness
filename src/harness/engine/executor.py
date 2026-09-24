@@ -20,7 +20,7 @@ from harness.engine.result import (
     action_for_error,
 )
 from harness.security.tool_policy import ToolSecurityPolicy
-from harness.tools.base import ToolError, ToolRegistry
+from harness.tools.base import PermissionLevel, ToolError, ToolRegistry
 
 
 class Executor:
@@ -72,6 +72,10 @@ class Executor:
             except json.JSONDecodeError:
                 completed_ids = []
         completed = set(completed_ids or [])
+        if context.tool_invocation_pending is not None:
+            pending = context.tool_invocation_pending()
+            if pending is not None:
+                return self._uncertain_result(executions, pending)
         for step in plan.steps:
             if step.id in completed:
                 executions.append(
@@ -97,13 +101,41 @@ class Executor:
                 continue
             if context.ownership_guard is not None:
                 context.ownership_guard()
+            invocation_id: str | None = None
             try:
                 tool = self.tool_registry.get(step.tool)
                 self.security_policy.authorize(step, tool, context)
+                tool.validate_arguments(step.arguments)
+                if (
+                    self._has_external_effect(step, tool.definition.permission)
+                    and context.tool_invocation_begin is not None
+                ):
+                    state, value = context.tool_invocation_begin(
+                        plan, step, tool.definition.permission.value
+                    )
+                    if state == "completed":
+                        executions.append(
+                            StepExecution(
+                                step_id=value["step_id"],
+                                status=ExecutionStatus(value["status"]),
+                                tool=value["tool"],
+                                result="journaled",
+                                artifacts=list(value.get("artifacts", [])),
+                                changed_files=list(value.get("changed_files", [])),
+                                acceptance_criteria=list(
+                                    value.get("acceptance_criteria", [])
+                                ),
+                                test_criteria=list(value.get("test_criteria", [])),
+                            )
+                        )
+                        continue
+                    if state == "uncertain":
+                        return self._uncertain_result(executions, value)
+                    invocation_id = value
                 result = self.tool_registry.execute(step.tool, **step.arguments)
-                if context.ownership_guard is not None:
-                    context.ownership_guard()
             except ToolError as error:
+                if invocation_id is not None:
+                    return self._uncertain_result(executions, invocation_id)
                 structured = ExecutionError(
                     error.error_type,
                     str(error),
@@ -138,6 +170,12 @@ class Executor:
                     wait_reason=execution.wait_reason,
                     data={"execution": execution, "next_action": next_action},
                 )
+            except Exception:
+                if invocation_id is not None:
+                    return self._uncertain_result(executions, invocation_id)
+                raise
+            if context.ownership_guard is not None:
+                context.ownership_guard()
             normalized = (
                 ToolExecutionResult(data=result)
                 if step.tool == "test_runner" and isinstance(result, dict)
@@ -184,26 +222,33 @@ class Executor:
                         "next_action": NextAction.RETRY_EXECUTION,
                     },
                 )
-            executions.append(
-                StepExecution(
-                    step.id,
-                    ExecutionStatus.SUCCESS,
-                    step.tool,
-                    result=normalized,
-                    acceptance_criteria=list(step.acceptance_criteria),
-                    test_criteria=list(step.test_criteria),
-                    artifacts=(
-                        list(normalized.data.get("artifacts", []))
-                        if isinstance(normalized, ToolExecutionResult)
-                        else []
-                    ),
-                    changed_files=(
-                        list(normalized.data.get("changed_files", []))
-                        if isinstance(normalized, ToolExecutionResult)
-                        else []
-                    ),
-                )
+            completed_step = StepExecution(
+                step.id,
+                ExecutionStatus.SUCCESS,
+                step.tool,
+                result=normalized,
+                acceptance_criteria=list(step.acceptance_criteria),
+                test_criteria=list(step.test_criteria),
+                artifacts=(
+                    list(normalized.data.get("artifacts", []))
+                    if isinstance(normalized, ToolExecutionResult)
+                    else []
+                ),
+                changed_files=(
+                    list(normalized.data.get("changed_files", []))
+                    if isinstance(normalized, ToolExecutionResult)
+                    else []
+                ),
             )
+            if (
+                invocation_id is not None
+                and context.tool_invocation_complete is not None
+            ):
+                try:
+                    context.tool_invocation_complete(invocation_id, completed_step)
+                except Exception:  # noqa: BLE001 - a lost journal write leaves the effect uncertain
+                    return self._uncertain_result(executions, invocation_id)
+            executions.append(completed_step)
 
         execution = ExecutionResult(
             ExecutionStatus.SUCCESS,
@@ -214,3 +259,43 @@ class Executor:
             ),
         )
         return EngineResult.success("Plan executed", execution=execution)
+
+    @staticmethod
+    def _uncertain_result(
+        completed_steps: list[StepExecution], invocation_id: str
+    ) -> EngineResult:
+        """Stop instead of replaying an effect whose outcome is not durable."""
+        message = "Tool outcome is unknown; reconcile before resuming."
+        execution = ExecutionResult(
+            ExecutionStatus.WAITING,
+            steps=list(completed_steps),
+            next_action=NextAction.WAIT,
+            wait_reason=WaitReason.TOOL_OUTCOME_UNKNOWN,
+        )
+        return EngineResult(
+            status=ResultStatus.WAITING,
+            message=message,
+            wait_reason=WaitReason.TOOL_OUTCOME_UNKNOWN,
+            data={
+                "execution": execution,
+                "next_action": NextAction.WAIT,
+                "tool_invocation_id": invocation_id,
+            },
+        )
+
+    @staticmethod
+    def _has_external_effect(step: object, permission: PermissionLevel) -> bool:
+        # Test commands are declared READ for authorization, but their code may write.
+        if getattr(step, "tool", None) == "test_runner":
+            return True
+        if permission is PermissionLevel.READ:
+            return False
+        tool = getattr(step, "tool", None)
+        operation = getattr(step, "arguments", {}).get("operation")
+        if tool == "filesystem" and operation in {"read", "list", "exists"}:
+            return False
+        return not (
+            tool == "git"
+            and operation
+            in {"status", "diff", "diff_stat", "changed_files", "branch", "log"}
+        )
