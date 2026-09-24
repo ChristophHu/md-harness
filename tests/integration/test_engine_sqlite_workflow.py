@@ -11,7 +11,7 @@ import pytest
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
 from harness.engine.orchestrator import Orchestrator
-from harness.engine.plan import ExecutionPlan
+from harness.engine.plan import ExecutionPlan, PlanStep
 from harness.engine.planner import Planner
 from harness.engine.result import (
     EngineResult,
@@ -165,6 +165,129 @@ def build_orchestrator(tmp_path, validator, planner=None, executor=None):
         ),
     )
     return orchestrator, connection, task_id
+
+
+def _create_scoped_approval_wait(tmp_path):
+    database = initialize_database(tmp_path / "approval-race.sqlite")
+    connection = connect(database)
+    projects = ProjectStore(connection)
+    tasks = TaskStore(connection)
+    project_id = projects.create("Approval race", str(tmp_path))
+    task_id = tasks.create("Wait for scoped approval", project_id=project_id)
+    tasks.transition(task_id, "ready")
+    tasks.approve(task_id, "task-owner")
+    events = EventStore(connection)
+    artifacts = ArtifactStore(connection, tmp_path)
+    checkpoints = CheckpointStore(connection)
+    registry = ToolRegistry()
+    registry.register(FilesystemTool(tmp_path))
+    plan = ExecutionPlan(
+        "Write only after approval",
+        version=1,
+        steps=[
+            PlanStep(
+                "write-race-file",
+                "Write the approved file",
+                "write",
+                "filesystem",
+                {
+                    "operation": "write",
+                    "path": "race-approved.txt",
+                    "content": "approved",
+                },
+                metadata={"requires_approval": True},
+            )
+        ],
+    )
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan=plan)
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("validated", next_action="stop")
+
+    builder = ContextBuilder(
+        tasks,
+        events,
+        artifacts,
+        projects,
+        tool_registry=registry,
+        checkpoint_store=checkpoints,
+    )
+    engine = Orchestrator(
+        builder,
+        planner=Planner(),
+        executor=Executor(registry, ToolSecurityPolicy(require_approval=True)),
+        validator=Validator(),
+        task_store=tasks,
+        event_store=events,
+        artifact_store=artifacts,
+        checkpoint_store=checkpoints,
+        transaction_manager=TransactionManager(
+            connection, tasks, events, artifacts, checkpoints
+        ),
+    )
+    waiting = engine.run(task_id)
+    assert waiting.status is ResultStatus.WAITING
+    token = checkpoints.get_active(task_id)["wait_token"]
+    connection.close()
+    return database, task_id, token
+
+
+def _scoped_approval_worker(database, workspace, task_id, token, operation, calls):
+    connection = connect(database)
+    tasks = TaskStore(connection)
+    events = EventStore(connection)
+    artifacts = ArtifactStore(connection, workspace)
+    checkpoints = CheckpointStore(connection)
+    registry = ToolRegistry()
+    registry.register(FilesystemTool(workspace))
+    execute = registry.execute
+
+    def counted_execute(name, **arguments):
+        calls.append((name, dict(arguments)))
+        return execute(name, **arguments)
+
+    registry.execute = counted_execute
+
+    class ForbiddenPlanner:
+        def plan(self, _context):
+            raise AssertionError("resume must use the checkpoint plan")
+
+    class Validator:
+        def validate(self, *_args):
+            return EngineResult.success("validated", next_action="stop")
+
+    engine = Orchestrator(
+        ContextBuilder(
+            tasks,
+            events,
+            artifacts,
+            ProjectStore(connection),
+            tool_registry=registry,
+            checkpoint_store=checkpoints,
+        ),
+        planner=ForbiddenPlanner(),
+        executor=Executor(registry, ToolSecurityPolicy(require_approval=True)),
+        validator=Validator(),
+        task_store=tasks,
+        event_store=events,
+        artifact_store=artifacts,
+        checkpoint_store=checkpoints,
+        transaction_manager=TransactionManager(
+            connection, tasks, events, artifacts, checkpoints
+        ),
+    )
+    try:
+        if operation == "approve":
+            return engine.approve_wait(task_id, token, "reviewer", "write")
+        if operation == "resume":
+            return engine.resume(task_id).status
+        return engine.cancel(task_id, "cancel raced with approval").status
+    finally:
+        connection.close()
 
 
 def test_resume_replan_uses_existing_claim_when_task_is_executing(tmp_path):
@@ -735,6 +858,91 @@ def test_external_wait_resolution_racing_resume(tmp_path):
     )
 
 
+def test_scoped_approval_racing_resume_eventually_executes_once(tmp_path):
+    database, task_id, token = _create_scoped_approval_wait(tmp_path)
+    barrier = Barrier(2)
+    calls = []
+
+    def launch(operation):
+        barrier.wait()
+        return _scoped_approval_worker(
+            database, tmp_path, task_id, token, operation, calls
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        approver = pool.submit(launch, "approve")
+        resumer = pool.submit(launch, "resume")
+        assert approver.result(timeout=15) is True
+        assert resumer.result(timeout=15) in {
+            ResultStatus.WAITING,
+            ResultStatus.SUCCESS,
+        }
+
+    connection = connect(database)
+    if TaskStore(connection).get(task_id)["status"] == "waiting":
+        final_status = _scoped_approval_worker(
+            database, tmp_path, task_id, token, "resume", calls
+        )
+        assert final_status is ResultStatus.SUCCESS
+    assert TaskStore(connection).get(task_id)["status"] == "done"
+    assert CheckpointStore(connection).get_active(task_id) is None
+    approval = connection.execute(
+        "SELECT status FROM task_step_approvals WHERE wait_token = ?", (token,)
+    ).fetchone()
+    assert approval["status"] == "approved"
+    assert calls == [
+        (
+            "filesystem",
+            {
+                "operation": "write",
+                "path": "race-approved.txt",
+                "content": "approved",
+            },
+        )
+    ]
+    event_types = _event_types(connection, task_id)
+    assert event_types.count("task.approval.approved") == 1
+    assert event_types.count("task.done") == 1
+    connection.close()
+
+
+def test_scoped_approval_racing_cancel_never_runs_tool(tmp_path):
+    database, task_id, token = _create_scoped_approval_wait(tmp_path)
+    barrier = Barrier(2)
+    calls = []
+
+    def launch(operation):
+        barrier.wait()
+        return _scoped_approval_worker(
+            database, tmp_path, task_id, token, operation, calls
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        approver = pool.submit(launch, "approve")
+        canceller = pool.submit(launch, "cancel")
+        try:
+            approval_result = approver.result(timeout=15)
+        except ValueError as error:
+            assert "stale or mismatched" in str(error)
+            approval_result = False
+        assert canceller.result(timeout=15) is ResultStatus.SUCCESS
+
+    connection = connect(database)
+    tasks = TaskStore(connection)
+    assert tasks.get(task_id)["status"] == "cancelled"
+    assert CheckpointStore(connection).get_active(task_id) is None
+    approval = connection.execute(
+        "SELECT status FROM task_step_approvals WHERE wait_token = ?", (token,)
+    ).fetchone()
+    assert approval["status"] == ("approved" if approval_result else "pending")
+    events = _event_types(connection, task_id)
+    assert events.count("task.cancelled") == 1
+    assert events.count("task.approval.approved") == int(approval_result)
+    assert not calls
+    assert not (tmp_path / "race-approved.txt").exists()
+    connection.close()
+
+
 @pytest.mark.parametrize("reason", [None, "unknown"])
 def test_new_wait_requires_valid_reason(tmp_path, reason):
     class Validator:
@@ -1148,6 +1356,170 @@ def test_sqlite_workflow_persists_wait_checkpoint_and_resume(tmp_path):
     )
 
 
+def test_scoped_approval_survives_restart_and_executes_bound_tool_call(tmp_path):
+    database = initialize_database(tmp_path / "approval-restart.sqlite")
+    connection = connect(database)
+    projects = ProjectStore(connection)
+    tasks = TaskStore(connection)
+    project_id = projects.create("Approval project", str(tmp_path))
+    task_id = tasks.create("Write approved file", project_id=project_id)
+    tasks.transition(task_id, "ready")
+    tasks.approve(task_id, "task-owner")
+    connection.commit()
+
+    plan = ExecutionPlan(
+        "Write the approved artifact",
+        version=7,
+        steps=[
+            PlanStep(
+                "write-artifact",
+                "Write approved content",
+                "write",
+                "filesystem",
+                {
+                    "operation": "write",
+                    "path": "approved.txt",
+                    "content": "approved after restart",
+                },
+                metadata={"requires_approval": True},
+            )
+        ],
+    )
+    tool_calls = []
+
+    def make_engine(conn, *, planner):
+        project_store = ProjectStore(conn)
+        task_store = TaskStore(conn)
+        events = EventStore(conn)
+        artifacts = ArtifactStore(conn, tmp_path)
+        checkpoints = CheckpointStore(conn)
+        registry = ToolRegistry()
+        registry.register(FilesystemTool(tmp_path))
+        execute = registry.execute
+
+        def counted_execute(name, **arguments):
+            tool_calls.append((name, dict(arguments)))
+            return execute(name, **arguments)
+
+        registry.execute = counted_execute
+        builder = ContextBuilder(
+            task_store,
+            events,
+            artifacts,
+            project_store,
+            tool_registry=registry,
+            checkpoint_store=checkpoints,
+        )
+
+        class Validator:
+            def validate(self, *_args):
+                return EngineResult.success("validated", next_action="stop")
+
+        engine = Orchestrator(
+            builder,
+            planner=planner,
+            executor=Executor(registry, ToolSecurityPolicy(require_approval=True)),
+            validator=Validator(),
+            task_store=task_store,
+            event_store=events,
+            artifact_store=artifacts,
+            checkpoint_store=checkpoints,
+            transaction_manager=TransactionManager(
+                conn, task_store, events, artifacts, checkpoints
+            ),
+        )
+        return engine, task_store, events, checkpoints
+
+    class InitialPlanner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan=plan)
+
+    first, first_tasks, _first_events, first_checkpoints = make_engine(
+        connection, planner=InitialPlanner()
+    )
+    waiting = first.run(task_id)
+    assert waiting.status is ResultStatus.WAITING
+    assert not (tmp_path / "approved.txt").exists()
+    checkpoint = first_checkpoints.get_active(task_id)
+    token = checkpoint["wait_token"]
+    approval = first.unit_of_work.approval_store.get(token)
+    assert approval is not None
+    assert approval["status"] == "pending"
+    assert approval["plan_version"] == 7
+    assert approval["step_id"] == "write-artifact"
+    assert approval["tool"] == "filesystem"
+    assert approval["permission_scope"] == "write"
+    assert first_tasks.attempts(task_id)[-1]["status"] == "waiting"
+    connection.close()
+
+    restarted_connection = connect(database)
+
+    class ForbiddenPlanner:
+        def plan(self, _context):
+            raise AssertionError("resume must use the stored plan")
+
+    restarted, restarted_tasks, _restarted_events, restarted_checkpoints = make_engine(
+        restarted_connection, planner=ForbiddenPlanner()
+    )
+    assert restarted.approve_wait(task_id, token, "reviewer", "write")
+    assert restarted.unit_of_work.approval_store.get(token)["status"] == "approved"
+    result = restarted.resume(task_id)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert (tmp_path / "approved.txt").read_text() == "approved after restart"
+    assert tool_calls == [
+        (
+            "filesystem",
+            {
+                "operation": "write",
+                "path": "approved.txt",
+                "content": "approved after restart",
+            },
+        )
+    ]
+    assert restarted_tasks.get(task_id)["status"] == "done"
+    assert restarted_tasks.attempts(task_id)[-1]["status"] == "completed"
+    assert restarted_checkpoints.get_active(task_id) is None
+    event_types = _event_types(restarted_connection, task_id)
+    assert event_types.count("task.approval.requested") == 1
+    assert event_types.count("task.approval.approved") == 1
+    assert event_types[-1] == "task.done"
+
+    legacy_task_id = restarted_tasks.create(
+        "Legacy approval checkpoint", project_id=project_id
+    )
+    restarted_tasks.transition(legacy_task_id, "ready")
+    restarted_tasks.approve(legacy_task_id, "task-owner")
+    restarted_tasks.transition(legacy_task_id, "planning")
+    restarted_tasks.transition(legacy_task_id, "executing")
+    legacy_attempt = restarted_tasks.record_attempt(legacy_task_id, "running")
+    restarted_tasks.complete_attempt(legacy_attempt, "waiting", "approval required")
+    restarted_tasks.transition(legacy_task_id, "waiting")
+    legacy_execution = ExecutionResult(
+        ExecutionStatus.FAILED,
+        next_action="wait",
+        wait_reason=WaitReason.APPROVAL,
+    )
+    restarted_checkpoints.save(
+        legacy_task_id,
+        "waiting",
+        "wait",
+        attempt_id=legacy_attempt,
+        reason="approval required",
+        waiting_reason_code="approval",
+        context_data={
+            "plan": restarted._serialize(plan),
+            "execution": restarted._serialize(legacy_execution),
+        },
+    )
+    restarted_connection.commit()
+    legacy_wait = restarted.resume(legacy_task_id)
+    assert legacy_wait.status is ResultStatus.WAITING
+    assert restarted_tasks.get(legacy_task_id)["status"] == "waiting"
+    assert len(tool_calls) == 1
+    restarted_connection.close()
+
+
 def test_terminal_checkpoint_failure_rolls_back_task_attempt_and_event(tmp_path):
     class Validator:
         def validate(self, *_args):
@@ -1393,3 +1765,191 @@ def test_sqlite_resume_recovers_after_process_crash_and_restart(tmp_path):
     assert _event_types(connection, task_id).count("task.done") == 0
     connection.close()
     assert not marker.exists()
+
+
+def test_approval_wait_survives_process_crash_and_executes_after_restart(tmp_path):
+    database = initialize_database(tmp_path / "approval-process-crash.sqlite")
+    connection = connect(database)
+    projects = ProjectStore(connection)
+    tasks = TaskStore(connection)
+    project_id = projects.create("Approval crash recovery", str(tmp_path))
+    task_id = tasks.create("Write after approval", project_id=project_id)
+    tasks.transition(task_id, "ready")
+    tasks.approve(task_id, "task-owner")
+    connection.commit()
+    connection.close()
+
+    worker = textwrap.dedent(
+        """
+        import os
+        import sys
+        from harness.engine.context_builder import ContextBuilder
+        from harness.engine.executor import Executor
+        from harness.engine.orchestrator import Orchestrator
+        from harness.engine.plan import ExecutionPlan, PlanStep
+        from harness.engine.result import EngineResult, ResultStatus
+        from harness.security.tool_policy import ToolSecurityPolicy
+        from harness.storage.artifact_store import ArtifactStore
+        from harness.storage.checkpoint_store import CheckpointStore
+        from harness.storage.database import connect
+        from harness.storage.event_store import EventStore
+        from harness.storage.project_store import ProjectStore
+        from harness.storage.task_store import TaskStore
+        from harness.storage.transaction import TransactionManager
+        from harness.tools.base import ToolRegistry
+        from harness.tools.filesystem import FilesystemTool
+
+        database, task_id, workspace, marker, mode, token = sys.argv[1:]
+        connection = connect(database)
+        tasks = TaskStore(connection)
+        events = EventStore(connection)
+        artifacts = ArtifactStore(connection, workspace)
+        checkpoints = CheckpointStore(connection)
+        projects = ProjectStore(connection)
+        registry = ToolRegistry()
+        registry.register(FilesystemTool(workspace))
+        real_execute = registry.execute
+
+        def counted_execute(name, **arguments):
+            with open(marker, "a", encoding="utf-8") as stream:
+                stream.write(name + "\\n")
+            return real_execute(name, **arguments)
+
+        registry.execute = counted_execute
+        builder = ContextBuilder(
+            tasks, events, artifacts, projects,
+            tool_registry=registry, checkpoint_store=checkpoints,
+        )
+
+        class Planner:
+            def plan(self, _context):
+                if mode != "crash":
+                    raise AssertionError("recovery must use the persisted plan")
+                return EngineResult.success(
+                    "planned",
+                    plan=ExecutionPlan(
+                        "Write a file after approval",
+                        version=9,
+                        steps=[PlanStep(
+                            "write-file", "Write approved content", "write",
+                            "filesystem", {
+                                "operation": "write",
+                                "path": "crash-approved.txt",
+                                "content": "persisted approval survived process death",
+                            },
+                            metadata={"requires_approval": True},
+                        )],
+                    ),
+                )
+
+        class Validator:
+            def validate(self, *_args):
+                return EngineResult.success("validated", next_action="stop")
+
+        engine = Orchestrator(
+            builder, planner=Planner(),
+            executor=Executor(registry, ToolSecurityPolicy(require_approval=True)),
+            validator=Validator(), task_store=tasks, event_store=events,
+            artifact_store=artifacts, checkpoint_store=checkpoints,
+            transaction_manager=TransactionManager(
+                connection, tasks, events, artifacts, checkpoints
+            ),
+        )
+        if mode == "crash":
+            commit_decision = engine.unit_of_work.commit_decision
+            def commit_then_crash(decision):
+                commit_decision(decision)
+                if decision.approval_request is not None:
+                    os._exit(74)
+            engine.unit_of_work.commit_decision = commit_then_crash
+            engine.run(int(task_id))
+            raise SystemExit("approval wait was not persisted")
+
+        engine.approve_wait(int(task_id), token, "reviewer", "write")
+        result = engine.resume(int(task_id))
+        if result.status is not ResultStatus.SUCCESS:
+            raise SystemExit(f"resume failed: {result.status}: {result.message}")
+        connection.close()
+        """
+    )
+    marker = tmp_path / "approval-tool-calls.txt"
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            worker,
+            str(database),
+            str(task_id),
+            str(tmp_path),
+            str(marker),
+            "crash",
+            "-",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert crashed.returncode == 74, crashed.stderr
+
+    connection = connect(database)
+    tasks = TaskStore(connection)
+    checkpoints = CheckpointStore(connection)
+    checkpoint = checkpoints.get_active(task_id)
+    token = checkpoint["wait_token"]
+    approvals = connection.execute(
+        "SELECT status, plan_version, step_id, tool, permission_scope "
+        "FROM task_step_approvals WHERE wait_token = ?",
+        (token,),
+    ).fetchone()
+    assert checkpoint["waiting_reason_code"] == "approval"
+    assert approvals["status"] == "pending"
+    assert tuple(approvals)[1:] == (9, "write-file", "filesystem", "write")
+    assert tasks.get(task_id)["status"] == "waiting"
+    assert not marker.exists()
+    # The killed process leaves its execution lease behind; emulate its expiry
+    # before allowing a replacement process to take over the task.
+    connection.execute(
+        "UPDATE tasks SET claim_expires_at = '2000-01-01 00:00:00' WHERE id = ?",
+        (task_id,),
+    )
+    connection.commit()
+    connection.close()
+
+    recovered = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            worker,
+            str(database),
+            str(task_id),
+            str(tmp_path),
+            str(marker),
+            "recover",
+            token,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+
+    connection = connect(database)
+    tasks = TaskStore(connection)
+    assert tasks.get(task_id)["status"] == "done"
+    assert [row["status"] for row in tasks.attempts(task_id)] == [
+        "waiting",
+        "completed",
+    ]
+    assert CheckpointStore(connection).get_active(task_id) is None
+    assert (tmp_path / "crash-approved.txt").read_text() == (
+        "persisted approval survived process death"
+    )
+    assert marker.read_text().splitlines() == ["filesystem"]
+    assert _event_types(connection, task_id).count("task.approval.requested") == 1
+    assert _event_types(connection, task_id).count("task.approval.approved") == 1
+    assert _event_types(connection, task_id).count("task.done") == 1
+    connection.close()

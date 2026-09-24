@@ -120,7 +120,10 @@ class Executor:
                     error_details=[structured],
                     next_action=next_action,
                     wait_reason=(
-                        WaitReason.EXTERNAL_INFORMATION
+                        WaitReason.APPROVAL
+                        if next_action is NextAction.WAIT
+                        and structured.details.get("approval_required")
+                        else WaitReason.EXTERNAL_INFORMATION
                         if next_action is NextAction.WAIT
                         and structured.error_type is ExecutionErrorType.EXTERNAL_BLOCKER
                         else WaitReason.APPROVAL

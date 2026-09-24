@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sqlite3 import Connection, Row
+from uuid import uuid4
 
 
 class ProjectStore:
@@ -18,8 +19,8 @@ class ProjectStore:
         parent_id: int | None = None,
     ) -> int:
         return self.connection.execute(
-            "INSERT INTO projects (name, path, description, parent_id) VALUES (?, ?, ?, ?)",
-            (name, path, description, parent_id),
+            "INSERT INTO projects (name, path, description, parent_id, project_key) VALUES (?, ?, ?, ?, ?)",
+            (name, path, description, parent_id, uuid4().hex),
         ).lastrowid
 
     def get(self, project_id: int) -> Row | None:

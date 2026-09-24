@@ -9,5 +9,12 @@ properties:
     type: object
   execution:
     type: object
+    properties:
+      hitl:
+        type: object
+        properties:
+          mode:
+            type: string
+            enum: [minimal, selective, interactive]
   security:
     type: object

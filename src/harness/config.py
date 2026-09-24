@@ -23,6 +23,14 @@ class PersistenceMode(StrEnum):
     DISABLED = "disabled"
 
 
+class HITLMode(StrEnum):
+    """Controls optional human review points, never security approvals."""
+
+    MINIMAL = "minimal"
+    SELECTIVE = "selective"
+    INTERACTIVE = "interactive"
+
+
 @dataclass(frozen=True, slots=True)
 class SecretConfig:
     """Secret source and logical-name mapping for local/CI providers."""
@@ -65,6 +73,7 @@ class ExecutionConfig:
     max_cycles: int = 3
     persistence_mode: PersistenceMode = PersistenceMode.OPTIONAL
     max_replans: int = 2
+    hitl_mode: HITLMode = HITLMode.MINIMAL
 
     def __post_init__(self) -> None:
         if not isinstance(self.dry_run, bool):
@@ -83,6 +92,13 @@ class ExecutionConfig:
             except ValueError as error:
                 raise ConfigError(
                     "persistence_mode must be required, optional or disabled"
+                ) from error
+        if not isinstance(self.hitl_mode, HITLMode):
+            try:
+                object.__setattr__(self, "hitl_mode", HITLMode(self.hitl_mode))
+            except ValueError as error:
+                raise ConfigError(
+                    "hitl.mode must be minimal, selective or interactive"
                 ) from error
         if self.max_retries < 0:
             raise ConfigError("max_retries must be non-negative")
@@ -119,6 +135,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
     execution = data.get("execution", {})
     if not isinstance(execution, dict):
         raise ConfigError("execution configuration must be a mapping")
+    hitl = execution.get("hitl", {})
+    if not isinstance(hitl, dict):
+        raise ConfigError("execution.hitl configuration must be a mapping")
     settings = ExecutionConfig(
         **{
             key: execution[key]
@@ -130,7 +149,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
                 "persistence_mode",
             )
             if key in execution
-        }
+        },
+        hitl_mode=hitl.get("mode", execution.get("hitl_mode", HITLMode.MINIMAL)),
     )
     data["execution"] = settings
     data["secrets"] = secret_settings

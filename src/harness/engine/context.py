@@ -145,6 +145,8 @@ class ExecutionContext:
     ownership_guard: Callable[[], None] | None = None
     approval_checker: Callable[[Any, Any], bool] | None = None
     active_plan: Any | None = None
+    hitl_mode: str = "minimal"
+    human_responses: list[dict[str, Any]] = field(default_factory=list)
 
     def add_knowledge_document(self, document: str) -> None:
         """Add a knowledge document once while preserving insertion order."""

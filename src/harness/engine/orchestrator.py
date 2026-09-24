@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from harness.config import ConfigError, ExecutionConfig, PersistenceMode
+from harness.config import ConfigError, ExecutionConfig, HITLMode, PersistenceMode
 from harness.engine.context import ExecutionContext
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
+from harness.engine.hitl import plan_review_request, should_request_interaction
 from harness.engine.result import (
     EngineResult,
     ExecutionResult,
@@ -24,7 +25,7 @@ from harness.engine.result import (
     StepExecution,
     WaitReason,
 )
-from harness.security.approval import request_for_step
+from harness.security.approval import fingerprint, request_for_step
 from harness.storage.factory import StoreBundle
 from harness.storage.transaction import (
     EngineUnitOfWork,
@@ -82,6 +83,9 @@ class Orchestrator:
             max_retries = execution_config.max_retries
             max_replans = execution_config.max_replans
             persistence_mode = execution_config.persistence_mode
+            hitl_mode = execution_config.hitl_mode
+        else:
+            hitl_mode = HITLMode.MINIMAL
         if stores is not None:
             if any(
                 value is not None
@@ -102,6 +106,7 @@ class Orchestrator:
             self._validate_builder_stores(context_builder, stores)
             transaction_manager = stores.transaction_manager
         self.context_builder = context_builder
+        self.hitl_mode = HITLMode(hitl_mode)
         self.planner = planner
         self.executor = executor or (Executor(tool_registry) if tool_registry else None)
         if tool_registry is not None:
@@ -151,6 +156,12 @@ class Orchestrator:
             )
         if self.persistence_mode is PersistenceMode.DISABLED and stores is not None:
             raise ConfigError("disabled persistence mode cannot use a store bundle")
+        if self.hitl_mode is HITLMode.INTERACTIVE and (
+            self.unit_of_work is None or self.checkpoint_store is None
+        ):
+            raise ConfigError(
+                "interactive HITL mode requires transactional checkpoint persistence"
+            )
         if max_cycles < 1:
             raise ValueError("max_cycles must be positive")
         if max_retries < 0:
@@ -164,6 +175,7 @@ class Orchestrator:
             raise ValueError("resume_lease_seconds must be positive")
         self.resume_lease_seconds = resume_lease_seconds
         self.run_id = str(uuid4())
+        self.decision_vault: Any | None = None
 
     @staticmethod
     def _validate_builder_stores(
@@ -185,6 +197,7 @@ class Orchestrator:
         if self.transaction_manager is not None and isinstance(
             context, ExecutionContext
         ):
+            context.hitl_mode = self.hitl_mode.value
             context.ownership_guard = self._check_ownership
             context.approval_checker = lambda step, tool: self._approval_allowed(
                 context, step, tool
@@ -350,6 +363,42 @@ class Orchestrator:
                         task_id, attempt_id, "planning", error
                     )
                 if not planning.successful:
+                    if (
+                        planning.status is ResultStatus.WAITING
+                        and planning.interaction_request
+                    ):
+                        try:
+                            interaction_id = self._persist_planner_interaction(
+                                task_id, attempt_id, planning, cycle, retries, replans
+                            )
+                        except (TypeError, ValueError) as error:
+                            message = f"Invalid planner interaction request: {error}"
+                            if self.unit_of_work is not None:
+                                self.unit_of_work.commit_decision(
+                                    PhaseDecision(
+                                        task_id,
+                                        attempt_id,
+                                        "planning",
+                                        (
+                                            (
+                                                "task.planning.invalid_interaction",
+                                                {"error": str(error)},
+                                            ),
+                                            ("task.failed", {"error": message}),
+                                        ),
+                                        attempt_status="failed",
+                                        attempt_error=message,
+                                        task_status="failed",
+                                        invalidate_checkpoint=True,
+                                    )
+                                )
+                            return EngineResult.failure(message)
+                        if interaction_id is not None:
+                            return EngineResult.waiting(
+                                planning.message,
+                                planning.wait_reason,
+                                interaction_request={"interaction_id": interaction_id},
+                            )
                     if self.unit_of_work is not None and hasattr(
                         self.unit_of_work, "commit_decision"
                     ):
@@ -378,6 +427,47 @@ class Orchestrator:
                         )
                     return planning
                 plan = planning.data["plan"]
+                review_request = None
+                if self.hitl_mode is not HITLMode.MINIMAL and hasattr(plan, "steps"):
+                    review_request = plan_review_request(plan)
+                if (
+                    review_request is not None
+                    and self.unit_of_work is not None
+                    and self.checkpoint_store is not None
+                    and should_request_interaction(self.hitl_mode, review_request)
+                ):
+                    serialized_plan = self._serialize(plan)
+                    interaction_id = self.unit_of_work.create_human_wait(
+                        task_id,
+                        attempt_id,
+                        {
+                            "phase": "planning",
+                            "next_action": NextAction.WAIT.value,
+                            "attempt_id": attempt_id,
+                            "reason": review_request["prompt"],
+                            "context_data": {
+                                "plan": serialized_plan,
+                                "validation_progress": {
+                                    "retries": retries,
+                                    "replans": replans,
+                                    "cycles": cycle,
+                                },
+                            },
+                            "plan_version": getattr(plan, "version", None),
+                            "plan_fingerprint": fingerprint(serialized_plan),
+                            "next_step_id": plan.steps[0].id if plan.steps else None,
+                            "waiting_reason_code": WaitReason.PLAN_REVIEW.value,
+                        },
+                        review_request,
+                        plan_version=getattr(plan, "version", None),
+                        plan_fingerprint=fingerprint(serialized_plan),
+                        events=(("task.plan.created", serialized_plan),),
+                    )
+                    return EngineResult.waiting(
+                        review_request["prompt"],
+                        WaitReason.PLAN_REVIEW,
+                        interaction_request={"interaction_id": interaction_id},
+                    )
                 if self.unit_of_work is not None and hasattr(
                     self.unit_of_work, "commit_decision"
                 ):
@@ -1511,6 +1601,125 @@ class Orchestrator:
     def _require_wait_reason(cls, result: EngineResult) -> WaitReason:
         return cls._coerce_wait_reason(result.wait_reason)
 
+    def _persist_planner_interaction(
+        self,
+        task_id: int,
+        attempt_id: int,
+        result: EngineResult,
+        cycle: int,
+        retries: int,
+        replans: int,
+    ) -> str | None:
+        if self.unit_of_work is None or self.checkpoint_store is None:
+            return None
+        request = result.interaction_request
+        if not isinstance(request, dict):
+            raise TypeError("interaction request must be a mapping")
+        self.unit_of_work._validate_interaction_request(request)
+        reason = self._require_wait_reason(result)
+        expected = (
+            WaitReason.PLAN_REVIEW
+            if request["kind"] == "plan_review"
+            else WaitReason.HUMAN_INPUT
+        )
+        if reason is not expected:
+            raise ValueError("interaction kind does not match planner WAIT reason")
+        plan = result.data.get("plan")
+        execution = result.data.get("execution")
+        if request["resume_action"] == NextAction.VALIDATE.value and (
+            plan is None or execution is None
+        ):
+            raise ValueError("validation resume requires saved plan and execution")
+        serialized_plan = self._serialize(plan) if plan is not None else None
+        plan_fingerprint = fingerprint(serialized_plan) if serialized_plan else None
+        checkpoint = {
+            "phase": "planning",
+            "next_action": NextAction.WAIT.value,
+            "attempt_id": attempt_id,
+            "reason": result.message or request["prompt"],
+            "waiting_reason_code": reason.value,
+            "plan_version": getattr(plan, "version", None),
+            "plan_fingerprint": plan_fingerprint,
+            "context_data": {
+                "plan": serialized_plan,
+                "execution": self._serialize(execution)
+                if execution is not None
+                else None,
+                "validation_progress": {
+                    "retries": retries,
+                    "replans": replans,
+                    "cycles": cycle,
+                },
+            },
+        }
+        return self.unit_of_work.create_human_wait(
+            task_id,
+            attempt_id,
+            checkpoint,
+            request,
+            plan_version=getattr(plan, "version", None),
+            plan_fingerprint=plan_fingerprint,
+            events=(("task.planning.waiting", {"kind": request["kind"]}),),
+        )
+
+    def list_human_interactions(self, task_id: int) -> list[dict[str, Any]]:
+        """Return pending interaction requests for an application/API adapter."""
+        if self.unit_of_work is None:
+            raise ConfigError("human interactions require transactional SQLite stores")
+        with self.unit_of_work.phase():
+            rows = self.unit_of_work.human_interaction_store.list_open(task_id)
+            interactions = [
+                {
+                    "interaction_id": row["interaction_id"],
+                    "task_id": row["task_id"],
+                    "wait_token": row["wait_token"],
+                    "kind": row["kind"],
+                    "status": row["status"],
+                    "prompt": row["prompt"],
+                    "response_schema": json.loads(row["response_schema"]),
+                    "request_data": json.loads(row["request_data"]),
+                    "plan_version": row["plan_version"],
+                    "plan_fingerprint": row["plan_fingerprint"],
+                }
+                for row in rows
+            ]
+        for interaction in interactions:
+            interaction["suggestions"] = self.suggest_human_interaction(
+                task_id, interaction["prompt"]
+            )
+        return interactions
+
+    def suggest_human_interaction(
+        self, task_id: int, question: str
+    ) -> list[dict[str, Any]]:
+        """Suggest prior decisions from this task's project only."""
+        vault = getattr(self, "decision_vault", None)
+        if vault is None:
+            return []
+        task = self.task_store.get(task_id)
+        if task is None or task["project_id"] is None:
+            return []
+        project = self.context_builder.project_store.get(task["project_id"])
+        return vault.suggest(project["project_key"], question) if project else []
+
+    def publish_vault_decisions(self, *, limit: int = 100) -> int:
+        """Retry queued Vault publications (also useful after a restart)."""
+        vault = getattr(self, "decision_vault", None)
+        return vault.publish_pending(limit=limit) if vault else 0
+
+    def answer_human_interaction(
+        self, task_id: int, interaction_id: str, actor: str, response: Any
+    ) -> bool:
+        """Submit one typed response; authentication belongs to the API adapter."""
+        if self.unit_of_work is None:
+            raise ConfigError("human interactions require transactional SQLite stores")
+        answered = self.unit_of_work.answer_human_interaction(
+            task_id, interaction_id, actor, response
+        )
+        if answered:
+            self.publish_vault_decisions()
+        return answered
+
     def resolve_external_wait(
         self, task_id: int, wait_token: str, actor: str, information_ref: str
     ) -> bool:
@@ -1755,6 +1964,43 @@ class Orchestrator:
             payload.get("execution") if isinstance(payload, dict) else None
         )
         progress = self._checkpoint_progress(checkpoint)
+        interaction = None
+        interaction_action = None
+        if reason_code in {WaitReason.HUMAN_INPUT.value, WaitReason.PLAN_REVIEW.value}:
+            token = self._checkpoint_value(checkpoint, "wait_token")
+            if self.unit_of_work is not None and token:
+                interaction = self.unit_of_work.human_interaction_store.for_wait(
+                    task_id, token
+                )
+            if interaction is not None and interaction["status"] == "answered":
+                if interaction["plan_fingerprint"]:
+                    current_fingerprint = (
+                        fingerprint(self._serialize(plan)) if plan else None
+                    )
+                    if current_fingerprint != interaction["plan_fingerprint"]:
+                        return EngineResult.failure(
+                            "Human interaction plan binding is stale."
+                        )
+                interaction_action = interaction["resume_action"]
+                if interaction["kind"] == "plan_review":
+                    response = json.loads(interaction["response_data"])
+                    if response.get("decision") == "changes_requested":
+                        return self._resume_replan(task_id, progress=progress)
+                    interaction_action = NextAction.RETRY_EXECUTION.value
+        if interaction_action is not None:
+            if plan is None and isinstance(payload, dict):
+                plan = self._deserialize_plan(payload.get("plan"))
+            if interaction_action == NextAction.REPLAN.value:
+                return self._resume_replan(task_id, progress=progress)
+            if (
+                interaction_action == NextAction.VALIDATE.value
+                and execution is not None
+            ):
+                return self._resume_validation(
+                    task_id, checkpoint, plan, progress=progress
+                )
+            if interaction_action == NextAction.RETRY_EXECUTION.value:
+                return self._resume_retry_execution(task_id, plan, progress=progress)
         should_continue = (
             reason_code in {"temporary_error", "workspace_missing", "manual_replan"}
             or reason_code == "approval"

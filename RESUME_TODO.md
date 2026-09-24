@@ -54,14 +54,16 @@ sind als erledigt markiert; offene Punkte beschreiben verbleibende Arbeit und ke
 
 ## Human in the Middle
 
-- [ ] Approval-Request und Approval-Gate mit persistierter Entscheidung
-  implementieren.
-- [ ] Freigaben an Task, Planversion, Step, Tool und Berechtigungsscope binden.
-- [ ] Freigaben bei Replanning, Toolwechsel oder Scope-Erweiterung
-  invalidieren.
-- [ ] Approval-Events sowie Freigabe- und Ablehnungsübergänge in den
-  Orchestrator integrieren. Der aktuelle WAIT-Resume liest nur
-  `approval_status` und ist noch kein vollständiger HITM-Workflow.
+- [x] Tool-Approval mit persistierter, an Task/Plan/Step/Tool/Argumente/Scope
+  gebundener Entscheidung implementieren; Executor prüft an der Tool-Grenze.
+- [x] Generische strukturierte Interaktionen für Informationsfragen,
+  Entscheidungen und Planreviews persistieren und atomar beantworten.
+- [x] Antworten nach Neustart im Execution-Context bereitstellen und WAIT-Resume
+  an aktuellen Token und Plan-Fingerprint binden.
+- [x] `execution.hitl.mode` mit `minimal`, `selective` und `interactive`
+  integrieren; verpflichtende Tool-Approvals bleiben in jedem Modus aktiv.
+- [x] Application-/Orchestrator-API und SQLite-Neustart-, Resume-, API- und
+  Cancel-Integrationstests ergänzen.
 
 ## Secrets und Betrieb
 

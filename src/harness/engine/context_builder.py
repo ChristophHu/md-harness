@@ -28,6 +28,7 @@ class ContextBuilder:
         tool_registry: Any | None = None,
         dry_run: bool = False,
         checkpoint_store: Any | None = None,
+        hitl_mode: str = "minimal",
     ) -> None:
         self.task_store = task_store
         self.event_store = event_store
@@ -37,6 +38,7 @@ class ContextBuilder:
         self.tool_registry = tool_registry
         self.dry_run = dry_run
         self.checkpoint_store = checkpoint_store
+        self.hitl_mode = hitl_mode
 
     @classmethod
     def from_stores(
@@ -67,6 +69,7 @@ class ContextBuilder:
             else None
         )
         checkpoint_data = dict(checkpoint) if checkpoint is not None else None
+        human_responses = self._human_responses(task_id)
         context = ExecutionContext(
             task_id=task["id"],
             task_title=task["title"],
@@ -75,6 +78,8 @@ class ContextBuilder:
             priority=task["priority"],
             task_status=task["status"],
             approval_status=task["approval_status"],
+            hitl_mode=self.hitl_mode,
+            human_responses=human_responses,
             assigned_agent=task["assigned_agent"],
             acceptance_criteria=[
                 AcceptanceCriterion(row["id"], row["criterion"], bool(row["completed"]))
@@ -114,6 +119,32 @@ class ContextBuilder:
         if self.knowledge_loader is not None:
             context.knowledge_documents.extend(self.knowledge_loader(task_id))
         return context
+
+    def _human_responses(self, task_id: int) -> list[dict[str, Any]]:
+        """Load completed structured responses when the interaction migration exists."""
+        connection = getattr(self.checkpoint_store, "connection", None)
+        if connection is None:
+            return []
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_human_interactions'"
+        ).fetchone()
+        if exists is None:
+            return []
+        return [
+            {
+                "interaction_id": row["interaction_id"],
+                "kind": row["kind"],
+                "request": json.loads(row["request_data"]),
+                "response": json.loads(row["response_data"]),
+                "actor": row["decided_by"],
+            }
+            for row in connection.execute(
+                """SELECT interaction_id, kind, request_data, response_data, decided_by
+                   FROM task_human_interactions WHERE task_id = ? AND status = 'answered'
+                   ORDER BY created_at, interaction_id""",
+                (task_id,),
+            ).fetchall()
+        ]
 
     @staticmethod
     def _command(value: Any) -> str | list[str] | None:

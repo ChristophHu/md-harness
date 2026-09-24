@@ -5,6 +5,7 @@ import pytest
 from harness.config import (
     ConfigError,
     ExecutionConfig,
+    HITLMode,
     PersistenceMode,
     SecretConfig,
     load_config,
@@ -37,6 +38,16 @@ def test_execution_config_rejects_invalid_persistence_mode():
         ExecutionConfig(persistence_mode="invalid")
 
 
+@pytest.mark.parametrize("mode", list(HITLMode))
+def test_execution_config_accepts_hitl_modes(mode):
+    assert ExecutionConfig(hitl_mode=mode.value).hitl_mode is mode
+
+
+def test_execution_config_rejects_invalid_hitl_mode():
+    with pytest.raises(ConfigError, match="hitl.mode"):
+        ExecutionConfig(hitl_mode="unattended")
+
+
 @pytest.mark.parametrize(
     "field", ["dry_run", "max_retries", "max_cycles", "max_replans"]
 )
@@ -51,6 +62,17 @@ def test_load_config_handles_defaults_and_invalid_shapes(tmp_path):
     defaults = tmp_path / "defaults.yaml"
     defaults.write_text("project: {}\n", encoding="utf-8")
     assert load_config(defaults)["execution"] == ExecutionConfig()
+
+    configured = tmp_path / "hitl.yaml"
+    configured.write_text(
+        "execution:\n  hitl:\n    mode: interactive\n", encoding="utf-8"
+    )
+    assert load_config(configured)["execution"].hitl_mode is HITLMode.INTERACTIVE
+
+    invalid_hitl = tmp_path / "invalid-hitl.yaml"
+    invalid_hitl.write_text("execution:\n  hitl: true\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="execution.hitl"):
+        load_config(invalid_hitl)
 
     invalid = tmp_path / "invalid.yaml"
     invalid.write_text("execution: []\n", encoding="utf-8")

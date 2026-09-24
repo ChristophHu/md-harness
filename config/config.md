@@ -15,6 +15,8 @@ execution:
   max_retries: 2
   max_cycles: 3
   persistence_mode: required
+  hitl:
+    mode: minimal
 ```
 
 ### `PersistenceMode`
@@ -42,6 +44,7 @@ Bewusst persistenzfreier Modus. Der Orchestrator verwendet keine Persistenz. Die
 - `dry_run`: verhindert je nach Toolrichtlinie schreibende oder destruktive Operationen.
 - `max_retries`: maximale Anzahl erneuter Ausführungen nach `retry_execution`.
 - `max_cycles`: maximale Anzahl von Planungs-, Ausführungs- und Validierungszyklen.
+- `hitl.mode`: `minimal` (Default, rückwärtskompatibel), `selective` oder `interactive`. Der Modus steuert optionale Planreviews und menschliche Rückfragen. Er schaltet weder verpflichtende Tool-Approvals noch statische Sicherheitsverbote ab.
 
 ## Empfehlung
 

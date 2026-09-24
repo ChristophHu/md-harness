@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from threading import Event, Thread
 from typing import Any
 
 from harness.storage.approval_store import ApprovalStore
+from harness.storage.human_interaction_store import HumanInteractionStore
 
 
 class TransactionError(RuntimeError):
@@ -231,6 +233,7 @@ class EngineUnitOfWork:
         self.artifact_store = artifact_store
         self.checkpoint_store = checkpoint_store
         self.approval_store = ApprovalStore(manager.connection)
+        self.human_interaction_store = HumanInteractionStore(manager.connection)
         manager._validate_connections(
             (task_store, event_store, artifact_store, checkpoint_store)
         )
@@ -528,7 +531,169 @@ class EngineUnitOfWork:
                     f"task.approval.{status}",
                     {"wait_token": wait_token, "actor": actor, "scope": scope},
                 )
-            return changed
+        return changed
+
+    def create_human_wait(
+        self,
+        task_id: int,
+        attempt_id: int,
+        checkpoint: dict[str, Any],
+        request: dict[str, Any],
+        *,
+        plan_version: int | None = None,
+        plan_fingerprint: str | None = None,
+        events: tuple[tuple[str, Any], ...] = (),
+    ) -> str:
+        """Atomically create an interaction and move its task into waiting."""
+        self._validate_interaction_request(request)
+        with self.phase():
+            task = self.task_store.get(task_id)
+            if task is None or task["status"] not in {
+                "planning",
+                "executing",
+                "validating",
+            }:
+                raise TransactionError("task is not in an interactable state")
+            attempt = self.manager.connection.execute(
+                "SELECT task_id, status FROM task_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["task_id"] != task_id
+                or attempt["status"] != "running"
+            ):
+                raise TransactionError("interaction attempt is not active")
+            self.checkpoint_store.save(task_id, **checkpoint)
+            active = self.checkpoint_store.get_active(task_id)
+            self.manager.connection.execute(
+                """UPDATE task_human_interactions SET status = 'superseded',
+                   decided_at = CURRENT_TIMESTAMP
+                   WHERE task_id = ? AND status = 'pending' AND wait_token != ?""",
+                (task_id, active["wait_token"]),
+            )
+            interaction_id = self.human_interaction_store.create(
+                task_id,
+                active["wait_token"],
+                request,
+                plan_version=plan_version,
+                plan_fingerprint=plan_fingerprint,
+            )
+            for event_type, payload in events:
+                self.event_store.record(task_id, event_type, payload)
+            self.task_store.complete_attempt(
+                attempt_id, "waiting", checkpoint["reason"]
+            )
+            self.task_store.transition(task_id, "waiting")
+            self.event_store.record(
+                task_id,
+                "task.interaction.requested",
+                {
+                    "interaction_id": interaction_id,
+                    "wait_token": active["wait_token"],
+                    "kind": request["kind"],
+                    "prompt": request["prompt"],
+                },
+            )
+            self.event_store.record(
+                task_id, "task.waiting", {"reason": checkpoint["reason"]}
+            )
+            return interaction_id
+
+    def answer_human_interaction(
+        self, task_id: int, interaction_id: str, actor: str, response: Any
+    ) -> bool:
+        """Validate and persist one answer against the current waiting token."""
+        if not actor.strip():
+            raise ValueError("actor is required")
+        with self.phase():
+            task = self.task_store.get(task_id)
+            row = self.human_interaction_store.get(interaction_id)
+            checkpoint = self.checkpoint_store.get_active(task_id)
+            if row is None or row["task_id"] != task_id:
+                raise ValueError("human interaction not found for task")
+            if task is None or task["status"] != "waiting" or checkpoint is None:
+                raise ValueError("task has no active waiting interaction")
+            if checkpoint["wait_token"] != row["wait_token"]:
+                raise ValueError("stale human interaction")
+            expected_reason = (
+                "plan_review" if row["kind"] == "plan_review" else "human_input"
+            )
+            if checkpoint["waiting_reason_code"] != expected_reason:
+                raise ValueError("interaction does not match the active wait reason")
+            encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
+            if row["status"] == "answered":
+                if row["response_data"] == encoded:
+                    return False
+                raise ValueError("interaction already has a different answer")
+            if row["status"] != "pending":
+                raise ValueError("interaction is no longer pending")
+            schema = json.loads(row["response_schema"])
+            self.human_interaction_store.validate_response(schema, response)
+            cursor = self.manager.connection.execute(
+                """UPDATE task_human_interactions SET status = 'answered', response_data = ?,
+                   decided_by = ?, decided_at = CURRENT_TIMESTAMP
+                   WHERE interaction_id = ? AND status = 'pending'""",
+                (encoded, actor, interaction_id),
+            )
+            if cursor.rowcount != 1:
+                raise TransactionError("human interaction answer lost a race")
+            self.event_store.record(
+                task_id,
+                "task.interaction.answered",
+                {
+                    "interaction_id": interaction_id,
+                    "wait_token": row["wait_token"],
+                    "kind": row["kind"],
+                    "actor": actor,
+                },
+            )
+            if row["kind"] in {"human_decision", "plan_review"} or (
+                row["kind"] == "information_request"
+                and json.loads(row["request_data"]).get("reusable") is True
+            ):
+                self.manager.connection.execute(
+                    """INSERT INTO vault_decision_outbox (interaction_id, project_key)
+                       SELECT ?, p.project_key FROM tasks t
+                       JOIN projects p ON p.id = t.project_id
+                       WHERE t.id = ? AND p.project_key IS NOT NULL""",
+                    (interaction_id, task_id),
+                )
+            return True
+
+    @staticmethod
+    def _validate_interaction_request(request: dict[str, Any]) -> None:
+        if not isinstance(request, dict):
+            raise TypeError("interaction request must be a mapping")
+        if request.get("kind") not in {
+            "information_request",
+            "human_decision",
+            "plan_review",
+        }:
+            raise ValueError("unsupported human interaction kind")
+        if not isinstance(request.get("prompt"), str) or not request["prompt"].strip():
+            raise ValueError("interaction prompt is required")
+        if request.get("resume_action") not in {
+            "retry_execution",
+            "replan",
+            "validate",
+        }:
+            raise ValueError("invalid interaction resume_action")
+        schema = request.get("response_schema")
+        if not isinstance(schema, dict) or schema.get("type") not in {
+            "object",
+            "array",
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "null",
+        }:
+            raise ValueError(
+                "interaction response_schema must declare a supported type"
+            )
+        HumanInteractionStore.validate_schema(schema)
+        if not isinstance(request.get("request_data", {}), dict):
+            raise TypeError("interaction request_data must be an object")
 
     @contextmanager
     def phase(self) -> Iterator[sqlite3.Connection]:
@@ -680,4 +845,9 @@ class EngineUnitOfWork:
             self.task_store.cancel(task_id, reason)
             if self.checkpoint_store is not None:
                 self.checkpoint_store.invalidate(task_id, reason)
+            self.manager.connection.execute(
+                """UPDATE task_human_interactions SET status = 'cancelled',
+                   decided_at = CURRENT_TIMESTAMP WHERE task_id = ? AND status = 'pending'""",
+                (task_id,),
+            )
             self.event_store.record(task_id, "task.cancelled", {"reason": reason})

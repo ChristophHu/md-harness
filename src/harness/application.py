@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from dotenv import dotenv_values
 
 from harness.config import ConfigError, ExecutionConfig, PersistenceMode, load_config
 from harness.engine.context_builder import ContextBuilder
@@ -12,6 +15,7 @@ from harness.engine.executor import Executor
 from harness.engine.orchestrator import Orchestrator
 from harness.engine.planner import Planner
 from harness.engine.validator import Validator
+from harness.knowledge.decision_vault import DecisionVault
 from harness.security.secrets import default_secret_provider
 from harness.security.tool_policy import ToolSecurityPolicy
 from harness.storage.database import connect, initialize_database
@@ -45,6 +49,27 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
     connection = connect(database_path)
     stores = StoreFactory.create(connection, workspace)
     project_store = ProjectStore(connection)
+    env_file = (
+        path.parent.parent / ".env"
+        if path.parent.name == "config"
+        else path.parent / ".env"
+    )
+    env_values = dotenv_values(env_file)
+    vault_setting = os.environ.get("OBSIDIAN_VAULT_PATH") or env_values.get(
+        "OBSIDIAN_VAULT_PATH"
+    )
+    if not vault_setting:
+        sources = raw.get("knowledge", {}).get("sources", [])
+        vault_setting = next(
+            (
+                source.get("path")
+                for source in sources
+                if source.get("name") == "obsidian-vault"
+                and source.get("enabled", True)
+            ),
+            None,
+        )
+    decision_vault = DecisionVault(connection, vault_setting) if vault_setting else None
     registry = ToolRegistryFactory.create(
         workspace,
         database=database,
@@ -55,6 +80,8 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
         project_store,
         tool_registry=registry,
         dry_run=execution.dry_run,
+        hitl_mode=execution.hitl_mode.value,
+        knowledge_loader=decision_vault.for_task if decision_vault else None,
     )
     policy = ToolSecurityPolicy(
         allow_destructive=False,
@@ -73,6 +100,9 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
             names=secret_settings.names,
         ),
     )
+    orchestrator.decision_vault = decision_vault
+    if decision_vault is not None:
+        decision_vault.publish_pending()
     return orchestrator, connection
 
 
@@ -82,6 +112,26 @@ class Application:
 
     orchestrator: Orchestrator
     connection: Any
+
+    def list_human_interactions(self, task_id: int) -> list[dict[str, Any]]:
+        """List pending human requests through the application API."""
+        return self.orchestrator.list_human_interactions(task_id)
+
+    def answer_human_interaction(
+        self, task_id: int, interaction_id: str, actor: str, response: Any
+    ) -> bool:
+        """Submit a typed interaction response through the application API."""
+        return self.orchestrator.answer_human_interaction(
+            task_id, interaction_id, actor, response
+        )
+
+    def suggest_human_interaction(
+        self, task_id: int, question: str
+    ) -> list[dict[str, Any]]:
+        return self.orchestrator.suggest_human_interaction(task_id, question)
+
+    def publish_vault_decisions(self, *, limit: int = 100) -> int:
+        return self.orchestrator.publish_vault_decisions(limit=limit)
 
     def close(self) -> None:
         self.connection.close()

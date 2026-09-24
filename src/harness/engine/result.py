@@ -43,6 +43,8 @@ class WaitReason(StrEnum):
     TEMPORARY_ERROR = "temporary_error"
     WORKSPACE_MISSING = "workspace_missing"
     MANUAL_REPLAN = "manual_replan"
+    HUMAN_INPUT = "human_input"
+    PLAN_REVIEW = "plan_review"
 
 
 class ExecutionErrorType(StrEnum):
@@ -121,6 +123,7 @@ class EngineResult:
     tests: dict[str, bool] = field(default_factory=dict)
     data: dict[str, Any] = field(default_factory=dict)
     wait_reason: WaitReason | None = None
+    interaction_request: dict[str, Any] | None = None
 
     @property
     def successful(self) -> bool:
@@ -142,9 +145,20 @@ class EngineResult:
         )
 
     @classmethod
-    def waiting(cls, message: str, reason: WaitReason | None = None) -> EngineResult:
+    def waiting(
+        cls,
+        message: str,
+        reason: WaitReason | None = None,
+        *,
+        interaction_request: dict[str, Any] | None = None,
+    ) -> EngineResult:
         """Create a result indicating that human input or approval is needed."""
-        return cls(status=ResultStatus.WAITING, message=message, wait_reason=reason)
+        return cls(
+            status=ResultStatus.WAITING,
+            message=message,
+            wait_reason=reason,
+            interaction_request=interaction_request,
+        )
 
 
 @dataclass(slots=True)

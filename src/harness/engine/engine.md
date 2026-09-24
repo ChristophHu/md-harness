@@ -465,7 +465,7 @@ von Retry-Limits in `retry_execution` überführt werden.
 
 Neue WAIT-Ergebnisse von Executor und Validator benötigen einen expliziten
 `WaitReason` (`approval`, `external_information`, `temporary_error`,
-`workspace_missing` oder `manual_replan`). Nur alte Checkpoints ohne Code
+`workspace_missing`, `manual_replan`, `human_input` oder `plan_review`). Nur alte Checkpoints ohne Code
 werden anhand ihres Freitexts eingeordnet. Jeder neue WAIT erhält einen
 eindeutigen `wait_token`. Für `external_information` kann der Aufrufer mit
 `Orchestrator.resolve_external_wait(task_id, wait_token, actor, information_ref)`
@@ -476,6 +476,43 @@ Referenz idempotent und lehnt alte Token sowie andere Wartegründe ab.
 steht die Referenz in `ExecutionContext.external_information_ref` für Planner
 und Executor bereit. Die Anwendung, die den Wert setzt, muss sicherstellen,
 dass die referenzierte Information für diese Stages tatsächlich zugänglich ist.
+
+Generische HITL-Interaktionen werden getrennt von `task_step_approvals`
+gespeichert. `information_request`, `human_decision` und `plan_review`
+enthalten einen typisierten Antwortvertrag und sind an Task und aktuellen
+`wait_token` gebunden. `Orchestrator.list_human_interactions(task_id)` listet
+offene Anfragen; `answer_human_interaction(task_id, interaction_id, actor,
+response)` validiert und speichert eine Antwort atomar mit Audit-Event. Die
+Antwort erscheint nach einem Neustart im neu aufgebauten
+`ExecutionContext.human_responses`. Der aufrufende API-Adapter ist
+verantwortlich, die Actor-Identität zu authentisieren.
+
+Bei Projekt-Tasks legt dieselbe Antwort-Transaktion für `human_decision` und
+`plan_review` einen Eintrag in `vault_decision_outbox` an. Für
+`information_request` geschieht dies nur mit `request_data.reusable: true`.
+Der Vault-Writer publiziert die Notiz unter
+`decisions/projects/<project_key>/<interaction_id>.md` und wiederholt
+fehlgeschlagene Publikationen beim nächsten Application-Start oder über
+`publish_vault_decisions()`. Potenziell geheime Inhalte werden nicht
+publiziert und benötigen manuelle Prüfung. Aktive Entscheidungen desselben
+Projekts stehen im Planner-Context und als Vorschläge mit Quellenverweis in
+`list_human_interactions()` bereit. Vorschläge sind niemals eine automatische
+Freigabe des aktuellen WAIT oder eines Tools.
+
+`execution.hitl.mode` konfiguriert optionale Interaktionspunkte:
+
+```yaml
+execution:
+  hitl:
+    mode: minimal # minimal | selective | interactive
+```
+
+`minimal` ist der rückwärtskompatible Default. `selective` fordert ein
+Planreview bei vorhandenen Planrisiken an. `interactive` fordert ein Planreview
+vor jeder ersten Planausführung an und benötigt transaktionale Checkpoint-
+Persistenz. Keine Stufe kann verpflichtende Tool-Approvals oder statische
+Sicherheitsverbote abschalten. Eine Planfreigabe ist an Planversion und
+Fingerprint gebunden; `changes_requested` führt in einen Replan.
 
 ### `validate`
 

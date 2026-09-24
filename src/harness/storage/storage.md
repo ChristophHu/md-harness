@@ -43,6 +43,8 @@ Das Schema umfasst:
 - `task_events`
 - `task_artifacts`
 - `task_checkpoints`
+- `task_step_approvals`: eng an Tool, Argumente, Plan und Permission-Scope gebundene Sicherheitsfreigaben
+- `task_human_interactions`: strukturierte Informationsfragen, menschliche Entscheidungen und Planreviews, jeweils an einen Warte-Token gebunden
 
 Projekte können über `projects.parent_id` hierarchisch verschachtelt werden. Aufgaben können über `tasks.parent_id` in Epics, Features, Tasks und atomare Subtasks zerlegt werden. `approval_status` ist bewusst vom operativen `status` getrennt: Ein Task darf nur nach expliziter Freigabe ausführbar werden.
 
@@ -86,6 +88,12 @@ Resume-Schrittfortschritt und Plan-Fingerprints. Der Orchestrator verwaltet
 außerdem `task_attempts`: Jeder Workflow-Zyklus wird begonnen, bei
 Retry/Replan als fehlgeschlagen abgeschlossen und bei Erfolg, Waiting oder
 endgültigem Fehler abgeschlossen.
+
+Schema-Version 15 ergänzt `task_human_interactions` für strukturierte
+Informationsfragen, menschliche Entscheidungen und Planreviews. Jede Interaktion
+ist an genau einen WAIT-Token gebunden; Antwort, Actor und Audit-Event werden
+atomar geschrieben. `task_step_approvals` bleibt separat die Autorisierungsquelle
+für konkrete Tool-Aufrufe.
 
 ## Transaktionen und Sicherheit
 

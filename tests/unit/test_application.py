@@ -16,6 +16,8 @@ execution:
   max_retries: 4
   max_cycles: 7
   persistence_mode: required
+  hitl:
+    mode: interactive
 """,
         encoding="utf-8",
     )
@@ -25,6 +27,8 @@ execution:
         assert orchestrator.max_retries == 4
         assert orchestrator.max_cycles == 7
         assert orchestrator.persistence_mode is PersistenceMode.REQUIRED
+        assert orchestrator.hitl_mode.value == "interactive"
+        assert orchestrator.context_builder.hitl_mode == "interactive"
         assert orchestrator.context_builder.dry_run is False
         assert orchestrator.secret_provider.providers[0].service_prefix == "dev-harness"
         assert orchestrator.secret_provider.providers[0]._service("github_token") == (
@@ -73,3 +77,17 @@ def test_build_orchestrator_rejects_disabled_persistence(tmp_path):
         assert "disabled persistence" in str(error)
     else:
         raise AssertionError("disabled persistence must be rejected")
+
+
+def test_build_orchestrator_uses_vault_path_from_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("OBSIDIAN_VAULT_PATH", raising=False)
+    config = tmp_path / "config.yaml"
+    config.write_text("project:\n  workspace_dir: .\n", encoding="utf-8")
+    vault = tmp_path / "project-vault"
+    (tmp_path / ".env").write_text(f"OBSIDIAN_VAULT_PATH={vault}\n", encoding="utf-8")
+    orchestrator, connection = build_orchestrator(config)
+    try:
+        assert orchestrator.decision_vault.root == vault
+        assert orchestrator.context_builder.knowledge_loader is not None
+    finally:
+        connection.close()
