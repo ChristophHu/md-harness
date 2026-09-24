@@ -56,10 +56,21 @@ class ToolSecurityPolicy:
                 f"destructive permission denied for tool '{tool.tool_name}'",
                 ExecutionErrorType.UNAUTHORIZED_TOOL,
             )
-        if self.require_approval and context.approval_status != "approved":
+        needs_grant = bool(plan_step.metadata.get("requires_approval"))
+        approved = not self.require_approval or context.approval_status == "approved"
+        scoped = (
+            context.approval_checker(plan_step, tool)
+            if context.approval_checker is not None
+            else not needs_grant
+        )
+        if not approved or not scoped:
             raise ToolError(
                 "tool execution requires task approval",
                 ExecutionErrorType.EXTERNAL_BLOCKER,
+                details={
+                    "approval_required": True,
+                    "permission_scope": permission.value,
+                },
             )
         if (
             context.dry_run

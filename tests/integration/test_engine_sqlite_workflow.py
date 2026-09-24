@@ -523,6 +523,8 @@ def test_external_wait_resolution_survives_restart_and_reaches_executor(tmp_path
     assert not orchestrator.resolve_external_wait(
         task_id, token, "tester", "answer.txt"
     )
+    with pytest.raises(ValueError, match="another reference"):
+        orchestrator.resolve_external_wait(task_id, token, "tester", "other.txt")
     assert _event_types(connection, task_id).count("task.external_wait.resolved") == 1
     connection.close()
 
@@ -606,13 +608,10 @@ def test_external_wait_rejects_wrong_reason_and_stale_token(tmp_path):
     orchestrator.task_store.approve(task_id, "tester")
     assert orchestrator.resume(task_id).status is ResultStatus.WAITING
     second = orchestrator.checkpoint_store.get_active(task_id)["wait_token"]
-    assert second != first
-    with pytest.raises(ValueError, match="stale wait token"):
+    assert second == first
+    with pytest.raises(ValueError, match="not waiting for external"):
         orchestrator.resolve_external_wait(task_id, first, "tester", "a.txt")
-    assert orchestrator.resolve_external_wait(task_id, second, "tester", "a.txt")
-    with pytest.raises(ValueError, match="another reference"):
-        orchestrator.resolve_external_wait(task_id, second, "tester", "b.txt")
-    assert _event_types(connection, task_id).count("task.external_wait.resolved") == 1
+    assert _event_types(connection, task_id).count("task.external_wait.resolved") == 0
 
 
 def test_external_wait_resolution_racing_resume(tmp_path):
@@ -1117,12 +1116,12 @@ def test_sqlite_workflow_persists_wait_checkpoint_and_resume(tmp_path):
 
     resumed = orchestrator.resume(task_id)
 
-    assert resumed.status is ResultStatus.SUCCESS
+    assert resumed.status is ResultStatus.WAITING
     assert (
         connection.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()[0]
-        == "done"
+        == "waiting"
     )
     assert (
         connection.execute(
@@ -1131,16 +1130,16 @@ def test_sqlite_workflow_persists_wait_checkpoint_and_resume(tmp_path):
         is not None
     )
     assert _event_types(connection, task_id).count("task.waiting") == 1
-    assert CheckpointStore(connection).get_active(task_id) is None
-    checkpoint = CheckpointStore(connection).get(task_id)
-    assert checkpoint["invalidated_at"] is not None
+    checkpoint = CheckpointStore(connection).get_active(task_id)
+    assert checkpoint is not None
+    assert checkpoint["invalidated_at"] is None
     assert checkpoint["reason"] == "approval required"
     events_before = _event_types(connection, task_id)
     attempts_before = connection.execute(
         "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
     ).fetchone()[0]
-    assert orchestrator.resume(task_id).data["already_completed"] is True
-    assert _event_types(connection, task_id) == events_before
+    assert orchestrator.resume(task_id).status is ResultStatus.WAITING
+    assert _event_types(connection, task_id) == events_before + ["task.resumed"]
     assert (
         connection.execute(
             "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
@@ -1367,21 +1366,21 @@ def test_sqlite_resume_recovers_after_process_crash_and_restart(tmp_path):
         timeout=15,
         check=False,
     )
-    assert recovery.returncode == 0, recovery.stderr
+    assert recovery.returncode == 1, recovery.stderr
+    assert "approval required" in recovery.stderr
 
     connection = connect(database)
     assert (
         connection.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()[0]
-        == "done"
+        == "waiting"
     )
     assert (
         connection.execute(
-            "SELECT status FROM task_attempts WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-            (task_id,),
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?", (task_id,)
         ).fetchone()[0]
-        == "completed"
+        == 0
     )
     assert (
         connection.execute(
@@ -1391,6 +1390,6 @@ def test_sqlite_resume_recovers_after_process_crash_and_restart(tmp_path):
         is None
     )
     assert _event_types(connection, task_id).count("task.resumed") == 2
-    assert _event_types(connection, task_id).count("task.done") == 1
+    assert _event_types(connection, task_id).count("task.done") == 0
     connection.close()
-    assert marker.read_text(encoding="utf-8").splitlines() == ["executed"]
+    assert not marker.exists()

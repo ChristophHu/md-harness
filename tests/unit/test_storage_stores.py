@@ -30,7 +30,7 @@ def db(tmp_path):
 def test_database_transaction_health_version_and_backup(tmp_path):
     path = db(tmp_path)
     assert healthcheck(path) is True
-    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 13
+    assert schema_version(path) == CURRENT_SCHEMA_VERSION == 14
     with transaction(path) as connection:
         connection.execute("INSERT INTO projects (name, path) VALUES ('p', '/p')")
     with transaction(path) as connection:

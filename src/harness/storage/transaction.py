@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 from typing import Any
 
+from harness.storage.approval_store import ApprovalStore
+
 
 class TransactionError(RuntimeError):
     """Raised when stores cannot participate in one transaction."""
@@ -43,6 +45,24 @@ class ValidationWrite:
     event_type: str | None = None
     event_payload: Any = None
     replan: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseDecision:
+    """All persistence effects of one planner or executor decision."""
+
+    task_id: int
+    attempt_id: int | None
+    expected_status: str
+    events: tuple[tuple[str, Any], ...]
+    checkpoint: dict[str, Any] | None = None
+    attempt_status: str | None = None
+    attempt_error: str | None = None
+    task_status: str | None = None
+    artifacts: tuple[str, ...] = ()
+    replan: tuple[str, int, int] | None = None
+    approval_request: dict[str, Any] | None = None
+    invalidate_checkpoint: bool = False
 
 
 class TransactionManager:
@@ -210,6 +230,7 @@ class EngineUnitOfWork:
         self.event_store = event_store
         self.artifact_store = artifact_store
         self.checkpoint_store = checkpoint_store
+        self.approval_store = ApprovalStore(manager.connection)
         manager._validate_connections(
             (task_store, event_store, artifact_store, checkpoint_store)
         )
@@ -413,10 +434,19 @@ class EngineUnitOfWork:
         checkpoint: dict[str, Any],
         execution: Any,
         next_action: str,
+        approval_request: dict[str, Any] | None = None,
     ) -> None:
         """Persist an execution wait checkpoint and waiting decision atomically."""
         with self.phase():
             self.checkpoint_store.save(task_id, **checkpoint)
+            if approval_request is not None:
+                current = self.checkpoint_store.get_active(task_id)
+                self.approval_store.create(
+                    task_id, current["wait_token"], approval_request
+                )
+                self.event_store.record(
+                    task_id, "task.approval.requested", approval_request
+                )
             self.event_store.record(
                 task_id,
                 "task.execution.next_action",
@@ -429,6 +459,76 @@ class EngineUnitOfWork:
             self.event_store.record(
                 task_id, "task.waiting", {"reason": checkpoint["reason"]}
             )
+
+    def commit_decision(self, decision: PhaseDecision) -> None:
+        """Persist an entire planner/executor decision or nothing at all."""
+        if decision.checkpoint is not None and self.checkpoint_store is None:
+            raise TransactionError("decision requires checkpoint store")
+        with self.phase() as connection:
+            task = self.task_store.get(decision.task_id)
+            if task is None or task["status"] != decision.expected_status:
+                raise TransactionError("decision task state changed")
+            if decision.attempt_id is not None:
+                attempt = connection.execute(
+                    "SELECT task_id, status FROM task_attempts WHERE id = ?",
+                    (decision.attempt_id,),
+                ).fetchone()
+                if (
+                    attempt is None
+                    or attempt["task_id"] != decision.task_id
+                    or attempt["status"] != "running"
+                ):
+                    raise TransactionError("decision attempt is not active")
+            if decision.checkpoint is not None:
+                self.checkpoint_store.save(decision.task_id, **decision.checkpoint)
+                if decision.approval_request is not None:
+                    checkpoint = self.checkpoint_store.get_active(decision.task_id)
+                    self.approval_store.create(
+                        decision.task_id,
+                        checkpoint["wait_token"],
+                        decision.approval_request,
+                    )
+            for path in decision.artifacts:
+                self.artifact_store.register(
+                    decision.task_id, path, "execution-artifact"
+                )
+            if decision.attempt_status is not None and decision.attempt_id is not None:
+                self.task_store.complete_attempt(
+                    decision.attempt_id,
+                    decision.attempt_status,
+                    decision.attempt_error,
+                )
+            if decision.replan is not None:
+                reason, parent_version, version = decision.replan
+                self.task_store.record_replan(
+                    decision.task_id,
+                    reason,
+                    version,
+                    parent_plan_version=parent_version,
+                    attempt_id=decision.attempt_id,
+                )
+            if decision.task_status is not None:
+                self.task_store.transition(decision.task_id, decision.task_status)
+            for event_type, payload in decision.events:
+                self.event_store.record(decision.task_id, event_type, payload)
+            if decision.invalidate_checkpoint and self.checkpoint_store is not None:
+                self.checkpoint_store.invalidate(decision.task_id)
+
+    def decide_approval(
+        self, task_id: int, wait_token: str, actor: str, scope: str, status: str
+    ) -> bool:
+        """Apply a scoped human decision and its audit event atomically."""
+        with self.manager.atomic(fenced=False):
+            changed = self.approval_store.decide(
+                task_id, wait_token, actor, scope, status
+            )
+            if changed:
+                self.event_store.record(
+                    task_id,
+                    f"task.approval.{status}",
+                    {"wait_token": wait_token, "actor": actor, "scope": scope},
+                )
+            return changed
 
     @contextmanager
     def phase(self) -> Iterator[sqlite3.Connection]:

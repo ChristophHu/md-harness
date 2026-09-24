@@ -143,6 +143,8 @@ class ExecutionContext:
     resume_checkpoint: dict[str, Any] | None = None
     external_information_ref: str | None = None
     ownership_guard: Callable[[], None] | None = None
+    approval_checker: Callable[[Any, Any], bool] | None = None
+    active_plan: Any | None = None
 
     def add_knowledge_document(self, document: str) -> None:
         """Add a knowledge document once while preserving insertion order."""

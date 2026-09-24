@@ -24,10 +24,12 @@ from harness.engine.result import (
     StepExecution,
     WaitReason,
 )
+from harness.security.approval import request_for_step
 from harness.storage.factory import StoreBundle
 from harness.storage.transaction import (
     EngineUnitOfWork,
     ExecutionOwner,
+    PhaseDecision,
     TransactionError,
     TransactionManager,
     ValidationWrite,
@@ -184,7 +186,37 @@ class Orchestrator:
             context, ExecutionContext
         ):
             context.ownership_guard = self._check_ownership
+            context.approval_checker = lambda step, tool: self._approval_allowed(
+                context, step, tool
+            )
         return context
+
+    def _approval_allowed(
+        self, context: ExecutionContext, step: Any, tool: Any
+    ) -> bool:
+        if self.unit_of_work is None or self.checkpoint_store is None:
+            return not bool(step.metadata.get("requires_approval"))
+        with self.unit_of_work.phase():
+            task = self.task_store.get(context.task_id)
+            if task is None or task["approval_status"] != "approved":
+                return False
+            checkpoint = self.checkpoint_store.get_active(context.task_id)
+            if checkpoint is None or checkpoint["waiting_reason_code"] != "approval":
+                return not bool(step.metadata.get("requires_approval"))
+            token = checkpoint["wait_token"]
+            request = self.unit_of_work.approval_store.get(token) if token else None
+            if request is None:
+                return False
+            if request["step_id"] != step.id:
+                return not bool(step.metadata.get("requires_approval"))
+            if context.active_plan is None:
+                return False
+            expected = request_for_step(
+                context.active_plan, step, tool.definition.permission.value
+            )
+            return self.unit_of_work.approval_store.ready(
+                context.task_id, token, expected
+            )
 
     def _check_ownership(self) -> None:
         if (
@@ -318,12 +350,71 @@ class Orchestrator:
                         task_id, attempt_id, "planning", error
                     )
                 if not planning.successful:
-                    self._finish_attempt(attempt_id, "failed", planning.message)
-                    self._fail_task(task_id, planning.message, "task.planning.failed")
+                    if self.unit_of_work is not None and hasattr(
+                        self.unit_of_work, "commit_decision"
+                    ):
+                        self.unit_of_work.commit_decision(
+                            PhaseDecision(
+                                task_id,
+                                attempt_id,
+                                "planning",
+                                (
+                                    (
+                                        "task.planning.failed",
+                                        {"error": planning.message},
+                                    ),
+                                    ("task.failed", {"error": planning.message}),
+                                ),
+                                attempt_status="failed",
+                                attempt_error=planning.message,
+                                task_status="failed",
+                                invalidate_checkpoint=True,
+                            )
+                        )
+                    else:
+                        self._finish_attempt(attempt_id, "failed", planning.message)
+                        self._fail_task(
+                            task_id, planning.message, "task.planning.failed"
+                        )
                     return planning
                 plan = planning.data["plan"]
-                self._event(task_id, "task.plan.created", self._serialize(plan))
-                if _resume_plan is None:
+                if self.unit_of_work is not None and hasattr(
+                    self.unit_of_work, "commit_decision"
+                ):
+                    checkpoint = None
+                    if _resume_plan is None and self.checkpoint_store is not None:
+                        checkpoint = {
+                            "phase": "executing",
+                            "next_action": NextAction.VALIDATE.value,
+                            "attempt_id": attempt_id,
+                            "reason": "plan persisted for resumability",
+                            "context_data": {
+                                "plan": self._serialize(plan),
+                                "validation_progress": {
+                                    "retries": retries,
+                                    "replans": replans,
+                                    "cycles": cycle,
+                                },
+                            },
+                            "plan_version": getattr(plan, "version", None),
+                            "next_step_id": (
+                                plan.steps[0].id
+                                if hasattr(plan, "steps") and plan.steps
+                                else None
+                            ),
+                        }
+                    self.unit_of_work.commit_decision(
+                        PhaseDecision(
+                            task_id,
+                            attempt_id,
+                            "planning",
+                            (("task.plan.created", self._serialize(plan)),),
+                            checkpoint=checkpoint,
+                        )
+                    )
+                else:
+                    self._event(task_id, "task.plan.created", self._serialize(plan))
+                if self.unit_of_work is None and _resume_plan is None:
                     self._save_checkpoint(
                         task_id,
                         "executing",
@@ -382,6 +473,19 @@ class Orchestrator:
             except Exception as error:  # noqa: BLE001 - stage boundary
                 return self._handle_stage_exception(
                     task_id, attempt_id, "execution", error
+                )
+            if self.unit_of_work is not None and hasattr(
+                self.unit_of_work, "commit_decision"
+            ):
+                return self._finish_persistent_execution(
+                    task_id,
+                    attempt_id,
+                    plan,
+                    context,
+                    execution_result,
+                    retries=retries,
+                    replans=replans,
+                    cycle=cycle,
                 )
             self._persist_execution(task_id, execution_result)
             execution = execution_result.data.get("execution")
@@ -588,6 +692,301 @@ class Orchestrator:
         result = EngineResult.failure("Maximum orchestration cycles exceeded.")
         self._fail_task(task_id, result.message, "task.failed")
         return result
+
+    def _execution_checkpoint(
+        self,
+        task_id: int,
+        attempt_id: int | None,
+        plan: Any,
+        result: EngineResult,
+        action: NextAction,
+        *,
+        retries: int,
+        replans: int,
+        cycle: int,
+    ) -> dict[str, Any]:
+        execution = result.data.get("execution")
+        completed = {
+            step.step_id
+            for step in getattr(execution, "steps", [])
+            if step.status in {ExecutionStatus.SUCCESS, ExecutionStatus.SKIPPED}
+        }
+        steps = getattr(plan, "steps", [])
+        next_step = next((step.id for step in steps if step.id not in completed), None)
+        waiting = action is NextAction.WAIT
+        return {
+            "phase": "waiting"
+            if waiting
+            else "validating"
+            if action is NextAction.VALIDATE
+            else "executing",
+            "next_action": action.value,
+            "attempt_id": attempt_id,
+            "reason": result.message,
+            "context_data": {
+                "plan": self._serialize(plan),
+                "execution": self._serialize(execution),
+                "validation_progress": {
+                    "retries": retries,
+                    "replans": replans,
+                    "cycles": cycle
+                    if waiting
+                    else cycle + 1
+                    if action in {NextAction.RETRY_EXECUTION, NextAction.REPLAN}
+                    else cycle,
+                },
+            },
+            "plan_version": getattr(plan, "version", None),
+            "next_step_id": next_step
+            if action in {NextAction.WAIT, NextAction.RETRY_EXECUTION}
+            else None,
+            "completed_step_ids": sorted(completed)
+            if action in {NextAction.WAIT, NextAction.RETRY_EXECUTION}
+            else [],
+            "execution_result": self._serialize(result),
+            "waiting_reason_code": self._require_wait_reason(result).value
+            if waiting
+            else None,
+        }
+
+    def _finish_persistent_execution(
+        self,
+        task_id: int,
+        attempt_id: int,
+        plan: Any,
+        context: ExecutionContext,
+        result: EngineResult,
+        *,
+        retries: int,
+        replans: int,
+        cycle: int,
+    ) -> EngineResult:
+        """Classify an executor result before committing all its effects."""
+        execution = result.data.get("execution")
+        error: Exception | None = None
+        try:
+            action = self._action(
+                getattr(execution, "next_action", None)
+                or result.data.get("next_action")
+            )
+            if result.status is ResultStatus.WAITING and action is not NextAction.WAIT:
+                raise ValueError("WAITING execution requires next_action=WAIT")
+            if action is NextAction.WAIT:
+                self._require_wait_reason(result)
+        except (InvalidNextActionError, ValueError) as caught:
+            error = caught
+            action = None
+        if error is not None:
+            message = str(error)
+            error_events = (
+                ("task.execution.completed", self._serialize(result)),
+                ("task.execution.invalid_next_action", {"error": message}),
+                ("task.failed", {"error": message}),
+            )
+            self.unit_of_work.commit_decision(
+                PhaseDecision(
+                    task_id,
+                    attempt_id,
+                    "executing",
+                    error_events,
+                    attempt_status="failed",
+                    attempt_error=message,
+                    task_status="failed",
+                    invalidate_checkpoint=True,
+                )
+            )
+            return EngineResult.failure(message)
+        action = action or (
+            NextAction.REPLAN if not result.successful else NextAction.VALIDATE
+        )
+        events: list[tuple[str, Any]] = [
+            ("task.execution.completed", self._serialize(result)),
+        ]
+        if not result.successful:
+            events.append(
+                (
+                    "task.execution.failed",
+                    {
+                        "error": result.message,
+                        "errors": result.errors,
+                    },
+                )
+            )
+        events.append(("task.execution.next_action", {"next_action": action.value}))
+        artifacts = set(getattr(execution, "artifacts", []))
+        for step in getattr(execution, "steps", []):
+            artifacts.update(step.artifacts)
+        checkpoint = None
+        attempt_status = None
+        task_status = None
+        attempt_error = None
+        replan = None
+        approval_request = None
+        invalidate = False
+        response = result
+        if action is NextAction.WAIT:
+            checkpoint = self._execution_checkpoint(
+                task_id,
+                attempt_id,
+                plan,
+                result,
+                action,
+                retries=retries,
+                replans=replans,
+                cycle=cycle,
+            )
+            if self.checkpoint_store is None:
+                checkpoint = None
+            approval_request = (
+                self._approval_request(plan, execution)
+                if result.wait_reason == WaitReason.APPROVAL and checkpoint is not None
+                else None
+            )
+            if approval_request is not None and checkpoint is not None:
+                checkpoint["plan_fingerprint"] = approval_request["plan_fingerprint"]
+                events.append(("task.approval.requested", approval_request))
+            attempt_status, task_status = "waiting", "waiting"
+            attempt_error = result.message
+            events.append(("task.waiting", {"reason": result.message}))
+            response = EngineResult(
+                ResultStatus.WAITING,
+                result.message,
+                result.errors,
+                data=result.data,
+                wait_reason=result.wait_reason,
+            )
+        elif result.successful and action is NextAction.STOP:
+            attempt_status, task_status, invalidate = "completed", "done", True
+            events.append(("task.done", None))
+        elif action in {NextAction.RETRY_EXECUTION, NextAction.REPLAN}:
+            retries += int(action is NextAction.RETRY_EXECUTION)
+            replans += int(action is NextAction.REPLAN)
+            limit_message = (
+                "Maximum execution retries exceeded."
+                if retries > self.max_retries
+                else "Maximum replans exceeded."
+                if replans > self.max_replans
+                else "Maximum orchestration cycles exceeded."
+                if cycle + 1 >= self.max_cycles
+                else None
+            )
+            attempt_status, attempt_error = "failed", result.message
+            if limit_message is not None:
+                task_status, invalidate = "failed", True
+                events.append(("task.failed", {"error": limit_message}))
+                response = EngineResult.failure(limit_message)
+            else:
+                checkpoint = self._execution_checkpoint(
+                    task_id,
+                    attempt_id,
+                    plan,
+                    result,
+                    action,
+                    retries=retries,
+                    replans=replans,
+                    cycle=cycle,
+                )
+                if self.checkpoint_store is None:
+                    checkpoint = None
+                if action is NextAction.REPLAN:
+                    version = getattr(plan, "version", 1)
+                    replan = ("execution_requested_replan", version, version + 1)
+                    events.append(
+                        ("task.replanning", {"reason": "execution requested replan"})
+                    )
+                else:
+                    events.append(
+                        (
+                            "task.retrying",
+                            {
+                                "retry_number": retries,
+                                "max_retries": self.max_retries,
+                            },
+                        )
+                    )
+        elif not result.successful:
+            attempt_status, task_status, invalidate = "failed", "failed", True
+            attempt_error = result.message
+            events.append(("task.failed", {"error": result.message}))
+        else:
+            action = NextAction.VALIDATE
+            checkpoint = self._execution_checkpoint(
+                task_id,
+                attempt_id,
+                plan,
+                result,
+                action,
+                retries=retries,
+                replans=replans,
+                cycle=cycle,
+            )
+            if self.checkpoint_store is None:
+                checkpoint = None
+            task_status = "validating"
+            events.append(("task.validating", None))
+        self.unit_of_work.commit_decision(
+            PhaseDecision(
+                task_id,
+                attempt_id,
+                "executing",
+                tuple(events),
+                checkpoint=checkpoint,
+                attempt_status=attempt_status,
+                attempt_error=attempt_error,
+                task_status=task_status,
+                artifacts=tuple(sorted(artifacts)),
+                replan=replan,
+                approval_request=approval_request,
+                invalidate_checkpoint=invalidate,
+            )
+        )
+        if task_status is None and action in {
+            NextAction.RETRY_EXECUTION,
+            NextAction.REPLAN,
+        }:
+            return self.run(
+                task_id,
+                _resume_plan=plan if action is NextAction.RETRY_EXECUTION else None,
+                _resume_action=action,
+                _resume_claimed=True,
+                _resume_retries=retries,
+                _resume_replans=replans,
+                _resume_cycles=cycle + 1,
+            )
+        if task_status != "validating":
+            return response
+        try:
+            self._check_ownership()
+            with self.transaction_manager.keep_lease_alive():
+                validation = self.validator.validate(context, plan, execution)
+            self._check_ownership()
+        except TransactionError:
+            raise
+        except Exception as caught:  # noqa: BLE001 - validator boundary
+            return self._handle_stage_exception(
+                task_id, attempt_id, "validation", caught
+            )
+        decision = self._finish_validation(
+            task_id,
+            attempt_id,
+            plan,
+            execution,
+            validation,
+            retries=retries,
+            replans=replans,
+            cycle=cycle,
+        )
+        if decision.outcome in {"retry", "replan"}:
+            return self.run(
+                task_id,
+                _resume_plan=plan if decision.outcome == "retry" else None,
+                _resume_action=decision.action,
+                _resume_claimed=True,
+                _resume_retries=decision.retries,
+                _resume_replans=decision.replans,
+                _resume_cycles=cycle + 1,
+            )
+        return decision.result
 
     def _validation_decision(
         self,
@@ -804,7 +1203,9 @@ class Orchestrator:
                     self.task_store.complete_attempt(attempt_id, status, error)
 
     def _complete_done(self, task_id: int, attempt_id: int | None) -> None:
-        if self.unit_of_work is not None:
+        if self.unit_of_work is not None and hasattr(
+            self.unit_of_work, "complete_done"
+        ):
             self.unit_of_work.complete_done(task_id, attempt_id)
             return
         self._finish_attempt(attempt_id, "completed")
@@ -816,6 +1217,24 @@ class Orchestrator:
             self.checkpoint_store.invalidate(task_id)
 
     def _fail_task(self, task_id: int, message: str, event_type: str) -> None:
+        if self.unit_of_work is not None and hasattr(
+            self.unit_of_work, "commit_decision"
+        ):
+            task = self.task_store.get(task_id)
+            events = [(event_type, {"error": message})]
+            if event_type != "task.failed":
+                events.append(("task.failed", {"error": message, "source": event_type}))
+            self.unit_of_work.commit_decision(
+                PhaseDecision(
+                    task_id,
+                    None,
+                    task["status"],
+                    tuple(events),
+                    task_status="failed",
+                    invalidate_checkpoint=True,
+                )
+            )
+            return
         if self.transaction_manager is None:
             self._transition(task_id, "failed")
             self._event(task_id, event_type, {"error": message})
@@ -876,6 +1295,34 @@ class Orchestrator:
         )
         message = f"Unexpected error during {phase}: {record.message}"
         event_type = f"task.{phase}.exception"
+        if self.unit_of_work is not None and hasattr(
+            self.unit_of_work, "commit_decision"
+        ):
+            self.unit_of_work.commit_decision(
+                PhaseDecision(
+                    task_id,
+                    attempt_id,
+                    "planning"
+                    if phase == "planning"
+                    else "executing"
+                    if phase == "execution"
+                    else "validating",
+                    (
+                        (event_type, self._serialize(record)),
+                        ("task.failed", {"error": message, "source": event_type}),
+                    ),
+                    attempt_status="failed",
+                    attempt_error=message,
+                    task_status="failed",
+                    invalidate_checkpoint=True,
+                )
+            )
+            return EngineResult(
+                status=ResultStatus.FAILED,
+                message=message,
+                errors=[record.error_class],
+                data={"failure": record, "recovery_action": recovery.value},
+            )
         self._finish_attempt(attempt_id, "failed", message)
         self._event(task_id, event_type, self._serialize(record))
         self._fail_task(task_id, message, event_type)
@@ -959,10 +1406,33 @@ class Orchestrator:
             "execution_result": self._serialize(result),
             "waiting_reason_code": self._require_wait_reason(result).value,
         }
+        approval_request = (
+            self._approval_request(plan, execution)
+            if result.wait_reason == WaitReason.APPROVAL
+            else None
+        )
+        if approval_request is not None:
+            checkpoint["plan_fingerprint"] = approval_request["plan_fingerprint"]
         if self.unit_of_work is not None and attempt_id is not None:
-            self.unit_of_work.execution_wait(
-                task_id, attempt_id, checkpoint, execution, NextAction.WAIT.value
-            )
+            try:
+                self.unit_of_work.execution_wait(
+                    task_id,
+                    attempt_id,
+                    checkpoint,
+                    execution,
+                    NextAction.WAIT.value,
+                    approval_request=approval_request,
+                )
+            except TypeError as error:
+                if "approval_request" not in str(error):
+                    raise
+                self.unit_of_work.execution_wait(
+                    task_id,
+                    attempt_id,
+                    checkpoint,
+                    execution,
+                    NextAction.WAIT.value,
+                )
             return
         if self.checkpoint_store is not None:
             self.checkpoint_store.save(task_id, **checkpoint)
@@ -970,6 +1440,23 @@ class Orchestrator:
         self._finish_attempt(attempt_id, "waiting", result.message)
         self._transition(task_id, "waiting")
         self._event(task_id, "task.waiting", {"reason": result.message})
+
+    @staticmethod
+    def _approval_request(plan: Any, execution: Any) -> dict[str, Any] | None:
+        for error in getattr(execution, "error_details", []):
+            if not getattr(error, "details", {}).get("approval_required"):
+                continue
+            step = next(
+                (
+                    item
+                    for item in getattr(plan, "steps", [])
+                    if item.id == error.step_id
+                ),
+                None,
+            )
+            if step is not None and step.tool == error.tool:
+                return request_for_step(plan, step, error.details["permission_scope"])
+        return None
 
     def _save_checkpoint(
         self,
@@ -1034,6 +1521,33 @@ class Orchestrator:
             )
         return self.unit_of_work.resolve_external_wait(
             task_id, wait_token, actor, information_ref
+        )
+
+    def approve_wait(
+        self, task_id: int, wait_token: str, actor: str, scope: str
+    ) -> bool:
+        if self.unit_of_work is None:
+            raise ConfigError("scoped approval requires transactional SQLite stores")
+        return self.unit_of_work.decide_approval(
+            task_id, wait_token, actor, scope, "approved"
+        )
+
+    def reject_wait(
+        self, task_id: int, wait_token: str, actor: str, scope: str
+    ) -> bool:
+        if self.unit_of_work is None:
+            raise ConfigError("scoped approval requires transactional SQLite stores")
+        return self.unit_of_work.decide_approval(
+            task_id, wait_token, actor, scope, "rejected"
+        )
+
+    def revoke_wait(
+        self, task_id: int, wait_token: str, actor: str, scope: str
+    ) -> bool:
+        if self.unit_of_work is None:
+            raise ConfigError("scoped approval requires transactional SQLite stores")
+        return self.unit_of_work.decide_approval(
+            task_id, wait_token, actor, scope, "revoked"
         )
 
     def _record_replan(
@@ -1244,8 +1758,7 @@ class Orchestrator:
         should_continue = (
             reason_code in {"temporary_error", "workspace_missing", "manual_replan"}
             or reason_code == "approval"
-            and task is not None
-            and task["approval_status"] == "approved"
+            and self._approval_checkpoint_ready(task_id, checkpoint, plan, payload)
             or reason_code == "external_information"
             and self._checkpoint_value(checkpoint, "external_resolved_at") is not None
         )
@@ -1268,6 +1781,28 @@ class Orchestrator:
         ):
             self._transition(task_id, "waiting")
         return EngineResult.waiting(reason, WaitReason(reason_code))
+
+    def _approval_checkpoint_ready(
+        self, task_id: int, checkpoint: Any, plan: Any, payload: Any
+    ) -> bool:
+        if self.unit_of_work is None:
+            return False
+        if plan is None and isinstance(payload, dict):
+            plan = self._deserialize_plan(payload.get("plan"))
+        token = self._checkpoint_value(checkpoint, "wait_token")
+        if not token or plan is None:
+            return False
+        request = self.unit_of_work.approval_store.get(token)
+        if request is None:
+            return False
+        step = next(
+            (item for item in plan.steps if item.id == request["step_id"]), None
+        )
+        if step is None:
+            return False
+        expected = request_for_step(plan, step, request["permission_scope"])
+        with self.unit_of_work.phase():
+            return self.unit_of_work.approval_store.ready(task_id, token, expected)
 
     @staticmethod
     def _checkpoint_value(checkpoint: Any, key: str) -> Any:

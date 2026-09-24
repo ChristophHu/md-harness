@@ -41,6 +41,7 @@ class Executor:
 
     def execute(self, context: ExecutionContext, plan: ExecutionPlan) -> EngineResult:
         """Execute every plan step and return structured results."""
+        context.active_plan = plan
         if not context.workspace:
             error = ExecutionError(
                 ExecutionErrorType.EXTERNAL_BLOCKER,
@@ -109,6 +110,7 @@ class Executor:
                     tool=step.tool,
                     step_id=step.id,
                     retryable=error.error_type is ExecutionErrorType.TOOL_FAILURE,
+                    details=error.details,
                 )
                 next_action = action_for_error(structured)
                 execution = ExecutionResult(

@@ -7,8 +7,20 @@ from types import SimpleNamespace
 import pytest
 
 from harness.config import ConfigError, PersistenceMode
+from harness.engine.context import ExecutionContext
 from harness.engine.orchestrator import Orchestrator
-from harness.engine.result import EngineResult, NextAction, ResultStatus
+from harness.engine.plan import ExecutionPlan, PlanStep
+from harness.engine.result import (
+    EngineResult,
+    ExecutionError,
+    ExecutionErrorType,
+    ExecutionResult,
+    ExecutionStatus,
+    NextAction,
+    ResultStatus,
+    StepExecution,
+    WaitReason,
+)
 from harness.storage.transaction import TransactionError, TransactionManager
 
 
@@ -20,6 +32,806 @@ class StubContextBuilder:
     def build(self, task_id):
         self.task_ids.append(task_id)
         return self.context
+
+
+class RecordingDecisionUnitOfWork:
+    def __init__(self):
+        self.decisions = []
+
+    def commit_decision(self, decision):
+        self.decisions.append(decision)
+
+
+def _persistent_execution(
+    result, *, checkpoint_store=True, max_retries=2, max_replans=2, max_cycles=3
+):
+    context = ExecutionContext(task_id=1, task_title="test")
+    engine = Orchestrator(
+        StubContextBuilder(context),
+        max_retries=max_retries,
+        max_replans=max_replans,
+        max_cycles=max_cycles,
+    )
+    engine.unit_of_work = RecordingDecisionUnitOfWork()
+    engine.checkpoint_store = object() if checkpoint_store else None
+    engine._check_ownership = lambda: None
+    engine.transaction_manager = SimpleNamespace(
+        keep_lease_alive=lambda: _NullContext()
+    )
+    engine.validator = SimpleNamespace(
+        validate=lambda *_: EngineResult.success("valid", next_action="stop")
+    )
+    engine._finish_validation = lambda *_args, **_kwargs: SimpleNamespace(
+        outcome="done", result=EngineResult.success("done")
+    )
+    plan = ExecutionPlan(
+        "goal",
+        steps=[PlanStep("s1", "first", "run"), PlanStep("s2", "second", "run")],
+        version=4,
+    )
+    return engine, context, plan
+
+
+class _NullContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def test_approval_checker_covers_all_scoped_guard_paths():
+    step = PlanStep("s", "write", "write", "fs", metadata={"requires_approval": True})
+    tool = SimpleNamespace(
+        definition=SimpleNamespace(permission=SimpleNamespace(value="write"))
+    )
+    context = ExecutionContext(task_id=1, task_title="test")
+    engine = Orchestrator(StubContextBuilder(context))
+    assert not engine._approval_allowed(context, step, tool)
+    step.metadata.clear()
+    assert engine._approval_allowed(context, step, tool)
+
+    class Phase:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Approvals:
+        def __init__(self, row=None, ready=False):
+            self.row, self.is_ready = row, ready
+
+        def get(self, _token):
+            return self.row
+
+        def ready(self, *_args):
+            return self.is_ready
+
+    class Uow:
+        def __init__(self, row=None, ready=False):
+            self.approval_store = Approvals(row, ready)
+
+        def phase(self):
+            return Phase()
+
+    engine.unit_of_work = Uow()
+    engine.checkpoint_store = SimpleNamespace(get_active=lambda _id: None)
+    engine.task_store = SimpleNamespace(get=lambda _id: {"approval_status": "pending"})
+    assert not engine._approval_allowed(context, step, tool)
+    engine.task_store = SimpleNamespace(get=lambda _id: {"approval_status": "approved"})
+    assert engine._approval_allowed(context, step, tool)
+    engine.checkpoint_store = SimpleNamespace(
+        get_active=lambda _id: {"waiting_reason_code": "approval", "wait_token": "t"}
+    )
+    assert not engine._approval_allowed(context, step, tool)
+    row = {"step_id": "other"}
+    engine.unit_of_work = Uow(row)
+    assert engine._approval_allowed(context, step, tool)
+    row = {"step_id": "s", "permission_scope": "write"}
+    engine.unit_of_work = Uow(row, True)
+    context.active_plan = ExecutionPlan("goal", steps=[step])
+    assert engine._approval_allowed(context, step, tool)
+    context.active_plan = None
+    assert not engine._approval_allowed(context, step, tool)
+
+
+def test_approval_resume_helpers_and_public_guards():
+    engine = Orchestrator(StubContextBuilder(object()))
+    with pytest.raises(ValueError, match="valid WaitReason"):
+        engine._coerce_wait_reason(None)
+    with pytest.raises(ValueError, match="valid WaitReason"):
+        engine._coerce_wait_reason("unknown")
+    assert engine._coerce_wait_reason("approval") is WaitReason.APPROVAL
+    assert not engine._approval_checkpoint_ready(1, {}, None, {})
+    for method, args in (
+        (engine.approve_wait, (1, "t", "a", "s")),
+        (engine.reject_wait, (1, "t", "a", "s")),
+        (engine.revoke_wait, (1, "t", "a", "s")),
+        (engine.resolve_external_wait, (1, "t", "a", "r")),
+    ):
+        with pytest.raises(ConfigError):
+            method(*args)
+
+    calls = []
+    engine.unit_of_work = SimpleNamespace(
+        decide_approval=lambda *args: calls.append(args) or True,
+        resolve_external_wait=lambda *args: calls.append(args) or True,
+    )
+    assert engine.approve_wait(1, "t", "a", "s")
+    assert engine.reject_wait(1, "t", "a", "s")
+    assert engine.revoke_wait(1, "t", "a", "s")
+    assert engine.resolve_external_wait(1, "t", "a", "r")
+    assert [call[-1] for call in calls[:3]] == ["approved", "rejected", "revoked"]
+
+
+def test_approval_checkpoint_ready_checks_saved_plan_and_request():
+    step = PlanStep("s", "write", "write", "fs", {"x": 1})
+    plan = ExecutionPlan("goal", steps=[step], version=2)
+    row = {"step_id": "s", "permission_scope": "write"}
+
+    class Phase:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Approvals:
+        def __init__(self, request, ready=True):
+            self.request, self.is_ready = request, ready
+
+        def get(self, _token):
+            return self.request
+
+        def ready(self, *_args):
+            return self.is_ready
+
+    engine = Orchestrator(StubContextBuilder(object()))
+    engine.unit_of_work = SimpleNamespace(
+        approval_store=Approvals(None), phase=lambda: Phase()
+    )
+    checkpoint = {"wait_token": "t"}
+    assert not engine._approval_checkpoint_ready(1, checkpoint, plan, {})
+    engine.unit_of_work.approval_store = Approvals(row)
+    assert engine._approval_checkpoint_ready(1, checkpoint, plan, {})
+    assert engine._approval_checkpoint_ready(
+        1, checkpoint, None, {"plan": engine._serialize(plan)}
+    )
+    assert not engine._approval_checkpoint_ready(1, {}, plan, {})
+    engine.unit_of_work.approval_store = Approvals(
+        {"step_id": "missing", "permission_scope": "write"}
+    )
+    assert not engine._approval_checkpoint_ready(1, checkpoint, plan, {})
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        EngineResult.success(
+            "bad",
+            execution=ExecutionResult(ExecutionStatus.SUCCESS, next_action="bogus"),
+        ),
+        EngineResult(
+            ResultStatus.WAITING,
+            "wait",
+            data={
+                "execution": ExecutionResult(
+                    ExecutionStatus.WAITING, next_action=NextAction.STOP
+                )
+            },
+            wait_reason=WaitReason.APPROVAL,
+        ),
+        EngineResult.success(
+            "missing reason",
+            execution=ExecutionResult(
+                ExecutionStatus.SUCCESS, next_action=NextAction.WAIT
+            ),
+        ),
+    ],
+)
+def test_persistent_execution_invalid_decisions_fail_atomically(result):
+    engine, context, plan = _persistent_execution(result)
+    failed = engine._finish_persistent_execution(
+        1, 10, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    decision = engine.unit_of_work.decisions[-1]
+    assert failed.status is ResultStatus.FAILED
+    assert decision.task_status == "failed"
+    assert decision.invalidate_checkpoint
+    assert "task.execution.invalid_next_action" in [
+        event for event, _ in decision.events
+    ]
+
+
+def test_persistent_execution_wait_records_approval_checkpoint_and_artifacts():
+    step = PlanStep("s1", "write", "write", "fs", {"path": "x"})
+    plan = ExecutionPlan("goal", steps=[step], version=4)
+    execution = ExecutionResult(
+        ExecutionStatus.WAITING,
+        steps=[StepExecution("s1", ExecutionStatus.SUCCESS, artifacts=["step.txt"])],
+        artifacts=["result.txt"],
+        next_action=NextAction.WAIT,
+        wait_reason=WaitReason.APPROVAL,
+        error_details=[
+            SimpleNamespace(
+                step_id="s1",
+                tool="fs",
+                details={"approval_required": True, "permission_scope": "write"},
+            )
+        ],
+    )
+    result = EngineResult(
+        ResultStatus.WAITING,
+        "approve",
+        data={"execution": execution},
+        wait_reason=WaitReason.APPROVAL,
+    )
+    engine, context, _ = _persistent_execution(result)
+    waiting = engine._finish_persistent_execution(
+        1, 10, plan, context, result, retries=1, replans=2, cycle=0
+    )
+    decision = engine.unit_of_work.decisions[-1]
+    assert waiting.status is ResultStatus.WAITING
+    assert decision.checkpoint["plan_fingerprint"]
+    assert decision.checkpoint["completed_step_ids"] == ["s1"]
+    assert decision.approval_request["step_id"] == "s1"
+    assert set(decision.artifacts) == {"step.txt", "result.txt"}
+
+
+@pytest.mark.parametrize(
+    ("action", "limit", "expected"),
+    [
+        (NextAction.STOP, {}, "done"),
+        (NextAction.RETRY_EXECUTION, {"max_retries": 0}, "failed"),
+        (NextAction.REPLAN, {"max_replans": 0}, "failed"),
+        (NextAction.REPLAN, {"max_cycles": 1}, "failed"),
+    ],
+)
+def test_persistent_execution_terminal_decisions(action, limit, expected):
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS
+        if action is NextAction.STOP
+        else ExecutionStatus.FAILED,
+        next_action=action,
+    )
+    result = (
+        EngineResult.success("complete", execution=execution)
+        if action is NextAction.STOP
+        else EngineResult(ResultStatus.FAILED, "retry", data={"execution": execution})
+    )
+    engine, context, plan = _persistent_execution(result, **limit)
+    response = engine._finish_persistent_execution(
+        1, 10, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    decision = engine.unit_of_work.decisions[0]
+    if action is NextAction.STOP:
+        assert decision.task_status == "done" and decision.invalidate_checkpoint
+    else:
+        assert decision.task_status == expected and decision.invalidate_checkpoint
+        assert response.status is ResultStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    ("action", "status", "reason"),
+    [
+        (NextAction.WAIT, ResultStatus.WAITING, WaitReason.EXTERNAL_INFORMATION),
+        (NextAction.RETRY_EXECUTION, ResultStatus.FAILED, None),
+        (NextAction.REPLAN, ResultStatus.FAILED, None),
+        (NextAction.VALIDATE, ResultStatus.SUCCESS, None),
+    ],
+)
+def test_execution_checkpoint_preserves_resume_position(action, status, reason):
+    engine, _context, plan = _persistent_execution(EngineResult.success("placeholder"))
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS,
+        steps=[
+            StepExecution("s1", ExecutionStatus.SUCCESS),
+            StepExecution("s2", ExecutionStatus.FAILED),
+        ],
+    )
+    result = EngineResult(
+        status, "checkpoint", data={"execution": execution}, wait_reason=reason
+    )
+    checkpoint = engine._execution_checkpoint(
+        1, 9, plan, result, action, retries=1, replans=2, cycle=3
+    )
+    assert checkpoint["completed_step_ids"] == (
+        ["s1"] if action in {NextAction.WAIT, NextAction.RETRY_EXECUTION} else []
+    )
+    assert checkpoint["next_step_id"] == (
+        "s2" if action in {NextAction.WAIT, NextAction.RETRY_EXECUTION} else None
+    )
+    assert checkpoint["context_data"]["validation_progress"]["cycles"] == (
+        3
+        if action is NextAction.WAIT
+        else 4
+        if action in {NextAction.RETRY_EXECUTION, NextAction.REPLAN}
+        else 3
+    )
+
+
+def test_persistent_execution_validation_and_retry_replan_progression():
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS, next_action=NextAction.VALIDATE
+    )
+    result = EngineResult.success("execute", execution=execution)
+    engine, context, plan = _persistent_execution(result)
+    response = engine._finish_persistent_execution(
+        1, 10, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    assert response.message == "done"
+    assert engine.unit_of_work.decisions[0].task_status == "validating"
+    assert engine.unit_of_work.decisions[0].checkpoint["phase"] == "validating"
+
+    for action in (NextAction.RETRY_EXECUTION, NextAction.REPLAN):
+        execution = ExecutionResult(ExecutionStatus.FAILED, next_action=action)
+        result = EngineResult(
+            ResultStatus.FAILED, "again", data={"execution": execution}
+        )
+        engine, context, plan = _persistent_execution(result, max_cycles=1)
+        engine.max_cycles = 3
+        engine.run = lambda *args, **kwargs: EngineResult.success("continued")
+        response = engine._finish_persistent_execution(
+            1, 10, plan, context, result, retries=0, replans=0, cycle=0
+        )
+        decision = engine.unit_of_work.decisions[0]
+        assert response.message == "continued"
+        assert decision.checkpoint["phase"] == "executing"
+        if action is NextAction.REPLAN:
+            assert decision.replan == ("execution_requested_replan", 4, 5)
+        else:
+            assert decision.events[-1][0] == "task.retrying"
+
+
+def test_persistent_execution_replan_without_limit_and_ordinary_failure():
+    execution = ExecutionResult(ExecutionStatus.FAILED, next_action=NextAction.REPLAN)
+    result = EngineResult(ResultStatus.FAILED, "replan", data={"execution": execution})
+    engine, context, plan = _persistent_execution(result)
+    engine.run = lambda *args, **kwargs: EngineResult.success("replanned")
+    response = engine._finish_persistent_execution(
+        1, 2, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    decision = engine.unit_of_work.decisions[0]
+    assert response.message == "replanned"
+    assert decision.replan == ("execution_requested_replan", 4, 5)
+
+    plain_failure = EngineResult(
+        ResultStatus.FAILED,
+        "fatal",
+        data={
+            "execution": ExecutionResult(
+                ExecutionStatus.FAILED, next_action=NextAction.STOP
+            )
+        },
+    )
+    engine, context, plan = _persistent_execution(plain_failure)
+    engine._finish_persistent_execution(
+        1, 2, plan, context, plain_failure, retries=0, replans=0, cycle=0
+    )
+    assert engine.unit_of_work.decisions[0].task_status == "failed"
+
+
+def test_persistent_execution_validation_exception_is_converted():
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS, next_action=NextAction.VALIDATE
+    )
+    result = EngineResult.success("execute", execution=execution)
+    engine, context, plan = _persistent_execution(result)
+    engine.validator = SimpleNamespace(
+        validate=lambda *_: (_ for _ in ()).throw(RuntimeError("validator broke"))
+    )
+    engine._handle_stage_exception = lambda *_args: EngineResult.failure("handled")
+    handled = engine._finish_persistent_execution(
+        1, 2, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    assert handled.message == "handled"
+
+
+def test_persistent_execution_rethrows_ownership_loss_during_validation():
+    result = EngineResult.success(
+        "execution",
+        execution=ExecutionResult(
+            ExecutionStatus.SUCCESS, next_action=NextAction.VALIDATE
+        ),
+    )
+    engine, context, plan = _persistent_execution(result)
+    engine.transaction_manager = SimpleNamespace(
+        keep_lease_alive=lambda: _NullContext()
+    )
+    engine._check_ownership = lambda: (_ for _ in ()).throw(TransactionError("fenced"))
+    with pytest.raises(TransactionError, match="fenced"):
+        engine._finish_persistent_execution(
+            1, 2, plan, context, result, retries=0, replans=0, cycle=0
+        )
+
+
+def test_legacy_pipeline_converts_validation_exception():
+    execution = ExecutionResult(ExecutionStatus.SUCCESS)
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan="plan")
+
+    class Executor:
+        def execute(self, *_args):
+            return EngineResult.success("executed", execution=execution)
+
+    class Validator:
+        def validate(self, *_args):
+            raise RuntimeError("validator failed")
+
+    engine = Orchestrator(
+        StubContextBuilder(object()),
+        planner=Planner(),
+        executor=Executor(),
+        validator=Validator(),
+    )
+    engine._check_ownership = lambda: None
+    engine._handle_stage_exception = lambda *_args: EngineResult.failure("converted")
+    result = engine._run_pipeline(1)
+    assert result.message == "converted"
+
+
+def test_fail_task_commits_failure_decision_with_source_event():
+    decisions = []
+    engine = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=SimpleNamespace(get=lambda _id: {"status": "executing"}),
+    )
+    engine.unit_of_work = SimpleNamespace(commit_decision=decisions.append)
+    engine._fail_task(3, "failed", "task.execution.exception")
+    decision = decisions[0]
+    assert decision.task_status == "failed"
+    assert [event for event, _payload in decision.events] == [
+        "task.execution.exception",
+        "task.failed",
+    ]
+
+
+def test_unit_of_work_execution_persistence_registers_step_artifacts():
+    calls = []
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS,
+        artifacts=["base"],
+        steps=[StepExecution("s", ExecutionStatus.SUCCESS, artifacts=["step"])],
+    )
+    engine = Orchestrator(
+        StubContextBuilder(object()),
+        artifact_store=SimpleNamespace(register=lambda *args: calls.append(args)),
+    )
+
+    class Phase:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    engine.unit_of_work = SimpleNamespace(phase=lambda: Phase())
+    engine.event_store = SimpleNamespace(record=lambda *_args: None)
+    engine._persist_execution(1, EngineResult.success("done", execution=execution))
+    assert {call[1] for call in calls} == {"base", "step"}
+
+
+def test_pipeline_commits_planning_failure_and_validation_exception():
+    decisions = []
+
+    class Uow:
+        def start_cycle(self, *_args):
+            return 7
+
+        def commit_decision(self, decision):
+            decisions.append(decision)
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.failure("no plan")
+
+    engine = Orchestrator(
+        StubContextBuilder(ExecutionContext(task_id=1, task_title="test")),
+        planner=Planner(),
+        executor=object(),
+        validator=object(),
+    )
+    engine.unit_of_work = Uow()
+    engine._claim_task = lambda _task_id: None
+    failed = engine._run_pipeline(1)
+    assert failed.message == "no plan"
+    assert decisions[0].task_status == "failed"
+
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS, next_action=NextAction.VALIDATE
+    )
+    result = EngineResult.success("executed", execution=execution)
+    engine, context, plan = _persistent_execution(result)
+    engine.transaction_manager = None
+    engine.validator = SimpleNamespace(
+        validate=lambda *_: (_ for _ in ()).throw(RuntimeError("invalid"))
+    )
+    engine._handle_stage_exception = lambda *_args: EngineResult.failure("converted")
+    response = engine._finish_persistent_execution(
+        1, 2, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    assert response.message == "converted"
+
+
+def test_persistent_execution_retry_checkpoint_and_replan_branches():
+    for action in (NextAction.RETRY_EXECUTION, NextAction.REPLAN):
+        execution = ExecutionResult(ExecutionStatus.FAILED, next_action=action)
+        result = EngineResult(
+            ResultStatus.FAILED, "again", data={"execution": execution}
+        )
+        engine, context, plan = _persistent_execution(result)
+        engine.run = lambda *args, **kwargs: EngineResult.success("continued")
+        engine._finish_persistent_execution(
+            1, 2, plan, context, result, retries=0, replans=0, cycle=0
+        )
+        assert engine.unit_of_work.decisions[0].checkpoint["phase"] == "executing"
+
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS, next_action=NextAction.RETRY_EXECUTION
+    )
+    result = EngineResult.success("retry", execution=execution)
+    engine, context, plan = _persistent_execution(result, checkpoint_store=False)
+    engine.max_cycles = 3
+    engine.run = lambda *args, **kwargs: EngineResult.success("continued")
+    engine._finish_persistent_execution(
+        1, 2, plan, context, result, retries=0, replans=0, cycle=0
+    )
+    assert engine.unit_of_work.decisions[0].checkpoint is None
+
+
+def test_wait_checkpoint_binds_approval_fingerprint_and_legacy_uow_fallback():
+    step = PlanStep("s", "write", "write", "fs", {"path": "x"})
+    plan = ExecutionPlan("goal", steps=[step])
+    execution = ExecutionResult(
+        ExecutionStatus.WAITING,
+        next_action=NextAction.WAIT,
+        wait_reason=WaitReason.APPROVAL,
+        error_details=[
+            SimpleNamespace(
+                step_id="s",
+                tool="fs",
+                details={"approval_required": True, "permission_scope": "write"},
+            )
+        ],
+    )
+    result = EngineResult(
+        ResultStatus.WAITING,
+        "approve",
+        data={"execution": execution},
+        wait_reason=WaitReason.APPROVAL,
+    )
+    calls = []
+
+    class LegacyUow:
+        def execution_wait(self, *_args):
+            calls.append(_args)
+
+    engine = Orchestrator(StubContextBuilder(object()))
+    engine.unit_of_work = LegacyUow()
+    engine._persist_execution_wait(1, 2, plan, result)
+    assert len(calls) == 1
+    assert calls[0][-1] == NextAction.WAIT.value
+
+    class CurrentUow:
+        def execution_wait(self, *_args, **kwargs):
+            calls.append(kwargs["approval_request"])
+
+    engine.unit_of_work = CurrentUow()
+    engine._persist_execution_wait(1, 2, plan, result)
+    assert calls[-1]["step_id"] == "s"
+
+
+def test_approval_request_skips_unrelated_errors_and_mismatched_steps():
+    plan = ExecutionPlan("goal", steps=[PlanStep("s", "write", "write", "fs")])
+    execution = ExecutionResult(
+        ExecutionStatus.FAILED,
+        error_details=[
+            SimpleNamespace(
+                step_id="s", tool="fs", details={"approval_required": False}
+            ),
+            SimpleNamespace(
+                step_id="s",
+                tool="other",
+                details={"approval_required": True, "permission_scope": "write"},
+            ),
+        ],
+    )
+    assert Orchestrator._approval_request(plan, execution) is None
+
+
+def test_persist_wait_legacy_uow_rethrows_unrelated_type_error():
+    step = PlanStep("s", "write", "write", "fs", {"x": 1})
+    plan = ExecutionPlan("goal", steps=[step])
+    execution = ExecutionResult(
+        ExecutionStatus.WAITING,
+        next_action=NextAction.WAIT,
+        wait_reason=WaitReason.APPROVAL,
+        error_details=[
+            ExecutionError(
+                ExecutionErrorType.EXTERNAL_BLOCKER,
+                "approval",
+                "fs",
+                "s",
+                details={"approval_required": True, "permission_scope": "write"},
+            )
+        ],
+    )
+    result = EngineResult(
+        ResultStatus.WAITING,
+        "approval",
+        data={"execution": execution},
+        wait_reason=WaitReason.APPROVAL,
+    )
+
+    class BrokenUow:
+        def execution_wait(self, *_args, **_kwargs):
+            raise TypeError("internal conversion bug")
+
+    engine = Orchestrator(StubContextBuilder(object()))
+    engine.unit_of_work = BrokenUow()
+    with pytest.raises(TypeError, match="internal conversion bug"):
+        engine._persist_execution_wait(1, 2, plan, result)
+
+
+def test_approval_request_accepts_matching_scoped_execution_error():
+    step = PlanStep("s", "write", "write", "fs", {"path": "a"})
+    plan = ExecutionPlan("goal", steps=[step])
+    execution = ExecutionResult(
+        ExecutionStatus.FAILED,
+        error_details=[
+            ExecutionError(
+                ExecutionErrorType.EXTERNAL_BLOCKER,
+                "approval",
+                "fs",
+                "s",
+                details={"approval_required": True, "permission_scope": "write"},
+            )
+        ],
+    )
+    request = Orchestrator._approval_request(plan, execution)
+    assert request["step_id"] == "s"
+    assert request["permission_scope"] == "write"
+
+
+def test_orchestrator_persistence_helpers_and_exception_paths():
+    engine = Orchestrator(StubContextBuilder(object()))
+    engine.checkpoint_store = SimpleNamespace(save=lambda *_args, **_kwargs: None)
+    engine._save_checkpoint(
+        1, "waiting", NextAction.WAIT, 2, "wait", wait_reason="external_information"
+    )
+
+    class Atomic:
+        def __init__(self):
+            self.calls = 0
+
+        def __enter__(self):
+            self.calls += 1
+
+        def __exit__(self, *_args):
+            return False
+
+    atomic = Atomic()
+    engine.transaction_manager = SimpleNamespace(atomic=lambda: atomic)
+    engine._save_checkpoint(
+        1, "waiting", NextAction.WAIT, 2, "wait", wait_reason=WaitReason.APPROVAL
+    )
+    assert atomic.calls == 1
+
+    records = []
+    events = []
+    engine.unit_of_work = None
+    engine.transaction_manager = SimpleNamespace(atomic=lambda: _NullContext())
+    engine.task_store = SimpleNamespace(
+        transition=lambda *_args: None,
+        complete_attempt=lambda *_args: records.append(_args),
+    )
+    engine.event_store = SimpleNamespace(record=lambda *args: events.append(args))
+    engine.checkpoint_store = SimpleNamespace(
+        invalidate=lambda *_args: records.append("invalidated")
+    )
+    engine._complete_done(1, 2)
+    assert records[-1] == "invalidated"
+    assert events[-1][1] == "task.done"
+
+    result = engine._handle_stage_exception(1, 2, "execution", TimeoutError("late"))
+    assert result.data["recovery_action"] == "retry_execution"
+    assert events[-2][1] == "task.execution.exception"
+
+
+def test_task_failure_fallback_records_failure_after_atomic_write_error():
+    calls = []
+
+    class FailedAtomic:
+        def __enter__(self):
+            raise RuntimeError("write failed")
+
+        def __exit__(self, *_args):
+            return False
+
+    manager = SimpleNamespace(
+        atomic=lambda: FailedAtomic(),
+        record_failure=lambda tasks, events, task_id, message: calls.append(
+            (tasks, events, task_id, message)
+        ),
+        _validate_connections=lambda _stores: None,
+        owner=None,
+    )
+    engine = Orchestrator(
+        StubContextBuilder(object()),
+        task_store=SimpleNamespace(transition=lambda *_: None),
+        event_store=SimpleNamespace(record=lambda *_: None),
+        transaction_manager=manager,
+    )
+    engine._fail_task(3, "bad", "task.execution.failed")
+    assert calls == [(engine.task_store, engine.event_store, 3, "bad")]
+
+
+def test_persist_execution_registers_execution_and_step_artifacts():
+    calls = []
+    execution = ExecutionResult(
+        ExecutionStatus.SUCCESS,
+        artifacts=["root.txt"],
+        steps=[
+            StepExecution(
+                "s", ExecutionStatus.SUCCESS, artifacts=["step.txt", "root.txt"]
+            )
+        ],
+    )
+    result = EngineResult.success("done", execution=execution)
+    engine = Orchestrator(
+        StubContextBuilder(object()),
+        artifact_store=SimpleNamespace(register=lambda *args: calls.append(args)),
+    )
+    engine._persist_execution(5, result)
+    assert [call[1] for call in calls] == ["root.txt", "step.txt"]
+
+    events = []
+
+    class Phase:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    engine.unit_of_work = SimpleNamespace(phase=lambda: Phase())
+    engine.event_store = SimpleNamespace(record=lambda *args: events.append(args))
+    engine._persist_execution(5, EngineResult.success("empty"))
+    assert events[-1][1] == "task.execution.completed"
+
+
+def test_persistent_execution_wait_without_store_and_retry_replan_write_checkpoints():
+    wait_execution = ExecutionResult(
+        ExecutionStatus.WAITING,
+        next_action=NextAction.WAIT,
+        wait_reason=WaitReason.TEMPORARY_ERROR,
+    )
+    wait_result = EngineResult(
+        ResultStatus.WAITING,
+        "wait",
+        data={"execution": wait_execution},
+        wait_reason=WaitReason.TEMPORARY_ERROR,
+    )
+    engine, context, plan = _persistent_execution(wait_result, checkpoint_store=False)
+    engine._finish_persistent_execution(
+        1, 10, plan, context, wait_result, retries=0, replans=0, cycle=0
+    )
+    assert engine.unit_of_work.decisions[-1].checkpoint is None
+
+    for action in (NextAction.RETRY_EXECUTION, NextAction.REPLAN):
+        execution = ExecutionResult(ExecutionStatus.FAILED, next_action=action)
+        result = EngineResult(
+            ResultStatus.FAILED, "again", data={"execution": execution}
+        )
+        engine, context, plan = _persistent_execution(result, max_cycles=1)
+        engine._finish_persistent_execution(
+            1, 10, plan, context, result, retries=0, replans=0, cycle=0
+        )
+        decision = engine.unit_of_work.decisions[0]
+        assert decision.checkpoint is None
 
 
 def test_orchestrator_builds_context_and_waits_for_engine_components():

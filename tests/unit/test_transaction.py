@@ -317,6 +317,16 @@ def test_engine_unit_of_work_persists_execution_wait_atomically():
                 "INSERT INTO checkpoints VALUES (?, ?)", (task_id, payload["reason"])
             )
 
+        def get_active(self, _task_id):
+            return {"wait_token": "approval-token"}
+
+    class Approvals:
+        def __init__(self):
+            self.created = []
+
+        def create(self, task_id, token, request):
+            self.created.append((task_id, token, request))
+
     work = EngineUnitOfWork(
         TransactionManager(connection),
         Tasks(connection),
@@ -324,18 +334,22 @@ def test_engine_unit_of_work_persists_execution_wait_atomically():
         Store(connection),
         Checkpoints(connection),
     )
+    approvals = Approvals()
+    work.approval_store = approvals
     work.execution_wait(
         1,
         4,
         {"reason": "approval", "phase": "waiting", "next_action": "wait"},
         None,
         "wait",
+        {"step_id": "step-1"},
     )
     assert connection.execute("SELECT status FROM tasks").fetchone()[0] == "waiting"
     assert connection.execute("SELECT status FROM attempts").fetchone()[0] == "waiting"
     assert (
         connection.execute("SELECT reason FROM checkpoints").fetchone()[0] == "approval"
     )
+    assert approvals.created == [(1, "approval-token", {"step_id": "step-1"})]
 
 
 def test_engine_unit_of_work_claims_and_releases_resume_lease():

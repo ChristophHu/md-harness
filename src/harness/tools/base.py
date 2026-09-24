@@ -19,10 +19,12 @@ class ToolError(RuntimeError):
         error_type: ExecutionErrorType = ExecutionErrorType.TOOL_FAILURE,
         *,
         retryable: bool = False,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
         self.retryable = retryable
+        self.details = details or {}
 
 
 class PermissionLevel(StrEnum):
