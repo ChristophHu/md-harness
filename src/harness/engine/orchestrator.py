@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -35,7 +36,8 @@ from harness.storage.transaction import (
     TransactionManager,
     ValidationWrite,
 )
-from harness.tools.base import ToolRegistry
+from harness.tools.base import ToolError, ToolRegistry
+from harness.tools.filesystem import FilesystemError, FilesystemTool
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +605,13 @@ class Orchestrator:
                     replans=replans,
                     cycle=cycle,
                 )
+            if execution_result.interaction_request is not None:
+                return self._handle_stage_exception(
+                    task_id,
+                    attempt_id,
+                    "execution",
+                    ValueError("structured execution interaction requires persistence"),
+                )
             self._persist_execution(task_id, execution_result)
             execution = execution_result.data.get("execution")
             try:
@@ -881,6 +890,7 @@ class Orchestrator:
         """Classify an executor result before committing all its effects."""
         execution = result.data.get("execution")
         error: Exception | None = None
+        error_event = "task.execution.invalid_next_action"
         try:
             action = self._action(
                 getattr(execution, "next_action", None)
@@ -890,14 +900,17 @@ class Orchestrator:
                 raise ValueError("WAITING execution requires next_action=WAIT")
             if action is NextAction.WAIT:
                 self._require_wait_reason(result)
-        except (InvalidNextActionError, ValueError) as caught:
+            if result.interaction_request is not None:
+                error_event = "task.execution.invalid_interaction"
+                self._validate_stage_interaction(result, action, "execution")
+        except (InvalidNextActionError, ValueError, TypeError) as caught:
             error = caught
             action = None
         if error is not None:
             message = str(error)
             error_events = (
                 ("task.execution.completed", self._serialize(result)),
-                ("task.execution.invalid_next_action", {"error": message}),
+                (error_event, {"error": message}),
                 ("task.failed", {"error": message}),
             )
             self.unit_of_work.commit_decision(
@@ -933,6 +946,38 @@ class Orchestrator:
         artifacts = set(getattr(execution, "artifacts", []))
         for step in getattr(execution, "steps", []):
             artifacts.update(step.artifacts)
+        if action is NextAction.WAIT and result.interaction_request is not None:
+            checkpoint = self._execution_checkpoint(
+                task_id,
+                attempt_id,
+                plan,
+                result,
+                action,
+                retries=retries,
+                replans=replans,
+                cycle=cycle,
+            )
+            serialized_plan = self._serialize(plan)
+            plan_fingerprint = fingerprint(serialized_plan)
+            checkpoint["plan_fingerprint"] = plan_fingerprint
+            interaction_id = self.unit_of_work.create_human_wait(
+                task_id,
+                attempt_id,
+                checkpoint,
+                result.interaction_request,
+                plan_version=getattr(plan, "version", None),
+                plan_fingerprint=plan_fingerprint,
+                events=tuple(events),
+                artifacts=tuple(sorted(artifacts)),
+            )
+            return EngineResult(
+                ResultStatus.WAITING,
+                result.message,
+                result.errors,
+                data=result.data,
+                wait_reason=result.wait_reason,
+                interaction_request={"interaction_id": interaction_id},
+            )
         checkpoint = None
         attempt_status = None
         task_status = None
@@ -1223,6 +1268,20 @@ class Orchestrator:
         decision = self._validation_decision(
             validation, retries=retries, replans=replans, cycle=cycle
         )
+        if validation.interaction_request is not None:
+            try:
+                self._validate_stage_interaction(
+                    validation, decision.action, "validation"
+                )
+            except (TypeError, ValueError) as error:
+                decision = _ValidationDecision(
+                    "failed",
+                    EngineResult.failure(f"Invalid validation interaction: {error}"),
+                    None,
+                    retries,
+                    replans,
+                    "task.validation.invalid_interaction",
+                )
         checkpoint = None
         if decision.outcome in {"wait", "retry", "replan"}:
             checkpoint = {
@@ -1248,6 +1307,32 @@ class Orchestrator:
                     else None
                 ),
             }
+        if decision.outcome == "wait" and validation.interaction_request is not None:
+            assert checkpoint is not None and self.unit_of_work is not None
+            assert attempt_id is not None
+            serialized_plan = self._serialize(plan)
+            plan_fingerprint = fingerprint(serialized_plan)
+            checkpoint["plan_fingerprint"] = plan_fingerprint
+            interaction_id = self.unit_of_work.create_human_wait(
+                task_id,
+                attempt_id,
+                checkpoint,
+                validation.interaction_request,
+                plan_version=getattr(plan, "version", None),
+                plan_fingerprint=plan_fingerprint,
+                events=(("task.validation.completed", self._serialize(validation)),),
+            )
+            response = EngineResult(
+                ResultStatus.WAITING,
+                validation.message,
+                validation.errors,
+                data=validation.data,
+                wait_reason=validation.wait_reason,
+                interaction_request={"interaction_id": interaction_id},
+            )
+            return _ValidationDecision(
+                "wait", response, NextAction.WAIT, retries, replans
+            )
         event_type = decision.event_type
         event_payload: Any = {"error": decision.result.message}
         replan = None
@@ -1627,6 +1712,30 @@ class Orchestrator:
     @classmethod
     def _require_wait_reason(cls, result: EngineResult) -> WaitReason:
         return cls._coerce_wait_reason(result.wait_reason)
+
+    def _validate_stage_interaction(
+        self, result: EngineResult, action: NextAction | None, phase: str
+    ) -> None:
+        """Reject structured waits that cannot be answered and resumed safely."""
+        request = result.interaction_request
+        if not isinstance(request, dict):
+            raise TypeError("interaction request must be a mapping")
+        if self.unit_of_work is None or self.checkpoint_store is None:
+            raise ValueError(
+                "structured interaction requires transactional persistence"
+            )
+        if result.status is not ResultStatus.WAITING or action is not NextAction.WAIT:
+            raise ValueError("interaction requires a WAITING result with WAIT action")
+        self.unit_of_work._validate_interaction_request(request)
+        expected = (
+            WaitReason.PLAN_REVIEW
+            if request["kind"] == "plan_review"
+            else WaitReason.HUMAN_INPUT
+        )
+        if result.wait_reason is not expected:
+            raise ValueError("interaction kind does not match WAIT reason")
+        if phase == "execution" and request["resume_action"] == "validate":
+            raise ValueError("execution interaction must resume or replan execution")
 
     def _persist_planner_interaction(
         self,
@@ -2067,7 +2176,6 @@ class Orchestrator:
                     response = json.loads(interaction["response_data"])
                     if response.get("decision") == "changes_requested":
                         return self._resume_replan(task_id, progress=progress)
-                    interaction_action = NextAction.RETRY_EXECUTION.value
         if interaction_action is not None:
             if plan is None and isinstance(payload, dict):
                 plan = self._deserialize_plan(payload.get("plan"))
@@ -2082,6 +2190,10 @@ class Orchestrator:
                 )
             if interaction_action == NextAction.RETRY_EXECUTION.value:
                 return self._resume_retry_execution(task_id, plan, progress=progress)
+        if reason_code == WaitReason.TOOL_OUTCOME_UNKNOWN.value and isinstance(
+            payload, dict
+        ):
+            self._reconcile_filesystem_write(task_id, checkpoint, payload)
         should_continue = (
             reason_code in {"temporary_error", "workspace_missing", "manual_replan"}
             or reason_code == "approval"
@@ -2118,6 +2230,67 @@ class Orchestrator:
         ):
             self._transition(task_id, "waiting")
         return EngineResult.waiting(reason, WaitReason(reason_code))
+
+    def _reconcile_filesystem_write(
+        self, task_id: int, checkpoint: Any, payload: dict[str, Any]
+    ) -> None:
+        """Accept only an exact readback of a deterministic file write."""
+        if self.unit_of_work is None or self.executor is None:
+            return
+        invocation_id = payload.get("tool_invocation_id")
+        row = (
+            self.unit_of_work.tool_invocation_store.get(invocation_id)
+            if isinstance(invocation_id, str)
+            else None
+        )
+        plan = payload.get("plan")
+        if (
+            row is None
+            or row["status"] != "started"
+            or row["tool_name"] != "filesystem"
+            or not isinstance(plan, dict)
+            or not isinstance(plan.get("steps"), list)
+        ):
+            return
+        step = next(
+            (
+                item
+                for item in plan["steps"]
+                if isinstance(item, dict) and item.get("id") == row["step_id"]
+            ),
+            None,
+        )
+        arguments = step.get("arguments") if step is not None else None
+        if not isinstance(arguments, dict) or arguments.get("operation") != "write":
+            return
+        path, content = arguments.get("path"), arguments.get("content")
+        if not isinstance(path, str) or not isinstance(content, str):
+            return
+        registry = getattr(self.executor, "registry", None)
+        if registry is None:
+            return
+        try:
+            tool = registry.get("filesystem")
+            if not isinstance(tool, FilesystemTool) or tool.read_text(path) != content:
+                return
+        except (ToolError, FilesystemError, OSError, UnicodeError):
+            return
+        token = self._checkpoint_value(checkpoint, "wait_token")
+        if not isinstance(token, str):
+            return
+        evidence = f"filesystem-readback:sha256:{sha256(content.encode()).hexdigest()}"
+        try:
+            self.resolve_tool_invocation(
+                task_id,
+                token,
+                invocation_id,
+                "harness:filesystem-readback",
+                "completed",
+                evidence,
+            )
+        except ValueError:
+            # The wait or invocation changed while the file was inspected.
+            return
 
     def _approval_checkpoint_ready(
         self, task_id: int, checkpoint: Any, plan: Any, payload: Any

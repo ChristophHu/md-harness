@@ -20,11 +20,36 @@ from harness.storage.database import (
 from harness.storage.event_store import EventStore
 from harness.storage.project_store import ProjectStore
 from harness.storage.task_store import TaskStore
+from harness.storage.tool_invocation_store import ToolInvocationStore
 
 
 def db(tmp_path):
     path = initialize_database(tmp_path / "harness.sqlite")
     return path
+
+
+def test_tool_invocation_reservation_blocks_changed_and_competing_steps(tmp_path):
+    with sqlite3.connect(db(tmp_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        task_id = TaskStore(connection).create("Tool journal")
+        store = ToolInvocationStore(connection)
+        binding = {
+            "plan_fingerprint": "plan-a",
+            "plan_version": 1,
+            "step_id": "step-a",
+            "tool_name": "filesystem",
+            "arguments_fingerprint": "args-a",
+            "permission_scope": "write",
+        }
+        state, invocation_id = store.reserve(task_id, binding)
+        assert state == "new"
+        assert store.reserve(task_id, binding) == ("uncertain", invocation_id)
+        with pytest.raises(ValueError, match="binding changed"):
+            store.reserve(task_id, {**binding, "arguments_fingerprint": "args-b"})
+        assert store.reserve(task_id, {**binding, "plan_fingerprint": "plan-b"}) == (
+            "uncertain",
+            invocation_id,
+        )
 
 
 def test_database_transaction_health_version_and_backup(tmp_path):

@@ -96,6 +96,32 @@ def test_record_failure_uses_failure_transaction():
     )
 
 
+@pytest.mark.parametrize(
+    ("change", "error", "message"),
+    [
+        (None, TypeError, "mapping"),
+        ({"kind": "unknown"}, ValueError, "kind"),
+        ({"prompt": " "}, ValueError, "prompt"),
+        ({"resume_action": "stop"}, ValueError, "resume_action"),
+        ({"response_schema": {"type": "alien"}}, ValueError, "response_schema"),
+        ({"request_data": "text"}, TypeError, "request_data"),
+    ],
+)
+def test_interaction_request_contract_rejects_invalid_fields(change, error, message):
+    request = {
+        "kind": "human_decision",
+        "prompt": "Choose",
+        "resume_action": "replan",
+        "response_schema": {"type": "string"},
+    }
+    if change is not None:
+        request.update(change)
+    else:
+        request = None
+    with pytest.raises(error, match=message):
+        EngineUnitOfWork._validate_interaction_request(request)
+
+
 def test_engine_unit_of_work_groups_cycle_start_and_decision():
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, status TEXT)")

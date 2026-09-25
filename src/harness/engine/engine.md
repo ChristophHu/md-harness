@@ -487,6 +487,19 @@ Antwort erscheint nach einem Neustart im neu aufgebauten
 `ExecutionContext.human_responses`. Der aufrufende API-Adapter ist
 verantwortlich, die Actor-Identität zu authentisieren.
 
+Ein explizites `WAIT` mit strukturierter `interaction_request` wird nun auch
+aus Executor und Validator als derselbe persistierte HITL-Wait verarbeitet.
+Checkpoint, Anfrage, Attempt-Abschluss, Status und Events werden gemeinsam
+geschrieben; bei Execution gehören ausgeführte Steps und Artefakte, bei
+Validation das Execution-Ergebnis zum Checkpoint. Der zurückgegebene
+`interaction_id` bezeichnet die beantwortbare Anfrage. Nach der Antwort
+setzt `resume()` gemäß `resume_action` bei Execution, Validation oder Replanning
+fort. Eine Execution-Anfrage darf nicht direkt zu `validate` springen, solange
+die Ausführung noch unterbrochen ist. Ungültige Anfragen und fehlende
+transaktionale Persistenz führen zu einem Fehler statt zu einem unerreichbaren
+WAIT. Ein `plan_review` respektiert bei Freigabe seine gespeicherte
+`resume_action`; `changes_requested` führt weiterhin zum Replan.
+
 Bei Projekt-Tasks legt dieselbe Antwort-Transaktion für `human_decision` und
 `plan_review` einen Eintrag in `vault_decision_outbox` an. Für
 `information_request` geschieht dies nur mit `request_data.reusable: true`.
@@ -513,6 +526,12 @@ outcome, evidence_ref)` akzeptiert nach unabhängiger Prüfung `completed`
 protokolliert die Entscheidung. Nur `no_effect` erlaubt einen erneuten Aufruf.
 `list_tool_reconciliations(task_id)` liefert die aktuelle Anfrage mit Token,
 Step, Tool und Argument-Fingerprint, ohne rohe Argumente offenzulegen.
+Für `filesystem.write` versucht `resume()` eine enge automatische Prüfung:
+Stimmt der aktuelle Dateiinhalt bytegenau mit dem geplanten UTF-8-Text überein,
+wird der Step mit Inhalts-Hash als Evidenz auditierbar als `completed` markiert.
+Ein fehlender oder abweichender Inhalt beweist **nicht** `no_effect`; der Task
+bleibt dann auf `WAIT`. Für Git, SQL und frei ausführbare Kommandos erfolgt
+keine automatische Entscheidung.
 Der API-Adapter muss den Actor authentisieren und die Evidenz überprüfbar
 halten. Ohne Idempotenz-Unterstützung des externen Tools ist dies keine
 mathematische Exactly-once-Garantie; es verhindert die blinde Wiederholung.

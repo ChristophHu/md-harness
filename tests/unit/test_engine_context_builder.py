@@ -1,5 +1,6 @@
 """Tests for building execution contexts from persistence and runtime services."""
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -141,3 +142,12 @@ def test_context_builder_loads_replanning_feedback(tmp_path):
     assert context.last_plan == {"version": 1}
     assert context.last_validation == {"message": "failed"}
     assert context.replanning_reasons == [{"reason": "missing test"}]
+
+
+def test_human_responses_are_empty_before_interaction_migration():
+    connection = sqlite3.connect(":memory:")
+    builder = ContextBuilder(
+        None, None, None, None, checkpoint_store=SimpleNamespace(connection=connection)
+    )
+    assert builder._human_responses(1) == []
+    connection.close()

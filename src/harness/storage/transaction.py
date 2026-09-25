@@ -546,6 +546,7 @@ class EngineUnitOfWork:
         plan_version: int | None = None,
         plan_fingerprint: str | None = None,
         events: tuple[tuple[str, Any], ...] = (),
+        artifacts: tuple[str, ...] = (),
     ) -> str:
         """Atomically create an interaction and move its task into waiting."""
         self._validate_interaction_request(request)
@@ -581,6 +582,8 @@ class EngineUnitOfWork:
                 plan_version=plan_version,
                 plan_fingerprint=plan_fingerprint,
             )
+            for path in artifacts:
+                self.artifact_store.register(task_id, path, "execution-artifact")
             for event_type, payload in events:
                 self.event_store.record(task_id, event_type, payload)
             self.task_store.complete_attempt(

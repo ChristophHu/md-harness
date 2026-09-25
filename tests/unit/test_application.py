@@ -1,4 +1,6 @@
-from harness.application import ApplicationFactory, build_orchestrator
+from unittest.mock import Mock
+
+from harness.application import Application, ApplicationFactory, build_orchestrator
 from harness.config import ConfigError, ExecutionConfig, PersistenceMode
 
 
@@ -91,3 +93,37 @@ def test_build_orchestrator_uses_vault_path_from_dotenv(tmp_path, monkeypatch):
         assert orchestrator.context_builder.knowledge_loader is not None
     finally:
         connection.close()
+
+
+def test_application_forwards_human_and_tool_reconciliation_calls():
+    orchestrator = Mock()
+    connection = Mock()
+    application = Application(orchestrator, connection)
+    assert (
+        application.list_human_interactions(1)
+        is orchestrator.list_human_interactions.return_value
+    )
+    assert (
+        application.answer_human_interaction(1, "interaction", "owner", "yes")
+        is orchestrator.answer_human_interaction.return_value
+    )
+    assert (
+        application.suggest_human_interaction(1, "question")
+        is orchestrator.suggest_human_interaction.return_value
+    )
+    assert (
+        application.publish_vault_decisions(limit=2)
+        is orchestrator.publish_vault_decisions.return_value
+    )
+    assert (
+        application.resolve_tool_invocation(
+            1, "wait", "invocation", "owner", "completed", "proof"
+        )
+        is orchestrator.resolve_tool_invocation.return_value
+    )
+    assert (
+        application.list_tool_reconciliations(1)
+        is orchestrator.list_tool_reconciliations.return_value
+    )
+    application.close()
+    connection.close.assert_called_once_with()

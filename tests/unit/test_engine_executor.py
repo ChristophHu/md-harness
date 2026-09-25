@@ -234,3 +234,46 @@ def test_policy_rejects_tool_not_matching_plan_step():
         assert "not authorized" in str(error)
     else:
         raise AssertionError("unauthorized tool was accepted")
+
+
+@pytest.mark.parametrize("failure", ["uncertain", "tool_error", "runtime_error"])
+def test_executor_never_replays_uncertain_effectful_calls(failure):
+    class WriteTool(Tool):
+        definition = ToolDefinition("write", "effect", PermissionLevel.WRITE)
+
+        def execute(self, **_arguments):
+            if failure == "tool_error":
+                raise ToolError("external failure")
+            if failure == "runtime_error":
+                raise RuntimeError("external failure")
+            raise AssertionError("uncertain reservation must not call the tool")
+
+    registry = ToolRegistry()
+    registry.register(WriteTool())
+    execution_context = context(available_tools=["write"])
+    execution_context.tool_invocation_begin = lambda *_args: (
+        "uncertain" if failure == "uncertain" else "new",
+        "invocation-1",
+    )
+    result = Executor(registry, ToolSecurityPolicy(require_approval=False)).execute(
+        execution_context,
+        ExecutionPlan("effect", [PlanStep("step", "Write", "write", "write")]),
+    )
+    assert result.status is ResultStatus.WAITING
+    assert result.data["tool_invocation_id"] == "invocation-1"
+
+
+def test_executor_propagates_unjournaled_unexpected_error():
+    class BrokenReadTool(Tool):
+        definition = ToolDefinition("read", "read", PermissionLevel.READ)
+
+        def execute(self, **_arguments):
+            raise RuntimeError("unexpected read failure")
+
+    registry = ToolRegistry()
+    registry.register(BrokenReadTool())
+    with pytest.raises(RuntimeError, match="unexpected read failure"):
+        Executor(registry, ToolSecurityPolicy(require_approval=False)).execute(
+            context(available_tools=["read"]),
+            ExecutionPlan("read", [PlanStep("step", "Read", "read", "read")]),
+        )

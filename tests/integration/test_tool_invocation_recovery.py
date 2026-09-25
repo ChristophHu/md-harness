@@ -1,9 +1,11 @@
 """Effectful tool calls cannot be blindly replayed after an uncertain exit."""
 
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +16,9 @@ from harness.engine.orchestrator import Orchestrator
 from harness.engine.plan import ExecutionPlan, PlanStep
 from harness.engine.result import (
     EngineResult,
+    ExecutionStatus,
     ResultStatus,
+    StepExecution,
     ToolExecutionResult,
     WaitReason,
 )
@@ -23,6 +27,7 @@ from harness.security.tool_policy import ToolSecurityPolicy
 from harness.storage.database import connect, initialize_database
 from harness.storage.factory import StoreFactory
 from harness.storage.project_store import ProjectStore
+from harness.storage.transaction import TransactionError
 from harness.tools.base import PermissionLevel, Tool, ToolDefinition, ToolRegistry
 from harness.tools.filesystem import FilesystemTool
 
@@ -393,6 +398,282 @@ def test_test_runner_is_journaled_despite_read_permission():
     assert Executor._has_external_effect(
         PlanStep("tests", "Run checks", "run", "test_runner"), PermissionLevel.READ
     )
+
+
+def _filesystem_write_engine(database, workspace, *, task_id=None):
+    if not database.exists():
+        initialize_database(database)
+    connection = connect(database)
+    stores = StoreFactory.create(connection, workspace)
+    projects = ProjectStore(connection)
+    if task_id is None:
+        project_id = projects.create("Readback", str(workspace))
+        task_id = stores.task_store.create("Write file", project_id=project_id)
+        stores.task_store.transition(task_id, "ready")
+        stores.task_store.approve(task_id, "owner")
+    registry = ToolRegistry()
+    registry.register(FilesystemTool(workspace))
+
+    class WritePlanner:
+        def plan(self, _context):
+            return EngineResult.success(
+                "planned",
+                plan=ExecutionPlan(
+                    "write",
+                    [
+                        PlanStep(
+                            "write",
+                            "Write expected content",
+                            "write",
+                            "filesystem",
+                            {
+                                "operation": "write",
+                                "path": "output.txt",
+                                "content": "expected",
+                            },
+                        )
+                    ],
+                ),
+            )
+
+    builder = ContextBuilder.from_stores(stores, projects, tool_registry=registry)
+    orchestrator = Orchestrator(
+        builder,
+        planner=WritePlanner(),
+        executor=Executor(registry, ToolSecurityPolicy(require_approval=False)),
+        validator=SuccessValidator(),
+        stores=stores,
+        execution_config=ExecutionConfig(dry_run=False, persistence_mode="required"),
+    )
+    return connection, orchestrator, task_id
+
+
+def test_filesystem_write_readback_resolves_uncertain_effect(tmp_path):
+    database = tmp_path / "auto-readback.sqlite"
+    connection, initial, task_id = _filesystem_write_engine(database, tmp_path)
+
+    def crash_after_write(*_args):
+        raise SystemExit("crash after write")
+
+    initial.unit_of_work.complete_tool_invocation = crash_after_write
+    with pytest.raises(SystemExit, match="crash after write"):
+        initial.run(task_id)
+    assert (tmp_path / "output.txt").read_text() == "expected"
+    connection.close()
+
+    connection, restarted, _ = _filesystem_write_engine(
+        database, tmp_path, task_id=task_id
+    )
+    assert restarted.resume(task_id).wait_reason is WaitReason.TOOL_OUTCOME_UNKNOWN
+    assert restarted.resume(task_id).status is ResultStatus.SUCCESS
+    assert (tmp_path / "output.txt").read_text() == "expected"
+    row = connection.execute(
+        "SELECT status, resolved_by, evidence_ref FROM task_tool_invocations WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert row["status"] == "completed"
+    assert row["resolved_by"] == "harness:filesystem-readback"
+    assert row["evidence_ref"].startswith("filesystem-readback:sha256:")
+    connection.close()
+
+
+def test_filesystem_readback_does_not_infer_no_effect_from_mismatch(tmp_path):
+    database = tmp_path / "mismatch.sqlite"
+    connection, initial, task_id = _filesystem_write_engine(database, tmp_path)
+
+    def crash_after_write(*_args):
+        raise SystemExit("crash after write")
+
+    initial.unit_of_work.complete_tool_invocation = crash_after_write
+    with pytest.raises(SystemExit):
+        initial.run(task_id)
+    connection.close()
+    (tmp_path / "output.txt").write_text("different")
+
+    connection, restarted, _ = _filesystem_write_engine(
+        database, tmp_path, task_id=task_id
+    )
+    assert restarted.resume(task_id).wait_reason is WaitReason.TOOL_OUTCOME_UNKNOWN
+    assert restarted.resume(task_id).wait_reason is WaitReason.TOOL_OUTCOME_UNKNOWN
+    assert (tmp_path / "output.txt").read_text() == "different"
+    assert (
+        connection.execute(
+            "SELECT status FROM task_tool_invocations WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        == "started"
+    )
+    (tmp_path / "output.txt").write_text("expected")
+    assert restarted.resume(task_id).status is ResultStatus.SUCCESS
+    connection.close()
+
+
+def test_filesystem_reconciliation_rejects_stale_or_malformed_readback(tmp_path):
+    database = tmp_path / "guarded-readback.sqlite"
+    connection, initial, task_id = _filesystem_write_engine(database, tmp_path)
+
+    def crash_after_write(*_args):
+        raise SystemExit("crash after write")
+
+    initial.unit_of_work.complete_tool_invocation = crash_after_write
+    with pytest.raises(SystemExit):
+        initial.run(task_id)
+    connection.close()
+    connection, restarted, _ = _filesystem_write_engine(
+        database, tmp_path, task_id=task_id
+    )
+    assert restarted.resume(task_id).wait_reason is WaitReason.TOOL_OUTCOME_UNKNOWN
+    checkpoint = restarted.checkpoint_store.get_active(task_id)
+    payload = json.loads(checkpoint["context_data"])
+    reconcile = restarted._reconcile_filesystem_write
+    original_executor = restarted.executor
+    reconcile(
+        task_id, checkpoint, {"tool_invocation_id": "missing", "plan": payload["plan"]}
+    )
+    reconcile(task_id, checkpoint, {**payload, "plan": None})
+    modified = json.loads(json.dumps(payload))
+    modified["plan"]["steps"][0]["arguments"]["operation"] = "delete"
+    reconcile(task_id, checkpoint, modified)
+    modified["plan"]["steps"][0]["arguments"] = {
+        "operation": "write",
+        "path": 42,
+        "content": "expected",
+    }
+    reconcile(task_id, checkpoint, modified)
+    restarted.executor = SimpleNamespace()
+    reconcile(task_id, checkpoint, payload)
+    restarted.executor = Executor(ToolRegistry())
+    reconcile(task_id, checkpoint, payload)
+    restarted.executor = original_executor
+    (tmp_path / "output.txt").unlink()
+    reconcile(task_id, checkpoint, payload)
+    (tmp_path / "output.txt").write_text("expected")
+    reconcile(task_id, {"wait_token": None}, payload)
+    reconcile(task_id, {"wait_token": "stale"}, payload)
+    assert (
+        connection.execute(
+            "SELECT status FROM task_tool_invocations WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        == "started"
+    )
+    connection.close()
+
+
+def _uncertain_tool_wait(tmp_path):
+    database = tmp_path / "reconciliation-errors.sqlite"
+    connection, initial, task_id = _engine(
+        database, tmp_path, EffectTool(tmp_path / "effect.txt", crash=True)
+    )
+    with pytest.raises(SystemExit):
+        initial.run(task_id)
+    connection.close()
+    connection, restarted, _ = _engine(
+        database, tmp_path, EffectTool(tmp_path / "effect.txt"), task_id=task_id
+    )
+    assert restarted.resume(task_id).wait_reason is WaitReason.TOOL_OUTCOME_UNKNOWN
+    return (
+        connection,
+        restarted,
+        task_id,
+        restarted.list_tool_reconciliations(task_id)[0],
+    )
+
+
+def test_reconciliation_rejects_invalid_outcome_and_changed_resolution(tmp_path):
+    connection, engine, task_id, request = _uncertain_tool_wait(tmp_path)
+    with pytest.raises(ValueError, match="outcome must be"):
+        engine.resolve_tool_invocation(
+            task_id,
+            request["wait_token"],
+            request["invocation_id"],
+            "owner",
+            "maybe",
+            "proof",
+        )
+    assert engine.resolve_tool_invocation(
+        task_id,
+        request["wait_token"],
+        request["invocation_id"],
+        "owner",
+        "no_effect",
+        "proof",
+    )
+    with pytest.raises(ValueError, match="another resolution"):
+        engine.resolve_tool_invocation(
+            task_id,
+            request["wait_token"],
+            request["invocation_id"],
+            "other",
+            "completed",
+            "other-proof",
+        )
+    connection.close()
+
+
+def test_tool_journal_rejects_nonexecuting_task_and_lost_completion(tmp_path):
+    connection, engine, task_id, _ = _uncertain_tool_wait(tmp_path)
+    plan = ExecutionPlan("effect", [PlanStep("step", "Do it", "write", "effect")])
+    with pytest.raises(TransactionError, match="not executing"):
+        engine.unit_of_work.begin_tool_invocation(task_id, plan, plan.steps[0], "write")
+    with pytest.raises(TransactionError, match="lost ownership"):
+        engine.unit_of_work.complete_tool_invocation(
+            task_id,
+            "missing",
+            StepExecution("step", ExecutionStatus.SUCCESS, tool="effect"),
+        )
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("wrong_reason", "not a tool reconciliation"),
+        ("wrong_checkpoint_invocation", "stale tool invocation"),
+        ("missing_invocation", "not found for task"),
+        ("wrong_plan", "plan binding is stale"),
+        ("wrong_tool", "step binding is stale"),
+        ("lost_update", "lost a race"),
+    ],
+)
+def test_reconciliation_rejects_stale_bindings_and_lost_updates(
+    tmp_path, monkeypatch, case, message
+):
+    connection, engine, task_id, request = _uncertain_tool_wait(tmp_path)
+    invocation_id = request["invocation_id"]
+    if case == "wrong_reason":
+        connection.execute(
+            "UPDATE task_checkpoints SET waiting_reason_code = 'approval' WHERE task_id = ? AND invalidated_at IS NULL",
+            (task_id,),
+        )
+    elif case in {"wrong_checkpoint_invocation", "missing_invocation"}:
+        row = engine.checkpoint_store.get_active(task_id)
+        payload = json.loads(row["context_data"])
+        payload["tool_invocation_id"] = "missing"
+        connection.execute(
+            "UPDATE task_checkpoints SET context_data = ? WHERE id = ?",
+            (json.dumps(payload), row["id"]),
+        )
+        if case == "missing_invocation":
+            invocation_id = "missing"
+    elif case == "wrong_plan":
+        connection.execute(
+            "UPDATE task_tool_invocations SET plan_fingerprint = 'other' WHERE invocation_id = ?",
+            (invocation_id,),
+        )
+    elif case == "wrong_tool":
+        connection.execute(
+            "UPDATE task_tool_invocations SET tool_name = 'other' WHERE invocation_id = ?",
+            (invocation_id,),
+        )
+    else:
+        monkeypatch.setattr(
+            engine.unit_of_work.tool_invocation_store, "resolve", lambda *_args: False
+        )
+    connection.commit()
+    with pytest.raises((ValueError, TransactionError), match=message):
+        engine.resolve_tool_invocation(
+            task_id, request["wait_token"], invocation_id, "owner", "completed", "proof"
+        )
+    connection.close()
 
 
 if __name__ == "__main__":

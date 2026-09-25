@@ -12,7 +12,7 @@ from harness.engine.context_builder import ContextBuilder
 from harness.engine.orchestrator import Orchestrator
 from harness.engine.result import EngineResult, ResultStatus, WaitReason
 from harness.engine.validator import Validator
-from harness.knowledge.decision_vault import DecisionVault
+from harness.knowledge.decision_vault import DecisionVault, UnsafeDecision
 from harness.storage.database import connect, initialize_database
 from harness.storage.factory import StoreFactory
 from harness.storage.project_store import ProjectStore
@@ -548,3 +548,68 @@ def test_malformed_vault_documents_are_skipped(tmp_path):
         documents = vault.project_documents(project_key)
         assert len(documents) == 1
         assert documents[0]["metadata"]["source_interaction_id"] == interaction_id
+
+
+def test_missing_outbox_source_is_blocked(tmp_path, monkeypatch):
+    db, root, interaction_id, _ = _queued_decision(tmp_path)
+    with connect(db) as connection:
+        vault = DecisionVault(connection, root)
+        monkeypatch.setattr(vault, "_source", lambda _id: None)
+        assert vault.publish_pending() == 0
+        row = connection.execute(
+            "SELECT status FROM vault_decision_outbox WHERE interaction_id = ?",
+            (interaction_id,),
+        ).fetchone()
+        assert row[0] == "blocked"
+
+
+def test_vault_claim_rolls_back_when_read_fails(tmp_path):
+    class FailingConnection:
+        def __init__(self):
+            self.rolled_back = False
+
+        def execute(self, sql, *_args):
+            if sql == "BEGIN IMMEDIATE":
+                return
+            raise OSError("read failed")
+
+        def rollback(self):
+            self.rolled_back = True
+
+    connection = FailingConnection()
+    vault = DecisionVault(connection, tmp_path)
+    with pytest.raises(OSError, match="read failed"):
+        vault._claim(set())
+    assert connection.rolled_back
+
+
+def test_vault_document_reader_rejects_unsafe_or_expired_notes(tmp_path, monkeypatch):
+    db, root, interaction_id, project_key = _queued_decision(tmp_path)
+    with connect(db) as connection:
+        vault = DecisionVault(connection, root)
+        with pytest.raises(UnsafeDecision, match="invalid project key"):
+            vault.project_documents("../outside")
+        assert vault.publish_pending() == 1
+        directory = root / "decisions" / "projects" / project_key
+        canonical = directory / f"{interaction_id}.md"
+        original = canonical.read_text(encoding="utf-8")
+        (directory / "not-reusable.md").write_text(
+            original.replace("reusable: true", "reusable: false"), encoding="utf-8"
+        )
+        (directory / "bad-date.md").write_text(
+            original.replace("status: active", "status: active\nvalid_until: bogus"),
+            encoding="utf-8",
+        )
+        unreadable = directory / "unreadable.md"
+        unreadable.write_text(original, encoding="utf-8")
+        read_text = Path.read_text
+
+        def read_or_fail(path, *args, **kwargs):
+            if path == unreadable:
+                raise OSError("simulated read failure")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_or_fail)
+        assert len(vault.project_documents(project_key)) == 1
+        assert vault.suggest(project_key, "!!!") == []
+        assert vault.for_task(-1) == []
