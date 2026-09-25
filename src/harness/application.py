@@ -9,6 +9,8 @@ from typing import Any
 
 from dotenv import dotenv_values
 
+from harness.agents.registry import AgentRegistry
+from harness.agents.runner import AgentRunner, OpenAIResponsesModel
 from harness.config import ConfigError, ExecutionConfig, PersistenceMode, load_config
 from harness.engine.context_builder import ContextBuilder
 from harness.engine.executor import Executor
@@ -18,6 +20,7 @@ from harness.engine.validator import Validator
 from harness.knowledge.decision_vault import DecisionVault
 from harness.security.secrets import default_secret_provider
 from harness.security.tool_policy import ToolSecurityPolicy
+from harness.storage.agent_store import AgentStore
 from harness.storage.database import connect, initialize_database
 from harness.storage.factory import StoreFactory
 from harness.storage.project_store import ProjectStore
@@ -87,18 +90,31 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
         allow_destructive=False,
         require_approval=True,
     )
+    secret_provider = default_secret_provider(
+        service_prefix=secret_settings.service_prefix,
+        account=secret_settings.account,
+        names=secret_settings.names,
+    )
+    agent_settings = raw["agents"]
+    agent_store = AgentStore(connection)
+    agent_runner = None
+    if agent_settings["enabled"]:
+        agent_runner = AgentRunner(
+            AgentRegistry(agent_settings["profiles"]),
+            agent_store,
+            registry,
+            OpenAIResponsesModel(secret_provider),
+        )
     orchestrator = Orchestrator(
         context_builder,
-        planner=Planner(),
+        planner=agent_runner or Planner(),
         executor=Executor(registry, policy),
         validator=Validator(),
         stores=stores,
         execution_config=execution,
-        secret_provider=default_secret_provider(
-            service_prefix=secret_settings.service_prefix,
-            account=secret_settings.account,
-            names=secret_settings.names,
-        ),
+        secret_provider=secret_provider,
+        agent_runner=agent_runner,
+        agent_store=agent_store,
     )
     orchestrator.decision_vault = decision_vault
     if decision_vault is not None:

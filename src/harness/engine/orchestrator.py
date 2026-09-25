@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from harness.agents.registry import AgentProfileError
 from harness.config import ConfigError, ExecutionConfig, HITLMode, PersistenceMode
 from harness.engine.context import ExecutionContext
 from harness.engine.context_builder import ContextBuilder
@@ -79,6 +80,8 @@ class Orchestrator:
         execution_config: ExecutionConfig | None = None,
         resume_lease_seconds: int = 300,
         secret_provider: Any | None = None,
+        agent_runner: Any | None = None,
+        agent_store: Any | None = None,
     ) -> None:
         if execution_config is not None:
             max_cycles = execution_config.max_cycles
@@ -108,6 +111,8 @@ class Orchestrator:
             self._validate_builder_stores(context_builder, stores)
             transaction_manager = stores.transaction_manager
         self.context_builder = context_builder
+        self.agent_runner = agent_runner
+        self.agent_store = agent_store
         self.hitl_mode = HITLMode(hitl_mode)
         self.planner = planner
         self.executor = executor or (Executor(tool_registry) if tool_registry else None)
@@ -196,11 +201,25 @@ class Orchestrator:
     def build_context(self, task_id: int) -> ExecutionContext:
         """Build the consistent context used by all engine stages."""
         context = self.context_builder.build(task_id)
+        if self.agent_runner is not None and isinstance(context, ExecutionContext):
+            bind = (
+                self.transaction_manager is not None
+                and self.transaction_manager.owner is not None
+            )
+            if bind:
+                with self.transaction_manager.atomic():
+                    self.agent_runner.scope(context, bind=True)
+            else:
+                self.agent_runner.scope(context)
         if self.transaction_manager is not None and isinstance(
             context, ExecutionContext
         ):
             context.hitl_mode = self.hitl_mode.value
-            context.ownership_guard = self._check_ownership
+            context.ownership_guard = (
+                (lambda: self._check_agent_ownership(context))
+                if self.agent_runner is not None
+                else self._check_ownership
+            )
             context.approval_checker = lambda step, tool: self._approval_allowed(
                 context, step, tool
             )
@@ -253,6 +272,13 @@ class Orchestrator:
             with self.transaction_manager.atomic():
                 pass
 
+    def _check_agent_ownership(self, context: ExecutionContext) -> None:
+        self._check_ownership()
+        try:
+            self.agent_runner.assert_bound(context)
+        except AgentProfileError as error:
+            raise TransactionError(str(error)) from error
+
     def _claim_task(self, task_id: int) -> bool | None:
         """Claim a ready task, or identify an already active concurrent run."""
         if self.task_store is None or not hasattr(self.task_store, "claim"):
@@ -294,6 +320,14 @@ class Orchestrator:
         _resume_cycles: int = 0,
     ) -> EngineResult:
         """Run a pipeline while retaining and releasing its fencing identity."""
+        if (
+            self.agent_store is not None
+            and self.agent_store.binding(task_id) is not None
+            and (terminal := self._terminal_resume_result(task_id))
+        ):
+            return terminal
+        if agent_block := self._agent_preflight(task_id):
+            return agent_block
         if (
             not _resume_claimed
             and _resume_plan is None
@@ -1981,6 +2015,8 @@ class Orchestrator:
         terminal = self._terminal_resume_result(task_id)
         if terminal is not None:
             return terminal
+        if agent_block := self._agent_preflight(task_id):
+            return agent_block
         get_active = getattr(self.checkpoint_store, "get_active", None)
         checkpoint = (
             get_active(task_id)
@@ -2124,6 +2160,20 @@ class Orchestrator:
             )
         if status in {"failed", "cancelled"}:
             return EngineResult.failure(f"Task is already {status}.")
+        return None
+
+    def _agent_preflight(self, task_id: int) -> EngineResult | None:
+        """Never continue a pinned agent task with another or disabled profile."""
+        if self.agent_store is None or self.agent_store.binding(task_id) is None:
+            return None
+        if self.agent_runner is None:
+            return EngineResult.waiting(
+                "Pinned agent execution is disabled.", WaitReason.MANUAL_REPLAN
+            )
+        context = self.build_context(task_id)
+        error = context.metadata.get("agent_error")
+        if error:
+            return EngineResult.waiting(error, WaitReason.MANUAL_REPLAN)
         return None
 
     def _resume_from_checkpoint(

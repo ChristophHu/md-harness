@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from harness.agents.registry import AgentProfile, AgentProfileError
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are invalid."""
@@ -154,4 +156,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
     )
     data["execution"] = settings
     data["secrets"] = secret_settings
+    agents = data.get("agents", {})
+    if not isinstance(agents, dict) or not isinstance(
+        agents.get("enabled", False), bool
+    ):
+        raise ConfigError("agents.enabled must be a boolean")
+    definitions = agents.get("profiles", [])
+    if not isinstance(definitions, list):
+        raise ConfigError("agents.profiles must be a list")
+    try:
+        profiles = [AgentProfile.from_mapping(item) for item in definitions]
+        if len({profile.name for profile in profiles}) != len(profiles):
+            raise AgentProfileError("duplicate agent profile name")
+    except (AgentProfileError, ValueError) as error:
+        raise ConfigError(str(error)) from error
+    if agents.get("enabled", False) and not profiles:
+        raise ConfigError("agents.enabled requires at least one profile")
+    data["agents"] = {"enabled": agents.get("enabled", False), "profiles": profiles}
     return data

@@ -32,13 +32,13 @@ def test_initialize_database_creates_parent_directory_and_file(tmp_path):
     assert path.exists()
 
 
-def test_current_schema_version_is_sixteen(tmp_path):
+def test_current_schema_version_is_eighteen(tmp_path):
     path = initialize_database(tmp_path / "harness.sqlite")
     with connect(path) as connection:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == CURRENT_SCHEMA_VERSION
-            == 17
+            == 18
         )
 
 
@@ -47,8 +47,8 @@ def test_resume_fencing_migration_upgrades_existing_database(tmp_path):
     with connect(path) as connection:
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         assert apply_migrations(connection, target=12) == 12
-        assert apply_migrations(connection) == 17
-        assert apply_migrations(connection) == 17
+        assert apply_migrations(connection) == 18
+        assert apply_migrations(connection) == 18
         task_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(tasks)")
         }

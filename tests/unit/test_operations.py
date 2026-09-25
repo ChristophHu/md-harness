@@ -224,7 +224,7 @@ def test_verify_backup_restores_database_and_rejects_missing_or_invalid(tmp_path
             connection.backup(destination)
     verified = verify_backup(backup)
     assert verified["ok"] is True
-    assert verified["schema_version"] == 17
+    assert verified["schema_version"] == 18
     assert verify_backup(tmp_path / "absent.sqlite")["error"] == "backup does not exist"
     broken = tmp_path / "broken.sqlite"
     broken.write_text("invalid")

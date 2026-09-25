@@ -70,5 +70,30 @@ properties:
           mode:
             type: string
             enum: [minimal, selective, interactive]
+  agents:
+    type: object
+    properties:
+      enabled:
+        type: boolean
+      profiles:
+        type: array
+        items:
+          type: object
+          required: [name, version, instructions, task_types, tools, model]
+          properties:
+            name: {type: string, minLength: 1}
+            version: {type: integer, minimum: 1}
+            instructions: {type: string, minLength: 1}
+            task_types:
+              type: array
+              items: {type: string, minLength: 1}
+              minItems: 1
+            tools:
+              type: array
+              items: {type: string, minLength: 1}
+              minItems: 1
+            model: {type: string, minLength: 1}
+            max_steps: {type: integer, minimum: 1}
+            enabled: {type: boolean}
   security:
     type: object

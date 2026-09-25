@@ -82,6 +82,7 @@ secrets:
   # account: christoph
   names:
     codex_api_key: CODEX_API_KEY
+    openai_api_key: OPENAI_API_KEY
     qdrant_api_key: QDRANT_API_KEY
     kanban_api_token: KANBAN_API_TOKEN
     github_token: GITHUB_TOKEN
@@ -93,6 +94,20 @@ execution:
   max_retries: 2
   max_cycles: 3
   persistence_mode: required
+
+# Opt in only after providing an API key and testing a profile in dry-run.
+agents:
+  enabled: false
+  profiles:
+    - name: developer
+      version: 1
+      instructions: >-
+        Plan small, verifiable repository changes. Use only the listed tools
+        and never request destructive or network operations.
+      task_types: [task]
+      tools: [filesystem, git, test_runner]
+      model: gpt-6-astra
+      max_steps: 8
 
 quality:
   enabled: true

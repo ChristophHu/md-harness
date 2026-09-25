@@ -310,6 +310,12 @@ class TaskStore:
         claim_token: str | None = None,
         lease_seconds: int = 300,
     ) -> int:
+        if agent is None:
+            binding = self.connection.execute(
+                "SELECT profile_name FROM agent_task_bindings WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            agent = binding["profile_name"] if binding is not None else None
         if claim_token is not None:
             self.assert_claim(task_id, claim_token)
         active = self.connection.execute(

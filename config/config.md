@@ -46,6 +46,26 @@ Bewusst persistenzfreier Modus. Der Orchestrator verwendet keine Persistenz. Die
 - `max_cycles`: maximale Anzahl von Planungs-, Ausführungs- und Validierungszyklen.
 - `hitl.mode`: `minimal` (Default, rückwärtskompatibel), `selective` oder `interactive`. Der Modus steuert optionale Planreviews und menschliche Rückfragen. Er schaltet weder verpflichtende Tool-Approvals noch statische Sicherheitsverbote ab.
 
+### Ausführende Task-Agenten
+
+`agents.enabled` aktiviert die profilgesteuerte Modellplanung für neue Tasks;
+die Vorgabe ist `false`. Ein Profil enthält `name`, positive `version`,
+`instructions`, `task_types`, eine Tool-Allowlist, `model` und ein positives
+`max_steps`. Profile werden in Listenreihenfolge für nicht explizit zugewiesene
+Tasks ausgewählt. Eine aktive `task_assignments`-Zuweisung übersteuert
+`tasks.assigned_agent`. Die gewählte Profilversion wird pro Task festgehalten.
+
+Bei aktivierter Schicht werden Aufgaben- und Vault-Inhalte an den konfigurierten
+Modellanbieter gesendet. Der Schlüssel kommt aus `secrets.names.openai_api_key`
+über Keychain bzw. Umgebung. Vor produktiver Aktivierung sollten ein
+geeignetes Profil, ein zugängliches Modell, Datenschutzeignung und der
+Approval-Prozess in `dry_run` geprüft werden. Effektbehaftete Agentenschritte
+benötigen zusätzlich eine konkrete Step-Freigabe. Die Tool-Policy bleibt
+verbindlich; ein Profil kann sie nicht abschwächen.
+
+Technische Details und Wiederanlauf-Verhalten stehen in
+`src/harness/agents/agents.md`.
+
 ## Empfehlung
 
 Für produktive Konfigurationen:
