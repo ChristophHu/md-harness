@@ -56,3 +56,39 @@ execution:
 ```
 
 Für Unit-Tests kann `disabled` oder `optional` verwendet werden. Die Anwendung muss den konfigurierten Wert beim Erzeugen des `Orchestrator` als `persistence_mode` weitergeben.
+
+## Unbeaufsichtigter Betrieb
+
+Der Abschnitt `operations` konfiguriert Diagnose, Recovery, Backups und – auf
+macOS – die ausdrücklich installierbaren LaunchAgents:
+
+```yaml
+operations:
+  stale_task_minutes: 30
+  outbox_pending_minutes: 15
+  backup_directory: backups
+  backup_keep: 7
+  recovery_limit: 25
+  auto_dispatch: false
+  launchd_label: com.mdharness.operations
+  maintenance_interval_seconds: 300
+  backup_hour: 2
+  backup_minute: 15
+  alerts:
+    provider: none
+    webhook_secret: operations_slack_webhook
+    state_file: ../state/alerts.json
+    cooldown_minutes: 60
+    escalation_minutes: 30
+    repeat_minutes: 240
+```
+
+`service install` installiert Maintenance und Backup in der Login-Domain des
+aktuellen macOS-Benutzers. Zeit-/Intervallwerte und Label werden vor dem
+Schreiben validiert. Die Installation startet **keine** freigegebenen Tasks:
+`auto_dispatch` bleibt unabhängig und standardmäßig `false`. Pro Datenbank und
+Job verhindert ein Betriebssystem-Lock überlappende Scheduler-Läufe. Siehe
+[`src/harness/storage/operations.md`](../src/harness/storage/operations.md)
+für Installation, Status, Entfernung, Logs und Alarmierung. Slack wird erst bei
+`operations.alerts.provider: slack` aktiviert; das Webhook-Secret muss im
+Keychain oder über das zugeordnete Environment verfügbar sein.

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -8,6 +9,159 @@ from harness.storage.transaction import (
     TransactionError,
     TransactionManager,
 )
+
+
+def _orphaned_work(tmp_path, *, status="planning"):
+    from harness.storage.database import connect, initialize_database
+    from harness.storage.factory import StoreFactory
+    from harness.storage.project_store import ProjectStore
+
+    connection = connect(initialize_database(tmp_path / "orphan.sqlite"))
+    stores = StoreFactory.create(connection)
+    project_id = ProjectStore(connection).create("project", str(tmp_path))
+    task_id = stores.task_store.create("task", project_id=project_id)
+    stores.task_store.transition(task_id, "ready")
+    stores.task_store.approve(task_id, "test")
+    stores.task_store.transition(task_id, status)
+    attempt_id = stores.task_store.record_attempt(task_id, "running")
+    connection.execute(
+        "UPDATE tasks SET claim_token = 'expired', claim_expires_at = '2000-01-01' WHERE id = ?",
+        (task_id,),
+    )
+    connection.commit()
+    work = EngineUnitOfWork(
+        stores.transaction_manager,
+        stores.task_store,
+        stores.event_store,
+        stores.artifact_store,
+        stores.checkpoint_store,
+    )
+    return connection, stores, work, task_id, attempt_id
+
+
+def test_claim_orphaned_run_takes_over_only_after_fencing_old_attempt(tmp_path):
+    connection, stores, work, task_id, attempt_id = _orphaned_work(tmp_path)
+    assert work.claim_orphaned_run(task_id, "new-owner", 23) is True
+    task = stores.task_store.get(task_id)
+    assert task["claim_token"] == "new-owner"
+    assert task["execution_epoch"] == 1
+    assert stores.task_store.attempts(task_id)[0]["status"] == "failed"
+    assert work.manager.owner.token == "new-owner"
+    event = stores.event_store.list_for_task(task_id)[0]
+    assert event["event_type"] == "task.recovery.claimed"
+    assert json.loads(event["payload"]) == {
+        "previous_status": "planning",
+        "interrupted_attempts": 1,
+    }
+    assert attempt_id == stores.task_store.attempts(task_id)[0]["id"]
+    connection.close()
+
+
+def test_claim_orphaned_run_rejects_invalid_or_ineligible_tasks(tmp_path):
+    from harness.storage.database import connect, initialize_database
+    from harness.storage.factory import StoreFactory
+
+    connection = connect(initialize_database(tmp_path / "ineligible.sqlite"))
+    stores = StoreFactory.create(connection)
+    work = EngineUnitOfWork(
+        stores.transaction_manager,
+        stores.task_store,
+        stores.event_store,
+        stores.artifact_store,
+        stores.checkpoint_store,
+    )
+    assert work.claim_orphaned_run(1, "token") is False
+    project_id = connection.execute(
+        "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')"
+    ).lastrowid
+    task_id = stores.task_store.create("ready", project_id=project_id)
+    assert work.claim_orphaned_run(task_id, "token") is False
+    stores.task_store.transition(task_id, "ready")
+    stores.task_store.approve(task_id, "test")
+    stores.task_store.transition(task_id, "planning")
+    connection.execute(
+        "UPDATE tasks SET claim_token = 'live', claim_expires_at = '2999-01-01' WHERE id = ?",
+        (task_id,),
+    )
+    connection.commit()
+    assert work.claim_orphaned_run(task_id, "token") is False
+    connection.execute(
+        "UPDATE tasks SET claim_token = 'expired', claim_expires_at = '2000-01-01' WHERE id = ?",
+        (task_id,),
+    )
+    stores.checkpoint_store.save(task_id, "executing", "validate")
+    connection.commit()
+    assert work.claim_orphaned_run(task_id, "token") is False
+    assert (
+        EngineUnitOfWork(
+            stores.transaction_manager,
+            stores.task_store,
+            stores.event_store,
+            stores.artifact_store,
+        ).claim_orphaned_run(task_id, "token")
+        is False
+    )
+    assert work.claim_orphaned_run(task_id, "token", 0) is False
+    assert (
+        EngineUnitOfWork(
+            stores.transaction_manager,
+            stores.task_store,
+            stores.event_store,
+            stores.artifact_store,
+            None,
+        ).claim_orphaned_run(task_id, "token", 0)
+        is False
+    )
+    connection.close()
+
+
+def test_claim_orphaned_run_refuses_tool_effect_history(tmp_path):
+    connection, _stores, work, task_id, _attempt_id = _orphaned_work(tmp_path)
+    connection.execute(
+        """INSERT INTO task_tool_invocations
+           (invocation_id, task_id, plan_fingerprint, plan_version, step_id,
+            tool_name, arguments_fingerprint, permission_scope, status)
+           VALUES ('invocation', ?, 'plan', 1, 'step', 'git', 'args', 'network', 'completed')""",
+        (task_id,),
+    )
+    connection.commit()
+    assert work.claim_orphaned_run(task_id, "new-owner") is False
+    connection.close()
+
+
+def test_claim_orphaned_run_rejects_legacy_or_raced_claims(tmp_path):
+    connection, stores, work, task_id, _attempt_id = _orphaned_work(tmp_path)
+    work.task_store.get = lambda _task_id: {
+        "status": "planning",
+        "claim_token": None,
+        "claim_expires_at": None,
+    }
+    assert work.claim_orphaned_run(task_id, "no-epoch") is False
+
+    work.task_store.get = stores.task_store.get
+    work.checkpoint_store = Store(connection)
+    assert work.claim_orphaned_run(task_id, "no-checkpoint-reader") is False
+    work.checkpoint_store = stores.checkpoint_store
+    work.manager.connection.execute(
+        """CREATE TRIGGER ignore_claim BEFORE UPDATE OF claim_token ON tasks
+           BEGIN SELECT RAISE(IGNORE); END"""
+    )
+    assert work.claim_orphaned_run(task_id, "raced") is False
+    connection.close()
+
+
+def test_claim_orphaned_run_fails_if_atomic_claim_loses_race(tmp_path):
+    connection, _stores, work, task_id, _attempt_id = _orphaned_work(tmp_path)
+    work.manager.connection.execute(
+        """CREATE TRIGGER replace_claim BEFORE UPDATE OF claim_token ON tasks
+           BEGIN
+             UPDATE tasks SET claim_token = 'other', claim_expires_at = '2999-01-01'
+             WHERE id = NEW.id;
+             SELECT RAISE(IGNORE);
+           END"""
+    )
+    assert work.claim_orphaned_run(task_id, "raced") is False
+    connection.close()
 
 
 class Store:

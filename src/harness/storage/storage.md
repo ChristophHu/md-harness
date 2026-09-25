@@ -17,6 +17,7 @@ Der Vault bleibt die Quelle für menschlich gepflegtes Wissen. SQLite ist dagege
 ## Inhalt
 
 - `database.py`: Verbindungen, Schema-Laden, Migrationen, Transaktionen, Healthcheck, Schema-Versionierung und Backup/Wiederherstellung
+- `operations.py`: read-only Betriebsdiagnose, Outbox-/Claim-Metriken und verifizierte Backup-/Restore-Abläufe
 - `schema.sql`: vollständiges, idempotentes Initialschema mit Tabellen, Indizes und Triggern
 - `project_store.py`: Projekte anlegen, laden und auflisten
 - `task_store.py`: Aufgaben, Aktualisierungen, Statuswechsel, Freigaben, Abhängigkeiten, Akzeptanz- und Testkriterien sowie Agentenversuche
@@ -108,6 +109,10 @@ Transaktionen werden über `database.transaction()` ausgeführt. Bei einem SQLit
 
 `backup_database()` erzeugt ein SQLite-Backup über die Online-Backup-API. `restore_database()` stellt ein Backup in einer Zieldatei wieder her. `healthcheck()` prüft die Datenbank mit SQLite `quick_check()`.
 
+Die CLI-Befehle `doctor`, `backup`, `verify-backup` und `restore-backup` samt
+Schwellenwerten, Exit-Codes, Rotation und Recovery-Runbook sind in
+[`operations.md`](operations.md) beschrieben.
+
 ## Tests
 
 Die Storage-Schicht wird durch `tests/unit/test_storage_stores.py` und `tests/unit/test_database.py` geprüft. Reproduzierbare Beispieldaten liegen in `tests/fixtures/sqlite_seed.sql`. Sie enthalten ein Hauptprojekt mit Unterprojekt, vier hierarchische Tasks, eine Abhängigkeit, Akzeptanz- und Testkriterien, einen Agenten, eine Zuweisung, eine Freigabe und ein Event.
@@ -130,8 +135,11 @@ Die bisherige lokale Datenbankstruktur gilt für diese Modellversion als verworf
 Planversion, Attempt, Grund, `next_step_id`, `completed_step_ids`,
 `plan_fingerprint` und optionalem Plan-Payload. `retry_execution` kann damit
 denselben Plan wiederherstellen und abgeschlossene Schritte überspringen.
-Die vollständige phasengenaue Resume-Semantik ist noch nicht abgeschlossen;
-offene Punkte stehen in `RESUME_TODO.md`.
+Resume speichert den phasengenauen Einstiegspunkt sowie Plan und Fortschritt.
+`harness maintenance` übernimmt im Einzelhost-Betrieb nur verwaiste aktive
+Tasks mit abgelaufenem oder fehlendem Claim; es umgeht weder Fencing noch
+Checkpoints. Details zu Schwellenwerten und Recovery stehen in
+[`operations.md`](operations.md).
 
 Für konkurrierende Läufe bietet `TaskStore.claim(task_id, run_id=...)` einen
 atomaren Claim mit Lease für freigegebene Tasks in aktiven Stati. Claims können

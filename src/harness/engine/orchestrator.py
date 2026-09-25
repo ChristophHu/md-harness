@@ -361,8 +361,11 @@ class Orchestrator:
             attempt_id = None
             if action is NextAction.REPLAN:
                 if self.unit_of_work is not None:
-                    if claimed:
+                    if claimed or _resume_claimed:
                         with self.unit_of_work.phase():
+                            task = self.task_store.get(task_id)
+                            if task is not None and task["status"] != "planning":
+                                self.task_store.transition(task_id, "planning")
                             attempt_id = self.task_store.record_attempt(
                                 task_id, "running"
                             )
@@ -1987,6 +1990,31 @@ class Orchestrator:
             else None
         )
         if checkpoint is None:
+            task = self.task_store.get(task_id) if self.task_store is not None else None
+            if (
+                task is not None
+                and task["status"] in {"planning", "executing", "validating"}
+                and self.unit_of_work is not None
+                and self.transaction_manager is not None
+            ):
+                token = str(uuid4())
+                recover = getattr(self.unit_of_work, "claim_orphaned_run", None)
+                if recover is None or not recover(task_id, token):
+                    return EngineResult.waiting(
+                        "Abandoned run cannot be recovered safely without a checkpoint."
+                    )
+                try:
+                    return self.run(task_id, _resume_claimed=True)
+                finally:
+                    owner = self.transaction_manager.owner
+                    if (
+                        owner is not None
+                        and owner.task_id == task_id
+                        and owner.token == token
+                    ):
+                        self.transaction_manager.owner = None
+                        with self.transaction_manager.atomic(fenced=False):
+                            self.task_store.release_claim(task_id, token)
             return self.run(task_id)
         try:
             next_action = checkpoint["next_action"]

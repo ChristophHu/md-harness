@@ -286,14 +286,15 @@ Ausführungsfehler werden als `ExecutionError` mit einem stabilen `ExecutionErro
 
 Der Orchestrator wertet `ExecutionResult.next_action` nach jeder Ausführung aus. `validate` ruft den Validator auf, `retry_execution` wiederholt die Ausführung mit demselben Plan, `replan` startet die Planung mit aktualisiertem Kontext erneut, `wait` beendet den Lauf im Status `waiting` und `stop` beendet ihn erfolgreich im Status `done`. Jede Entscheidung wird als `task.execution.next_action` persistiert.
 
-Bei `wait` persistiert der `CheckpointStore` Phase, nächste Aktion, Attempt-ID,
-Planversion, Grund, nächsten Schritt, abgeschlossene Schritte und optional den
-serialisierten Plan. `resume()` markiert den Checkpoint als wieder aufgenommen
-und erzeugt ein `task.resumed`-Event. Ein gespeicherter Plan kann für
-`retry_execution` wiederhergestellt werden; bereits abgeschlossene Schritte
-werden übersprungen. Ein separater Dispatcher für `validate` und `replan`, echte
-Workspace-Hash-Idempotenz, vollständige Claim-/Attempt-Recovery und getrennte
-Prozessabbruch-E2E-Tests sind noch offen und in `RESUME_TODO.md` dokumentiert.
+Checkpoints halten Phase, Folgeaktion, Attempt-ID, Planversion, Grund,
+Fortschritt, Ergebnisse und – soweit erforderlich – den serialisierten Plan.
+Resume-Claim, Task-/Attempt-Zustand und `task.resumed`-Event werden atomar
+gebunden; Fencing schützt spätere Harness-Schreibvorgänge. Der Resume-Dispatcher
+behandelt `validate`, `replan`, `retry_execution` und typisierte WAIT-Gründe.
+Prozessabbruch und Wiederanlauf sind durch Integrationstests abgedeckt. Für den
+regelmäßigen Einzelhost-Betrieb übernimmt `harness maintenance` ausschließlich
+alte aktive Läufe ohne gültigen Claim; gewöhnliche menschliche WAITs werden
+nicht automatisch aufgelöst.
 
 Unbekannte `next_action`-Werte werden als `invalid_next_action` klassifiziert. Der aktuelle Attempt und Task werden auf `failed` gesetzt; zusätzlich werden `task.execution.invalid_next_action` beziehungsweise `task.validation.invalid_next_action` sowie `task.failed` persistiert.
 
@@ -571,9 +572,11 @@ Der Planner erhält den letzten Plan, die letzte Validierung und strukturierte
 Replanning-Gründe. Die Planversion wird erhöht; der alte und der neue Plan
 bleiben als Events nachvollziehbar.
 
-Diese Pfade sind noch nicht vollständig gegen Taskstatus, Planversion,
-Workspace und Attempt-Zuordnung validiert. Der feste Lease wird während eines
-langen Laufs nicht erneuert und verhindert daher nicht, dass nach Ablauf ein
-zweiter Worker übernimmt. Cancellation invalidiert zwar den Checkpoint, stellt
-aber noch kein Fencing gegen Schreibvorgänge eines bereits laufenden Resumers
-bereit. Weitere offene Punkte und Recovery-Arbeit stehen in `RESUME_TODO.md`.
+Resume prüft Taskstatus, Checkpoint-Revision, Folgeaktion und Attempt-Zuordnung.
+Claims werden während langer Stages erneuert; Takeover und Cancel erhöhen die
+Fencing-Epoche und veraltete Worker dürfen keine späteren Harness-Schreibvorgänge
+commiten. Das kann einen bereits gestarteten externen Tool-Aufruf nicht
+zurückrollen. Bleibt dessen Ausgang unklar, greift die beschriebene
+Tool-Reconciliation statt eines automatischen Retry. Betriebsdiagnose,
+periodische Recovery, Backup und Restore sind im
+[`storage/operations.md`](../storage/operations.md) beschrieben.

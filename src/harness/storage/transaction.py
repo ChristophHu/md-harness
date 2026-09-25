@@ -375,6 +375,73 @@ class EngineUnitOfWork:
         self.manager.owner = owner
         return True
 
+    def claim_orphaned_run(
+        self, task_id: int, token: str, lease_seconds: int = 300
+    ) -> bool:
+        """Take over an expired active run that has no checkpoint or tool effects."""
+        if self.checkpoint_store is None or lease_seconds < 1:
+            return False
+        owner: ExecutionOwner | None = None
+        with self.manager.atomic(fenced=False):
+            task = self.task_store.get(task_id)
+            if task is None or task["status"] not in {
+                "planning",
+                "executing",
+                "validating",
+            }:
+                return False
+            get_active = getattr(self.checkpoint_store, "get_active", None)
+            if get_active is None or get_active(task_id) is not None:
+                return False
+            # Without the persisted plan, a tool journal cannot prove safe progress.
+            if self.tool_invocation_store.has_for_task(task_id):
+                return False
+            now = datetime.now(UTC)
+            current = now.strftime("%Y-%m-%d %H:%M:%S")
+            if (
+                task["claim_token"] is not None
+                and task["claim_expires_at"] is not None
+                and task["claim_expires_at"] >= current
+            ):
+                return False
+            expires = (now + timedelta(seconds=lease_seconds)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            columns = set(task.keys())
+            if "execution_epoch" not in columns:
+                return False
+            epoch = int(task["execution_epoch"])
+            cursor = self.manager.connection.execute(
+                """UPDATE tasks SET claim_token = ?, claimed_at = CURRENT_TIMESTAMP,
+                   claim_expires_at = ?, execution_epoch = execution_epoch + 1
+                   WHERE id = ? AND execution_epoch = ?
+                   AND status IN ('planning', 'executing', 'validating')
+                   AND (claim_token IS NULL OR claim_expires_at IS NULL
+                        OR claim_expires_at < ?)""",
+                (token, expires, task_id, epoch, current),
+            )
+            if cursor.rowcount != 1:
+                return False
+            interrupted = self.manager.connection.execute(
+                """UPDATE task_attempts SET status = 'failed',
+                   completed_at = CURRENT_TIMESTAMP,
+                   error_message = 'process interrupted before checkpoint'
+                   WHERE task_id = ? AND status = 'running'
+                   AND completed_at IS NULL""",
+                (task_id,),
+            ).rowcount
+            self.event_store.record(
+                task_id,
+                "task.recovery.claimed",
+                {
+                    "previous_status": task["status"],
+                    "interrupted_attempts": interrupted,
+                },
+            )
+            owner = ExecutionOwner(task_id, token, epoch + 1, lease_seconds)
+        self.manager.owner = owner
+        return True
+
     def release_resume_lease(self, task_id: int, token: str) -> bool:
         """Release a lease after the resumed workflow returns."""
         if self.checkpoint_store is None:

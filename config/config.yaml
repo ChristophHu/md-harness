@@ -1,7 +1,7 @@
 project:
   name: md-harness
-  specification_dir: .
-  workspace_dir: .
+  specification_dir: ..
+  workspace_dir: ..
 
 git:
   repository_name: md-harness
@@ -26,7 +26,26 @@ git:
       - coverage
 
 storage:
-  database: state/harness.sqlite
+  database: ../state/harness.sqlite
+
+operations:
+  stale_task_minutes: 30
+  outbox_pending_minutes: 15
+  backup_directory: ../backups
+  backup_keep: 7
+  recovery_limit: 25
+  auto_dispatch: false
+  launchd_label: com.mdharness.operations
+  maintenance_interval_seconds: 300
+  backup_hour: 2
+  backup_minute: 15
+  alerts:
+    provider: none
+    webhook_secret: operations_slack_webhook
+    state_file: ../state/alerts.json
+    cooldown_minutes: 60
+    escalation_minutes: 30
+    repeat_minutes: 240
 
 knowledge:
   sources:
@@ -49,6 +68,7 @@ secrets:
     qdrant_api_key: QDRANT_API_KEY
     kanban_api_token: KANBAN_API_TOKEN
     github_token: GITHUB_TOKEN
+    operations_slack_webhook: HARNESS_SLACK_WEBHOOK
 
 execution:
   dry_run: true

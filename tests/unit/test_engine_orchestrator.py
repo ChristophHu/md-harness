@@ -1560,6 +1560,93 @@ def test_resume_without_checkpoint_falls_back_to_run():
     assert orchestrator.resume(1).message == "replanned"
 
 
+def test_resume_recovers_expired_active_run_without_checkpoint(tmp_path):
+    from harness.config import ExecutionConfig
+    from harness.engine.context_builder import ContextBuilder
+    from harness.engine.executor import Executor
+    from harness.engine.validator import Validator
+    from harness.security.tool_policy import ToolSecurityPolicy
+    from harness.storage.database import connect, initialize_database
+    from harness.storage.factory import StoreFactory
+    from harness.storage.project_store import ProjectStore
+    from harness.tools.base import ToolRegistry
+
+    connection = connect(initialize_database(tmp_path / "orphan-resume.sqlite"))
+    stores = StoreFactory.create(connection, tmp_path)
+    projects = ProjectStore(connection)
+    project_id = projects.create("project", str(tmp_path))
+    task_id = stores.task_store.create("orphan", project_id=project_id)
+    stores.task_store.transition(task_id, "ready")
+    stores.task_store.approve(task_id, "test")
+    stores.task_store.transition(task_id, "planning")
+    stores.task_store.record_attempt(task_id, "running")
+    connection.execute(
+        "UPDATE tasks SET claim_token = 'expired', claim_expires_at = '2000-01-01' WHERE id = ?",
+        (task_id,),
+    )
+    connection.commit()
+    registry = ToolRegistry()
+
+    class Planner:
+        def plan(self, _context):
+            return EngineResult.success("planned", plan=ExecutionPlan("recovered"))
+
+    builder = ContextBuilder.from_stores(stores, projects, tool_registry=registry)
+    engine = Orchestrator(
+        builder,
+        planner=Planner(),
+        executor=Executor(registry, ToolSecurityPolicy(require_approval=False)),
+        validator=Validator(),
+        stores=stores,
+        execution_config=ExecutionConfig(persistence_mode="required"),
+    )
+
+    result = engine.resume(task_id)
+
+    assert result.successful is True
+    assert stores.task_store.get(task_id)["status"] == "done"
+    assert stores.task_store.attempts(task_id)[0]["status"] == "failed"
+    assert stores.task_store.get(task_id)["claim_token"] is None
+    event_types = [
+        event["event_type"] for event in stores.event_store.list_for_task(task_id)
+    ]
+    assert event_types[0] == "task.recovery.claimed"
+    assert event_types[-1] == "task.done"
+    connection.close()
+
+
+def test_resume_refuses_active_run_without_checkpoint_when_claim_is_live(tmp_path):
+    from harness.engine.context_builder import ContextBuilder
+    from harness.storage.database import connect, initialize_database
+    from harness.storage.factory import StoreFactory
+    from harness.storage.project_store import ProjectStore
+
+    connection = connect(initialize_database(tmp_path / "live-orphan.sqlite"))
+    stores = StoreFactory.create(connection, tmp_path)
+    projects = ProjectStore(connection)
+    project_id = projects.create("project", str(tmp_path))
+    task_id = stores.task_store.create("active", project_id=project_id)
+    stores.task_store.transition(task_id, "ready")
+    stores.task_store.approve(task_id, "test")
+    stores.task_store.transition(task_id, "planning")
+    connection.execute(
+        "UPDATE tasks SET claim_token = 'live', claim_expires_at = '2999-01-01' WHERE id = ?",
+        (task_id,),
+    )
+    connection.commit()
+    engine = Orchestrator(ContextBuilder.from_stores(stores, projects), stores=stores)
+    engine.run = lambda *_args, **_kwargs: pytest.fail(
+        "live run must not be taken over"
+    )
+
+    result = engine.resume(task_id)
+
+    assert result.status is ResultStatus.WAITING
+    assert "cannot be recovered safely" in result.message
+    assert stores.task_store.get(task_id)["claim_token"] == "live"
+    connection.close()
+
+
 @pytest.mark.parametrize("status", ["done", "failed", "cancelled"])
 def test_resume_does_not_run_terminal_task(status):
     class Tasks:

@@ -7,6 +7,60 @@ properties:
     type: object
   storage:
     type: object
+  operations:
+    type: object
+    properties:
+      stale_task_minutes:
+        type: integer
+        minimum: 1
+      outbox_pending_minutes:
+        type: integer
+        minimum: 1
+      backup_directory:
+        type: string
+      backup_keep:
+        type: integer
+        minimum: 1
+      recovery_limit:
+        type: integer
+        minimum: 1
+      auto_dispatch:
+        type: boolean
+      launchd_label:
+        type: string
+        minLength: 1
+      maintenance_interval_seconds:
+        type: integer
+        minimum: 60
+      backup_hour:
+        type: integer
+        minimum: 0
+        maximum: 23
+      backup_minute:
+        type: integer
+        minimum: 0
+        maximum: 59
+      alerts:
+        type: object
+        properties:
+          provider:
+            type: string
+            enum: [none, slack]
+          webhook_secret:
+            type: string
+            minLength: 1
+          state_file:
+            type: string
+            minLength: 1
+          cooldown_minutes:
+            type: integer
+            minimum: 1
+          escalation_minutes:
+            type: integer
+            minimum: 1
+          repeat_minutes:
+            type: integer
+            minimum: 1
   execution:
     type: object
     properties:
