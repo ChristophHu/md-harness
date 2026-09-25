@@ -4,9 +4,118 @@ from contextlib import nullcontext
 
 import pytest
 
-from harness.cli import main
+from harness.cli import _offsite, _operation_path, main
 from harness.config import ConfigError
 from harness.storage.database import connect, initialize_database
+
+
+def test_offsite_cli_backup_drill_and_doctor(tmp_path, monkeypatch, capsys):
+    class MemoryStore:
+        def __init__(self):
+            self.files = {}
+
+        def upload(self, name, source):
+            self.files[name] = source.read_bytes()
+
+        def download(self, name, destination):
+            destination.write_bytes(self.files[name])
+
+    database = initialize_database(tmp_path / "db.sqlite")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "decision.md").write_text("decision")
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "storage:\n  database: db.sqlite\noperations:\n"
+        "  backup_directory: backups\n  offsite:\n"
+        "    provider: ssh\n    target: backup@host\n    directory: /backups\n"
+        "    receipt_file: receipt.json\n    drill_file: drill.json\n"
+        "    includes:\n      vault: vault\n"
+        "secrets:\n  names:\n    backup_encryption_key: TEST_BACKUP_KEY\n"
+    )
+    import base64
+    import os
+
+    monkeypatch.setenv("TEST_BACKUP_KEY", base64.b64encode(os.urandom(32)).decode())
+    store = MemoryStore()
+    monkeypatch.setattr("harness.cli.SSHStore", lambda *args: store)
+    monkeypatch.setattr("sys.argv", ["harness", "--config", str(config), "backup"])
+    main()
+    assert (
+        json.loads(capsys.readouterr().out)["offsite"]["proof"]["verified_files"] == 2
+    )
+    monkeypatch.setattr(
+        "sys.argv", ["harness", "--config", str(config), "restore-drill"]
+    )
+    main()
+    assert json.loads(capsys.readouterr().out)["verified_files"] == 2
+    restored = tmp_path / "restored"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["harness", "--config", str(config), "restore-offsite", str(restored)],
+    )
+    main()
+    assert json.loads(capsys.readouterr().out)["restored_path"] == str(restored)
+    monkeypatch.setattr("sys.argv", ["harness", "--config", str(config), "doctor"])
+    main()
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ok"
+    assert {item["name"] for item in report["checks"]} >= {
+        "offsite_backup_fresh",
+        "restore_drill_fresh",
+    }
+    assert database.exists()
+
+
+def test_offsite_configuration_errors_and_drill_lock(tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    from harness.config import SecretConfig
+    from harness.storage.offsite_backup import BackupError
+
+    config = {"_config_path": str(tmp_path / "config.yaml"), "secrets": SecretConfig()}
+    assert _offsite(config) is None
+    assert _operation_path(config, "relative").parent == tmp_path
+    assert _operation_path(config, str(tmp_path / "absolute")) == tmp_path / "absolute"
+    config["operations"] = {"offsite": {"provider": "invalid"}}
+    with pytest.raises(BackupError, match="provider"):
+        _offsite(config)
+    config["operations"]["offsite"] = {
+        "provider": "ssh",
+        "target": "backup@host",
+        "directory": "/backups",
+        "includes": [],
+    }
+    monkeypatch.setenv("backup_encryption_key", "key")
+    with pytest.raises(BackupError, match="includes"):
+        _offsite(config)
+    config["operations"]["offsite"]["includes"] = {"bad": None}
+    with pytest.raises(BackupError, match="includes"):
+        _offsite(config)
+
+    database = initialize_database(tmp_path / "db.sqlite")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("storage:\n  database: db.sqlite\n")
+    monkeypatch.setattr(
+        "sys.argv", ["harness", "--config", str(config_file), "restore-drill"]
+    )
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 1
+    assert "not configured" in capsys.readouterr().out
+
+    @contextmanager
+    def locked(*args):
+        yield False
+
+    monkeypatch.setattr(
+        "harness.cli._offsite",
+        lambda _: (object(), "key", tmp_path / "receipt", tmp_path / "drill", {}),
+    )
+    monkeypatch.setattr("harness.cli.process_lock", locked)
+    main()
+    assert json.loads(capsys.readouterr().out)["skipped"] is True
+    assert database.exists()
 
 
 def test_cli_prints_help(monkeypatch, capsys):

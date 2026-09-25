@@ -50,6 +50,10 @@ class OperationsThresholds:
 
     stale_task_minutes: int = 30
     outbox_pending_minutes: int = 15
+    backup_receipt: Path | None = None
+    drill_receipt: Path | None = None
+    backup_max_age_minutes: int = 120
+    drill_max_age_days: int = 8
 
     def __post_init__(self) -> None:
         if type(self.stale_task_minutes) is not int or self.stale_task_minutes < 1:
@@ -59,6 +63,13 @@ class OperationsThresholds:
             or self.outbox_pending_minutes < 1
         ):
             raise ValueError("outbox_pending_minutes must be positive")
+        if (
+            type(self.backup_max_age_minutes) is not int
+            or self.backup_max_age_minutes < 1
+        ):
+            raise ValueError("backup_max_age_minutes must be positive")
+        if type(self.drill_max_age_days) is not int or self.drill_max_age_days < 1:
+            raise ValueError("drill_max_age_days must be positive")
 
 
 def database_path_from_config(config_path: str | Path) -> Path:
@@ -181,6 +192,25 @@ def inspect_database(
         checks.append(_check("database_access", False, str(error), severity="critical"))
         metrics["database_path"] = str(path)
 
+    if thresholds.backup_receipt is not None:
+        checks.append(
+            _receipt_check(
+                "offsite_backup_fresh",
+                thresholds.backup_receipt,
+                "created_at",
+                thresholds.backup_max_age_minutes * 60,
+            )
+        )
+    if thresholds.drill_receipt is not None:
+        checks.append(
+            _receipt_check(
+                "restore_drill_fresh",
+                thresholds.drill_receipt,
+                "completed_at",
+                thresholds.drill_max_age_days * 86400,
+            )
+        )
+
     status = (
         "critical"
         if any(check["severity"] == "critical" and not check["ok"] for check in checks)
@@ -194,6 +224,25 @@ def inspect_database(
         "checks": checks,
         "metrics": metrics,
     }
+
+
+def _receipt_check(
+    name: str, path: Path, field: str, max_age_seconds: int
+) -> dict[str, Any]:
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        timestamp = datetime.fromisoformat(receipt[field])
+        if timestamp.tzinfo is None:
+            raise ValueError("receipt timestamp has no timezone")
+        age = (datetime.now(UTC) - timestamp).total_seconds()
+        return _check(
+            name,
+            0 <= age <= max_age_seconds,
+            {"age_seconds": round(age)},
+            severity="critical",
+        )
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return _check(name, False, "receipt missing or invalid", severity="critical")
 
 
 def stale_task_ids(
@@ -348,6 +397,7 @@ def create_verified_backup(
     destination = directory / f"harness-{stamp}.sqlite"
     try:
         backup_database(source, destination)
+        destination.chmod(0o600)
         verification = verify_backup(destination)
         if not verification["ok"]:
             raise sqlite3.DatabaseError(f"backup verification failed: {verification}")

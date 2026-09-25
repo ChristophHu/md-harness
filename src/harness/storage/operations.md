@@ -25,8 +25,8 @@ operations:
   auto_dispatch: false
   launchd_label: com.mdharness.operations
   maintenance_interval_seconds: 300
-  backup_hour: 2
-  backup_minute: 15
+  backup_interval_seconds: 3600
+  restore_drill_interval_seconds: 604800
 ```
 
 `doctor` ist strikt read-only. `maintenance` darf verwaiste aktive Läufe
@@ -105,7 +105,7 @@ Incident-Management.
 ### macOS LaunchAgent aktivieren
 
 Die Anwendung installiert keinen Scheduler automatisch. Auf macOS kann der
-Betreiber zwei benutzerspezifische LaunchAgents ausdrücklich verwalten:
+Betreiber benutzerspezifische LaunchAgents ausdrücklich verwalten:
 
 ```bash
 harness --config /absolut/pfad/config.yaml doctor
@@ -115,14 +115,21 @@ harness --config /absolut/pfad/config.yaml service uninstall
 ```
 
 `install` legt Agents für Maintenance und Alarmprüfung (standardmäßig alle
-300 Sekunden) sowie tägliche Backups um 02:15 Uhr in `~/Library/LaunchAgents`
+300 Sekunden) sowie Backups im konfigurierten Intervall in `~/Library/LaunchAgents`
 an und lädt sie in die aktuelle GUI-Login-Domain. Logs stehen im `logs/`-Verzeichnis
-neben der Konfiguration. Wiederholtes Installieren ersetzt nur die beiden
+neben der Konfiguration. Wiederholtes Installieren ersetzt nur die verwalteten
 Agents mit dem konfigurierten `launchd_label`; `uninstall` entfernt ebenfalls
 ausschließlich diese Agents. Der aktuelle Benutzer muss angemeldet sein.
+Bei aktiviertem SSH-Offsite-Backup kommt ein wöchentlicher
+`restore-drill`-Agent hinzu. Ohne `backup_interval_seconds` bleibt die bisherige
+Kalenderzeit `backup_hour`/`backup_minute` erhalten.
+Vor der Installation mit `provider: ssh` sind **ein manueller Backup- und
+Restore-Drill-Lauf** nötig: `service install` verweigert bei fehlenden
+Offsite-/Drill-Belegen den kritischen Doctor-Zustand. Die erste Ausführung des
+wöchentlichen Agents erfolgt nicht sofort beim Installieren.
 Konfiguration und Python-Umgebung müssen am eingetragenen absoluten Pfad
 verfügbar bleiben.
-Schlägt das Laden eines der beiden Agents fehl, werden die beiden verwalteten
+Schlägt das Laden eines Agents fehl, werden die verwalteten
 Plists entfernt und beide Labels entladen; die CLI meldet den Fehler, statt eine
 scheinbar erfolgreiche Teilinstallation zurückzulassen. Danach kann der
 Betreiber `service status` und `service install` erneut ausführen.
@@ -146,6 +153,9 @@ Restore in eine temporäre Datei geprüft. Die Prüfung kontrolliert SQLite
 `harness-<UTC-Zeitstempel>.sqlite` abgelegt beziehungsweise die Rotation
 ausgeführt. Es werden ausschließlich passende `harness-*.sqlite`-Dateien im
 konfigurierten Backup-Verzeichnis rotiert; andere Dateien bleiben unberührt.
+Die lokalen SQLite-Dateien sind weiterhin **unverschlüsselt** und werden mit
+Dateimodus 0600 angelegt. Das Verzeichnis und seine Datenträger müssen trotzdem
+zugriffsgeschützt sein.
 
 ```bash
 harness --config config/config.yaml maintenance
@@ -159,19 +169,88 @@ Quellbackup als auch die restaurierte Datei. Es stellt absichtlich nicht
 automatisch über die konfigurierte operative Datenbank wieder her; nach Prüfung
 kann der Betreiber den Zielpfad kontrolliert in Betrieb nehmen.
 
-Für regelmäßige Backups wird der Befehl über cron, launchd oder einen anderen
-Betriebssystem-Scheduler gestartet. Die Aufbewahrung ist konfigurierbar über
-`operations.backup_keep`. Das Backup-Verzeichnis sollte auf einem separaten,
-zugriffsgeschützten und ausreichend verfügbaren Datenträger liegen. Ein
-regelmäßiger Restore-Test in einem isolierten Ziel ist zusätzlich zum
-automatischen temporären Selbsttest sinnvoll; Aufbewahrung und externe
-Kopie/Offsite-Strategie sind Betreiberverantwortung.
+Für den Zielwert **RPO 2 Stunden** läuft `backup` stündlich. **RTO 4 Stunden**
+ist ein zu prüfendes Betriebsziel, keine durch den Code garantierte Zeit.
+`operations.backup_keep` regelt nur die lokalen Klartextkopien. Der externe
+SSH-Speicher benötigt eine eigenständige, gegen Löschen geschützte
+Aufbewahrungsregel (beispielsweise 30 Tage mit versionierten/immutablen
+Snapshots); der Harness löscht dort keine Artefakte. SSH-Ziel und Schlüssel
+müssen vor dem produktiven Start bereitgestellt werden:
+
+```yaml
+operations:
+  backup_interval_seconds: 3600
+  restore_drill_interval_seconds: 604800
+  offsite:
+    provider: ssh
+    target: backup-user@backup-host.example
+    directory: /srv/md-harness/backups
+    key_secret: backup_encryption_key
+    receipt_file: ../state/offsite-backup.json
+    drill_file: ../state/restore-drill.json
+    backup_max_age_minutes: 120
+    drill_max_age_days: 8
+    includes:
+      vault: ~/md-harness-vault
+      configuration: config.yaml
+```
+
+`includes` muss alle nicht aus Git rekonstruierbaren Projekt-/Arbeitsdateien
+explizit benennen. Symlinks und fehlende Pfade führen zum Fehler; die Liste ist
+vor Inbetriebnahme mit dem tatsächlichen Vault und den Projektverzeichnissen
+abzugleichen. Die Kopie ist ein konsistenter SQLite-Snapshot, aber die
+zusätzlich aufgenommenen Dateien werden während des Packens nicht eingefroren:
+Schreibprozesse für diese Verzeichnisse während des Backup-Fensters anhalten
+oder deren eigene Snapshot-Funktion verwenden. Die `.env` wird nicht implizit
+mitgesichert; stattdessen Secret-Provider, Schlüsselmaterial, SSH-Zugang und
+bekannte Host-Keys separat dokumentiert und geschützt wiederherstellbar halten.
+
+Der Schlüssel ist ein Base64-kodierter, zufälliger 32-Byte-Wert unter dem
+logischen Namen `backup_encryption_key` (Beispiel-Keychain-Service
+`dev-harness/harness-backup-encryption-key`). Für LaunchAgents ist Keychain
+statt einer nur interaktiv gesetzten Umgebungsvariablen zu verwenden.
+Schlüsselverlust macht alle verschlüsselten Kopien unbrauchbar; Schlüsselrotation
+erfordert eine dokumentierte Aufbewahrung alter Schlüssel bis zum Ablauf aller
+alten Backups. Der Zielhost muss mit Public-Key-Authentisierung ohne Prompt
+erreichbar sein; dessen Host-Key muss vorab in `known_hosts` geprüft und
+festgelegt sein. Die SSH-Übertragung nutzt Batch-Modus und StrictHostKeyChecking.
+Der Zielhost erhält nur AES-256-GCM-authentifizierten Chiffretext. Nach dem
+Upload liest der Harness die Kopie vom Zielhost zurück, prüft SHA-256,
+entschlüsselt und prüft alle enthaltenen Dateien sowie den SQLite-Restore.
+Auch das aktuelle Inventar wird verschlüsselt als `latest.manifest` extern
+abgelegt und zurückgelesen. Ein Ersatzhost kann daher ohne den verlorenen
+lokalen Beleg das letzte Artefakt finden; dafür müssen Konfiguration,
+SSH-Zugang und Entschlüsselungsschlüssel separat wiederbeschafft werden.
+Erst danach schreibt der Harness den lokalen Erfolgsbeleg. Der `doctor`-Check meldet
+fehlenden/älteren Offsite-Beleg oder Restore-Drill als kritisch; `alert` übernimmt
+die Checks und deren Eskalation.
+
+```bash
+harness --config config/config.yaml backup
+harness --config config/config.yaml restore-drill
+harness --config config/config.yaml restore-offsite /neuer/pfad/recovery
+harness --config config/config.yaml doctor
+```
+
+`restore-drill` lädt das letzte nachweislich erfolgreiche Offsite-Artefakt
+erneut herunter und restauriert es ausschließlich in einem temporären
+Verzeichnis. Der Beleg enthält Identität, Zeit, geprüfte Dateien,
+Schema-Version und gemessene Dauer. Ein fehlgeschlagener Drill überschreibt
+den letzten Erfolgsbeleg nicht; der CLI-Exitcode ist ungleich null. Für den
+`restore-offsite` führt dieselben Prüfungen aus und legt anschließend die
+geprüfte Datenbank sowie die `includes/`-Dateien in einem **neuen** privaten
+Zielverzeichnis ab. Ein bereits existierendes Ziel wird nie überschrieben.
+Für den
+monatlichen **vollständigen** Restore-Test müssen Betreiber zusätzlich einen
+isolierten Ersatzhost mit getrennten Zugängen verwenden und die folgenden
+Runbook-Schritte samt Start-/Endzeit, Befunden und Freigabe dokumentieren.
 
 Beispiel für cron (Pfade an die Installation anpassen):
 
 ```cron
 */5 * * * * /opt/md-harness/.venv/bin/harness --config /opt/md-harness/config/config.yaml maintenance
-15 2 * * * /opt/md-harness/.venv/bin/harness --config /opt/md-harness/config/config.yaml backup
+15 * * * * /opt/md-harness/.venv/bin/harness --config /opt/md-harness/config/config.yaml backup
+30 3 * * 1 /opt/md-harness/.venv/bin/harness --config /opt/md-harness/config/config.yaml restore-drill
 ```
 
 ## Recovery-Runbook
@@ -221,7 +300,22 @@ Bereitschaftsrotation.
 4. Nach Recovery `doctor` erneut ausführen und Datenbank, Schema-Version,
    Taskstatus sowie Outbox-Zustand bestätigen.
 
-Die Anwendung bietet bewusst keinen integrierten Scheduler und keinen
+Für den monatlichen Offsite-Gesamttest: Alarm-/Incident-Startzeit notieren,
+Originalhost unangetastet lassen, Ersatzhost bereitstellen, Schlüssel und
+SSH-Zugang aus getrennt gesicherter Betreiberquelle beschaffen und den
+`restore-offsite /neuer/pfad/recovery` vom Ersatzhost gegen dieselbe Remote-Kopie
+ausführen. Danach die geprüfte Datenbank und `includes/`-Dateien kontrolliert
+in Vault-/Konfigurationspfade des Ersatzhosts übernehmen; niemals ungeprüfte
+Archivpfade über vorhandene Produktionsdateien extrahieren. Konfiguration,
+Secret-Zugriff und Git-Revision herstellen, `doctor` ausführen, repräsentative
+Projektentscheidungen und Outbox-Einträge prüfen und einen ungefährlichen
+Test-Task durchlaufen lassen. Endzeit, Datenstand des Backups (tatsächliches
+RPO), Wiederanlaufdauer (tatsächliches RTO), fehlende Dateien und Korrekturen
+im Betriebsprotokoll festhalten. Bei RPO >2h oder RTO >4h ist die Übung
+fehlgeschlagen und die Alarm-/Runbook-Kette nachzuarbeiten. Eine automatische
+Produktions-Umschaltung oder Überschreibung existiert bewusst nicht.
+
+Die Anwendung bietet bewusst keinen eigenen Daemon-Scheduler und keinen
 E-Mail-Adapter. Auf macOS ist der LaunchAgent explizit installierbar; Slack ist
 ein optionaler Zustelladapter. Andere Scheduler und Incident-Management-Systeme
 können den `alert`-Befehl, seine JSON-Ausgabe und Exit-Codes verwenden.

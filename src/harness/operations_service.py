@@ -63,7 +63,7 @@ def manage_launch_agents(
     executable: str | None = None,
     runner=subprocess.run,
 ) -> dict[str, Any]:
-    """Install, inspect, or remove the two explicitly managed LaunchAgents."""
+    """Install, inspect, or remove explicitly managed LaunchAgents."""
     if action not in {"install", "status", "uninstall"}:
         raise ServiceError("service action must be install, status or uninstall")
     if (platform or sys.platform) != "darwin":
@@ -79,6 +79,13 @@ def manage_launch_agents(
         f"{label_prefix}.backup",
         f"{label_prefix}.alert",
     ]
+    offsite = settings.get("offsite", {})
+    drill_label = f"{label_prefix}.restore-drill"
+    drill_path = agents_dir / f"{drill_label}.plist"
+    if offsite.get("provider") == "ssh" or (
+        action != "install" and drill_path.exists()
+    ):
+        labels.append(drill_label)
     paths = [agents_dir / f"{label}.plist" for label in labels]
     if action == "status":
         loaded = []
@@ -103,14 +110,30 @@ def manage_launch_agents(
         return {"action": action, "agents": labels}
 
     interval = settings.get("maintenance_interval_seconds", 300)
+    backup_interval = settings.get("backup_interval_seconds")
+    drill_interval = settings.get("restore_drill_interval_seconds", 604800)
     hour = settings.get("backup_hour", 2)
     minute = settings.get("backup_minute", 15)
     if type(interval) is not int or interval < 60:
         raise ServiceError("operations.maintenance_interval_seconds must be >= 60")
+    if backup_interval is not None and (
+        type(backup_interval) is not int or backup_interval < 60
+    ):
+        raise ServiceError("operations.backup_interval_seconds must be >= 60")
+    if len(labels) == 4 and (type(drill_interval) is not int or drill_interval < 60):
+        raise ServiceError("operations.restore_drill_interval_seconds must be >= 60")
     if type(hour) is not int or not 0 <= hour <= 23:
         raise ServiceError("operations.backup_hour must be between 0 and 23")
     if type(minute) is not int or not 0 <= minute <= 59:
         raise ServiceError("operations.backup_minute must be between 0 and 59")
+    if offsite.get("provider") != "ssh" and drill_path.exists():
+        runner(
+            ["launchctl", "bootout", domain, str(drill_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        drill_path.unlink()
     log_directory = config.parent / "logs"
     log_directory.mkdir(parents=True, exist_ok=True)
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -130,8 +153,9 @@ def manage_launch_agents(
             config,
             ["backup"],
             log_directory,
-            hour=hour,
-            minute=minute,
+            interval=backup_interval,
+            hour=hour if backup_interval is None else None,
+            minute=minute if backup_interval is None else None,
         ),
         _agent_plist(
             labels[2],
@@ -142,6 +166,17 @@ def manage_launch_agents(
             interval=interval,
         ),
     ]
+    if len(labels) == 4:
+        payloads.append(
+            _agent_plist(
+                labels[3],
+                python,
+                config,
+                ["restore-drill"],
+                log_directory,
+                interval=drill_interval,
+            )
+        )
     try:
         for label, path, payload in zip(labels, paths, payloads, strict=True):
             runner(

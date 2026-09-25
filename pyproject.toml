@@ -9,6 +9,7 @@ description = "Markdown-driven Python MD Harness"
 requires-python = ">=3.11"
 dependencies = [
     "PyYAML>=6.0",
+    "cryptography>=43",
     "python-dotenv>=1.0",
 ]
 

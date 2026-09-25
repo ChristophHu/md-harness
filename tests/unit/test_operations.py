@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -24,6 +25,42 @@ def test_thresholds_require_positive_values():
         OperationsThresholds(outbox_pending_minutes=-1)
     with pytest.raises(ValueError, match="stale_task_minutes"):
         OperationsThresholds(stale_task_minutes="30")
+    with pytest.raises(ValueError, match="backup_max_age_minutes"):
+        OperationsThresholds(backup_max_age_minutes=0)
+    with pytest.raises(ValueError, match="drill_max_age_days"):
+        OperationsThresholds(drill_max_age_days=0)
+
+
+def test_offsite_receipts_are_monitored_even_if_database_is_unavailable(tmp_path):
+    receipt = tmp_path / "backup.json"
+    drill = tmp_path / "drill.json"
+    thresholds = OperationsThresholds(backup_receipt=receipt, drill_receipt=drill)
+    report = inspect_database(tmp_path / "missing.sqlite", thresholds)
+    assert {item["name"] for item in report["checks"]} >= {
+        "database_access",
+        "offsite_backup_fresh",
+        "restore_drill_fresh",
+    }
+    path = initialize_database(tmp_path / "db.sqlite")
+    now = datetime.now(UTC)
+    receipt.write_text(json.dumps({"created_at": now.isoformat()}))
+    drill.write_text(json.dumps({"completed_at": now.isoformat()}))
+    assert inspect_database(path, thresholds)["status"] == "ok"
+    receipt.write_text(
+        json.dumps({"created_at": (now - timedelta(hours=3)).isoformat()})
+    )
+    assert inspect_database(path, thresholds)["status"] == "critical"
+    receipt.write_text(json.dumps({"created_at": "2020-01-01T00:00:00"}))
+    assert (
+        next(
+            item
+            for item in inspect_database(path, thresholds)["checks"]
+            if item["name"] == "offsite_backup_fresh"
+        )["detail"]
+        == "receipt missing or invalid"
+    )
+    receipt.write_text("not json")
+    assert inspect_database(path, thresholds)["status"] == "critical"
 
 
 def test_database_path_resolves_relative_and_absolute_config(tmp_path):

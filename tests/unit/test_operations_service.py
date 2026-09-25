@@ -169,6 +169,93 @@ def test_service_rejects_non_string_launchd_label(tmp_path):
         )
 
 
+def test_offsite_agents_use_hourly_backup_and_weekly_drill(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("storage: {}\n")
+    settings = {
+        "offsite": {"provider": "ssh"},
+        "backup_interval_seconds": 3600,
+        "restore_drill_interval_seconds": 604800,
+    }
+    calls = []
+    report = manage_launch_agents(
+        "install",
+        config,
+        settings,
+        home=tmp_path / "home",
+        platform="darwin",
+        runner=_runner(calls),
+    )
+    assert len(report["agents"]) == 4
+    agents = tmp_path / "home/Library/LaunchAgents"
+    backup = plistlib.loads(
+        (agents / "com.mdharness.operations.backup.plist").read_bytes()
+    )
+    drill = plistlib.loads(
+        (agents / "com.mdharness.operations.restore-drill.plist").read_bytes()
+    )
+    assert backup["StartInterval"] == 3600
+    assert drill["StartInterval"] == 604800
+    assert drill["ProgramArguments"][-1] == "restore-drill"
+    manage_launch_agents(
+        "install",
+        config,
+        {},
+        home=tmp_path / "home",
+        platform="darwin",
+        runner=_runner([]),
+    )
+    assert not (agents / "com.mdharness.operations.restore-drill.plist").exists()
+    manage_launch_agents(
+        "install",
+        config,
+        settings,
+        home=tmp_path / "home",
+        platform="darwin",
+        runner=_runner([]),
+    )
+    assert (
+        len(
+            manage_launch_agents(
+                "status",
+                config,
+                {},
+                home=tmp_path / "home",
+                platform="darwin",
+                runner=_runner([], loaded={}),
+            )["agents"]
+        )
+        == 4
+    )
+    manage_launch_agents(
+        "uninstall",
+        config,
+        {},
+        home=tmp_path / "home",
+        platform="darwin",
+        runner=_runner([]),
+    )
+    assert not list(agents.glob("*.plist"))
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("backup_interval_seconds", 59), ("restore_drill_interval_seconds", 0)],
+)
+def test_offsite_agent_interval_validation(tmp_path, key, value):
+    config = tmp_path / "config.yaml"
+    config.write_text("storage: {}\n")
+    with pytest.raises(ServiceError, match=key):
+        manage_launch_agents(
+            "install",
+            config,
+            {"offsite": {"provider": "ssh"}, key: value},
+            home=tmp_path / "home",
+            platform="darwin",
+            runner=_runner([]),
+        )
+
+
 def test_process_lock_is_exclusive_and_released_on_exit(tmp_path):
     database = tmp_path / "state.sqlite"
     with process_lock(database, "maintenance") as acquired:

@@ -17,6 +17,12 @@ from harness.application import build_orchestrator
 from harness.config import ConfigError, load_config
 from harness.operations_service import ServiceError, manage_launch_agents
 from harness.security.secrets import SecretError, default_secret_provider
+from harness.storage.offsite_backup import (
+    BackupError,
+    SSHStore,
+    create_offsite_backup,
+    restore_drill,
+)
 from harness.storage.operations import (
     JsonLogFormatter,
     OperationsThresholds,
@@ -47,9 +53,66 @@ def _emit_json(payload: object) -> None:
 
 def _thresholds(config: dict) -> OperationsThresholds:
     settings = config.get("operations", {})
+    offsite = settings.get("offsite", {})
     return OperationsThresholds(
         stale_task_minutes=settings.get("stale_task_minutes", 30),
         outbox_pending_minutes=settings.get("outbox_pending_minutes", 15),
+        backup_receipt=_operation_path(
+            config, offsite.get("receipt_file", "../state/offsite-backup.json")
+        )
+        if offsite.get("provider") == "ssh"
+        else None,
+        drill_receipt=_operation_path(
+            config, offsite.get("drill_file", "../state/restore-drill.json")
+        )
+        if offsite.get("provider") == "ssh"
+        else None,
+        backup_max_age_minutes=offsite.get("backup_max_age_minutes", 120),
+        drill_max_age_days=offsite.get("drill_max_age_days", 8),
+    )
+
+
+def _operation_path(config: dict, value: str) -> Path:
+    base = (
+        Path(config.get("_config_path", "config/config.yaml"))
+        .expanduser()
+        .resolve()
+        .parent
+    )
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else base / path).absolute()
+
+
+def _offsite(config: dict) -> tuple[SSHStore, str, Path, Path, dict[str, Path]] | None:
+    settings = config.get("operations", {}).get("offsite", {})
+    provider = settings.get("provider", "none")
+    if provider == "none":
+        return None
+    if provider != "ssh":
+        raise BackupError("operations.offsite.provider must be none or ssh")
+    store = SSHStore(settings.get("target", ""), settings.get("directory", ""))
+    secret = config["secrets"]
+    key = default_secret_provider(
+        service_prefix=secret.service_prefix,
+        account=secret.account,
+        names=secret.names,
+    ).require(settings.get("key_secret", "backup_encryption_key"))
+    includes = settings.get("includes", {})
+    if not isinstance(includes, dict) or any(
+        not isinstance(label, str) or not isinstance(path, str)
+        for label, path in includes.items()
+    ):
+        raise BackupError("operations.offsite.includes must map labels to paths")
+    return (
+        store,
+        key,
+        _operation_path(
+            config, settings.get("receipt_file", "../state/offsite-backup.json")
+        ),
+        _operation_path(
+            config, settings.get("drill_file", "../state/restore-drill.json")
+        ),
+        {label: _operation_path(config, path) for label, path in includes.items()},
     )
 
 
@@ -83,6 +146,14 @@ def main() -> None:
     )
     restore_parser.add_argument("backup_path")
     restore_parser.add_argument("destination")
+    subparsers.add_parser(
+        "restore-drill",
+        help="Download and verify the latest offsite backup in isolation",
+    )
+    offsite_restore_parser = subparsers.add_parser(
+        "restore-offsite", help="Restore a verified offsite bundle into a new directory"
+    )
+    offsite_restore_parser.add_argument("destination")
     maintenance_parser = subparsers.add_parser(
         "maintenance", help="Retry Vault publication and recover abandoned runs"
     )
@@ -101,6 +172,8 @@ def main() -> None:
         "backup",
         "verify-backup",
         "restore-backup",
+        "restore-drill",
+        "restore-offsite",
         "maintenance",
         "alert",
         "service",
@@ -143,7 +216,24 @@ def _run_operations_command(
 ) -> None:
     try:
         config = load_config(args.config)
+        config["_config_path"] = args.config
         database = database_path_from_config(args.config)
+        if args.command in {"restore-drill", "restore-offsite"}:
+            offsite = _offsite(config)
+            if offsite is None:
+                raise BackupError("offsite backup is not configured")
+            store, key, receipt, drill, _ = offsite
+            with process_lock(database, "backup") as acquired:
+                if not acquired:
+                    _emit_json(
+                        {"ok": True, "skipped": True, "reason": "already_running"}
+                    )
+                    return
+                destination = (
+                    args.destination if args.command == "restore-offsite" else None
+                )
+                _emit_json(restore_drill(store, key, receipt, drill, destination))
+            return
         if args.command == "doctor":
             report = inspect_database(database, _thresholds(config))
             _emit_json(report)
@@ -223,6 +313,12 @@ def _run_operations_command(
                 _backup_directory(args.config, config),
                 keep=keep,
             )
+            offsite = _offsite(config)
+            if offsite is not None:
+                store, key, receipt, _, includes = offsite
+                report["offsite"] = create_offsite_backup(
+                    report["backup_path"], includes, store, key, receipt
+                )
         _emit_json(report)
         _configure_logging()
         _logger.info(
@@ -244,6 +340,7 @@ def _run_operations_command(
         ServiceError,
         AlertError,
         SecretError,
+        BackupError,
     ) as error:
         _emit_json({"ok": False, "error": str(error)})
         raise SystemExit(1) from error
