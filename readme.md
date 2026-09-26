@@ -20,6 +20,33 @@ pip install -e .
 python -m harness --help
 ```
 
+## HTTP API und Swagger
+
+Die optionale API stellt Task-Suche, Detailansicht und `run` bereit. Swagger UI
+ist unter `/docs`, das OpenAPI-Schema unter `/openapi.json` verfügbar:
+
+```bash
+pip install -e '.[api]'
+harness --config config/config.yaml serve
+```
+
+Host und Port werden im YAML unter `api` festgelegt:
+
+```yaml
+api:
+  host: 127.0.0.1 # oder 0.0.0.0
+  port: 3000
+```
+
+Standardmäßig lauscht der Server ausschließlich auf `127.0.0.1:8000`. CLI-Flags
+`--host` und `--port` überschreiben die Konfiguration. Beim Binden an eine
+andere Adresse muss vor dem Start `HARNESS_API_TOKEN` gesetzt sein; API-Aufrufe
+müssen dann `Authorization: Bearer <token>` mitsenden.
+Die synchronen Datenbank- und Orchestrator-Aufrufe werden innerhalb des
+Prozesses serialisiert. Der `run`-Aufruf bleibt bis zum Abschluss des Laufs
+offen; für einen öffentlich erreichbaren oder hochverfügbaren Betrieb sollte
+ein vorgeschalteter authentifizierender Reverse Proxy verwendet werden.
+
 ## Betrieb
 
 ```bash

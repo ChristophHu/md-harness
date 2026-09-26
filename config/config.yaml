@@ -28,6 +28,10 @@ git:
 storage:
   database: ../state/harness.sqlite
 
+api:
+  host: 127.0.0.1
+  port: 8000
+
 operations:
   stale_task_minutes: 30
   outbox_pending_minutes: 15

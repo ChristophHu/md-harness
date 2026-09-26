@@ -159,6 +159,11 @@ def main() -> None:
     )
     maintenance_parser.add_argument("--limit", type=int)
     subparsers.add_parser("alert", help="Check operational health and deliver alerts")
+    api_parser = subparsers.add_parser(
+        "serve", help="Start the HTTP API and Swagger UI"
+    )
+    api_parser.add_argument("--host")
+    api_parser.add_argument("--port", type=int)
     service_parser = subparsers.add_parser(
         "service", help="Manage the macOS per-user launchd agents"
     )
@@ -166,6 +171,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
+        return
+    if args.command == "serve":
+        _serve_api(parser, args)
         return
     if args.command in {
         "doctor",
@@ -209,6 +217,21 @@ def main() -> None:
     print(result.message or result.status.value)
     if result.status.value == "failed":
         raise SystemExit(1)
+
+
+def _serve_api(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    try:
+        import uvicorn
+
+        from harness.api import create_app
+
+        api_config = load_config(args.config)["api"]
+        host = args.host or api_config.host
+        port = args.port if args.port is not None else api_config.port
+        app = create_app(args.config, host=host)
+    except (ImportError, RuntimeError, ValueError, ConfigError) as error:
+        parser.error(str(error))
+    uvicorn.run(app, host=host, port=port)
 
 
 def _run_operations_command(

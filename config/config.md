@@ -1,5 +1,19 @@
 # Konfiguration
 
+## HTTP API
+
+Die optionale HTTP API wird über den obersten YAML-Abschnitt `api` konfiguriert.
+Standard ist localhost auf Port 8000. Mit `host: 0.0.0.0` und `port: 3000` ist
+die API auf allen Interfaces an Port 3000 erreichbar. Vor dem Binden außerhalb
+von localhost muss `HARNESS_API_TOKEN` gesetzt sein. CLI-Optionen `--host` und
+`--port` überschreiben die Werte für einen einzelnen Start.
+
+```yaml
+api:
+  host: 127.0.0.1
+  port: 8000
+```
+
 ## Dateien
 
 - `config.yaml`: zentrale Anwendungskonfiguration

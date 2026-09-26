@@ -43,6 +43,25 @@ execution:
         connection.close()
 
 
+def test_build_orchestrator_supports_api_thread_mode(tmp_path):
+    from threading import Thread
+
+    config = tmp_path / "config.yaml"
+    config.write_text("project:\n  workspace_dir: .\n", encoding="utf-8")
+    orchestrator, connection = build_orchestrator(config, api_mode=True)
+    try:
+        outcome = []
+        worker = Thread(
+            target=lambda: outcome.append(connection.execute("SELECT 1").fetchone()[0])
+        )
+        worker.start()
+        worker.join()
+        assert outcome == [1]
+        assert orchestrator is not None
+    finally:
+        connection.close()
+
+
 def test_orchestrator_execution_config_overrides_constructor_defaults():
     from harness.engine.orchestrator import Orchestrator
 

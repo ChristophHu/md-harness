@@ -3,6 +3,17 @@ required:
   - project
   - storage
 properties:
+  api:
+    type: object
+    additionalProperties: false
+    properties:
+      host:
+        type: string
+        minLength: 1
+      port:
+        type: integer
+        minimum: 1
+        maximum: 65535
   project:
     type: object
   storage:

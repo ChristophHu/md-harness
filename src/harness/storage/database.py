@@ -20,8 +20,10 @@ def _migration_files() -> list[tuple[int, Path]]:
     return sorted(files)
 
 
-def connect(database_path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(database_path)
+def connect(
+    database_path: str | Path, *, check_same_thread: bool = True
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(database_path, check_same_thread=check_same_thread)
     connection.execute("PRAGMA foreign_keys = ON")
     connection.row_factory = sqlite3.Row
     return connection

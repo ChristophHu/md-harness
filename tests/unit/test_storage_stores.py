@@ -226,6 +226,28 @@ def test_project_and_task_stores_cover_task_lifecycle(tmp_path):
             tasks.transition(999, "ready")
 
 
+def test_task_store_search_filters_escapes_and_paginates(tmp_path):
+    with sqlite3.connect(db(tmp_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        tasks = TaskStore(connection)
+        matching = tasks.create("100%_ready", description="literal % and _")
+        tasks.create("other")
+        tasks.transition(matching, "ready")
+        rows, total = tasks.search(query="%_", status="ready", limit=1, offset=0)
+        assert [row["id"] for row in rows] == [matching]
+        assert total == 1
+        rows, total = tasks.search(query="no match", project_id=999)
+        assert rows == []
+        assert total == 0
+        rows, total = tasks.search(offset=1)
+        assert len(rows) == 1
+        assert total == 2
+        with pytest.raises(ValueError, match="limit"):
+            tasks.search(limit=0)
+        with pytest.raises(ValueError, match="offset"):
+            tasks.search(offset=-1)
+
+
 def test_failed_transition_records_failure_timestamp(tmp_path):
     path = db(tmp_path)
     with sqlite3.connect(path) as connection:

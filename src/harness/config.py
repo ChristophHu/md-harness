@@ -34,6 +34,23 @@ class HITLMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class APIConfig:
+    """Bind settings for the optional HTTP API."""
+
+    host: str = "127.0.0.1"
+    port: int = 8000
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.host, str) or not self.host.strip():
+            raise ConfigError("api.host must be a non-empty string")
+        object.__setattr__(self, "host", self.host.strip())
+        if not isinstance(self.port, int) or isinstance(self.port, bool):
+            raise ConfigError("api.port must be an integer")
+        if not 1 <= self.port <= 65535:
+            raise ConfigError("api.port must be between 1 and 65535")
+
+
+@dataclass(frozen=True, slots=True)
 class SecretConfig:
     """Secret source and logical-name mapping for local/CI providers."""
 
@@ -156,6 +173,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
     )
     data["execution"] = settings
     data["secrets"] = secret_settings
+    api_settings = data.get("api", {})
+    if not isinstance(api_settings, dict):
+        raise ConfigError("api configuration must be a mapping")
+    data["api"] = APIConfig(
+        host=api_settings.get("host", "127.0.0.1"),
+        port=api_settings.get("port", 8000),
+    )
     agents = data.get("agents", {})
     if not isinstance(agents, dict) or not isinstance(
         agents.get("enabled", False), bool

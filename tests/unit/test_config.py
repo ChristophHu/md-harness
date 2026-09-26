@@ -3,6 +3,7 @@
 import pytest
 
 from harness.config import (
+    APIConfig,
     ConfigError,
     ExecutionConfig,
     HITLMode,
@@ -10,6 +11,30 @@ from harness.config import (
     SecretConfig,
     load_config,
 )
+
+
+def test_api_config_defaults_and_normalizes_host(tmp_path):
+    path = tmp_path / "api.yaml"
+    path.write_text("api:\n  host: ' 0.0.0.0 '\n  port: 3000\n", encoding="utf-8")
+    assert load_config(path)["api"] == APIConfig(host="0.0.0.0", port=3000)
+    assert APIConfig() == APIConfig(host="127.0.0.1", port=8000)
+
+
+@pytest.mark.parametrize(
+    "contents, message",
+    [
+        ("api: []", "api configuration"),
+        ("api:\n  host: ' '", "api.host"),
+        ("api:\n  port: true", "api.port must be an integer"),
+        ("api:\n  port: 0", "api.port must be between"),
+        ("api:\n  port: 65536", "api.port must be between"),
+    ],
+)
+def test_load_config_rejects_invalid_api_settings(tmp_path, contents, message):
+    path = tmp_path / "invalid-api.yaml"
+    path.write_text(contents, encoding="utf-8")
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
 
 
 def test_execution_config_defaults_and_load(tmp_path):

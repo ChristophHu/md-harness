@@ -75,6 +75,49 @@ class TaskStore:
             "SELECT * FROM tasks WHERE status = 'ready' ORDER BY priority, id"
         ).fetchall()
 
+    def search(
+        self,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        project_id: int | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[Row], int]:
+        """Search tasks with parameterized filters and stable pagination."""
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if query:
+            escaped = (
+                query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            clauses.append(
+                "(title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' "
+                "OR external_key LIKE ? ESCAPE '\\')"
+            )
+            parameters.extend([f"%{escaped}%"] * 3)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            parameters.append(project_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        total = int(
+            self.connection.execute(
+                f"SELECT COUNT(*) FROM tasks{where}", parameters
+            ).fetchone()[0]
+        )
+        rows = self.connection.execute(
+            f"SELECT * FROM tasks{where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*parameters, limit, offset],
+        ).fetchall()
+        return rows, total
+
     def claim(
         self, task_id: int, *, run_id: str | None = None, lease_seconds: int = 300
     ) -> bool:

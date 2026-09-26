@@ -159,6 +159,86 @@ def test_cli_without_command_prints_help(monkeypatch, capsys):
     assert "MD Harness" in capsys.readouterr().out
 
 
+def test_cli_serve_starts_api(monkeypatch):
+    import sys
+    import types
+
+    from harness import api
+    from harness.config import APIConfig
+
+    calls = []
+    monkeypatch.setattr(api, "create_app", lambda config, **kwargs: (config, kwargs))
+    monkeypatch.setattr("harness.cli.load_config", lambda _path: {"api": APIConfig()})
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        types.SimpleNamespace(run=lambda app, **kwargs: calls.append((app, kwargs))),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "harness",
+            "--config",
+            "custom.yaml",
+            "serve",
+            "--host",
+            "localhost",
+            "--port",
+            "9000",
+        ],
+    )
+    main()
+    assert calls == [
+        (("custom.yaml", {"host": "localhost"}), {"host": "localhost", "port": 9000})
+    ]
+
+
+def test_cli_serve_uses_api_config_when_flags_are_omitted(monkeypatch):
+    import sys
+    import types
+
+    from harness import api
+    from harness.config import APIConfig
+
+    calls = []
+    monkeypatch.setattr(api, "create_app", lambda config, **kwargs: (config, kwargs))
+    monkeypatch.setattr(
+        "harness.cli.load_config", lambda _path: {"api": APIConfig("0.0.0.0", 3000)}
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        types.SimpleNamespace(run=lambda app, **kwargs: calls.append((app, kwargs))),
+    )
+    monkeypatch.setattr("sys.argv", ["harness", "serve"])
+    main()
+    assert calls == [
+        (("config/config.yaml", {"host": "0.0.0.0"}), {"host": "0.0.0.0", "port": 3000})
+    ]
+
+
+@pytest.mark.parametrize("missing", ["uvicorn", "api"])
+def test_cli_serve_reports_missing_optional_dependencies(monkeypatch, missing):
+    import builtins
+    import sys
+
+    if missing == "uvicorn":
+        monkeypatch.setitem(sys.modules, "uvicorn", None)
+    else:
+        original_import = builtins.__import__
+
+        def import_without_api(name, *args, **kwargs):
+            if name == "harness.api":
+                raise ImportError("missing api")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_api)
+    monkeypatch.setattr("sys.argv", ["harness", "serve"])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize("command", ["run", "resume", "cancel"])
 def test_cli_dispatches_engine_command(monkeypatch, capsys, command):
     class Result:

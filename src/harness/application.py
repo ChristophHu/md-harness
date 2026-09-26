@@ -27,7 +27,9 @@ from harness.storage.project_store import ProjectStore
 from harness.tools.factory import ToolRegistryFactory
 
 
-def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
+def build_orchestrator(
+    config_path: str | Path, *, api_mode: bool = False
+) -> tuple[Orchestrator, Any]:
     """Build the configured engine and return it with its live connection."""
     path = Path(config_path).expanduser().resolve()
     raw = load_config(path)
@@ -49,7 +51,7 @@ def build_orchestrator(config_path: str | Path) -> tuple[Orchestrator, Any]:
         )
 
     database_path = initialize_database(database)
-    connection = connect(database_path)
+    connection = connect(database_path, check_same_thread=not api_mode)
     stores = StoreFactory.create(connection, workspace)
     project_store = ProjectStore(connection)
     env_file = (
