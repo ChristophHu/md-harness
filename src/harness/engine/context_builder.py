@@ -1,0 +1,201 @@
+"""Build execution contexts from the harness data sources."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Iterable
+from typing import Any
+
+from harness.engine.context import (
+    AcceptanceCriterion,
+    DependencyContext,
+    ExecutionContext,
+    TestCriterion,
+)
+
+
+class ContextBuilder:
+    """Assemble one complete :class:`ExecutionContext` for a task run."""
+
+    def __init__(
+        self,
+        task_store: Any,
+        event_store: Any,
+        artifact_store: Any,
+        project_store: Any,
+        *,
+        knowledge_loader: Callable[[int], Iterable[str]] | None = None,
+        tool_registry: Any | None = None,
+        dry_run: bool = False,
+        checkpoint_store: Any | None = None,
+        hitl_mode: str = "minimal",
+    ) -> None:
+        self.task_store = task_store
+        self.event_store = event_store
+        self.artifact_store = artifact_store
+        self.project_store = project_store
+        self.knowledge_loader = knowledge_loader
+        self.tool_registry = tool_registry
+        self.dry_run = dry_run
+        self.checkpoint_store = checkpoint_store
+        self.hitl_mode = hitl_mode
+
+    @classmethod
+    def from_stores(
+        cls, stores: Any, project_store: Any, **options: Any
+    ) -> ContextBuilder:
+        """Create a builder wired to every store in one StoreBundle."""
+        return cls(
+            stores.task_store,
+            stores.event_store,
+            stores.artifact_store,
+            project_store,
+            checkpoint_store=stores.checkpoint_store,
+            **options,
+        )
+
+    def build(self, task_id: int) -> ExecutionContext:
+        """Load all sources and create a consistent task snapshot."""
+        task = self.task_store.get(task_id)
+        if task is None:
+            raise ValueError(f"task not found: {task_id}")
+
+        project = self._project(task["project_id"])
+        event_dicts = [dict(row) for row in self.event_store.list_for_task(task_id)]
+        last_plan, last_validation, replanning_reasons = self._feedback(event_dicts)
+        checkpoint = (
+            self.checkpoint_store.get_active(task_id)
+            if self.checkpoint_store is not None
+            else None
+        )
+        checkpoint_data = dict(checkpoint) if checkpoint is not None else None
+        human_responses = self._human_responses(task_id)
+        context = ExecutionContext(
+            task_id=task["id"],
+            task_title=task["title"],
+            task_description=task["description"] or "",
+            task_type=task["task_type"],
+            priority=task["priority"],
+            task_status=task["status"],
+            approval_status=task["approval_status"],
+            hitl_mode=self.hitl_mode,
+            human_responses=human_responses,
+            assigned_agent=task["assigned_agent"],
+            acceptance_criteria=[
+                AcceptanceCriterion(row["id"], row["criterion"], bool(row["completed"]))
+                for row in self.task_store.criteria(task_id)
+            ],
+            test_criteria=[
+                TestCriterion(
+                    id=row["id"],
+                    criterion=row["criterion"],
+                    test_type=row["test_type"],
+                    command=self._command(row["command"]),
+                    timeout_seconds=float(row["timeout_seconds"] or 120.0),
+                    working_directory=row["working_directory"],
+                    completed=bool(row["completed"]),
+                )
+                for row in self.task_store.test_criteria(task_id)
+            ],
+            dependencies=[
+                self._dependency(row) for row in self.task_store.dependencies(task_id)
+            ],
+            previous_events=event_dicts,
+            previous_attempts=[dict(row) for row in self.task_store.attempts(task_id)],
+            artifacts=[dict(row) for row in self.artifact_store.list_for_task(task_id)],
+            available_tools=self._tools(),
+            workspace=project["path"] if project is not None else None,
+            dry_run=self.dry_run,
+            last_plan=last_plan,
+            last_validation=last_validation,
+            replanning_reasons=replanning_reasons,
+            resume_checkpoint=checkpoint_data,
+            external_information_ref=(
+                checkpoint_data.get("information_ref")
+                if checkpoint_data and checkpoint_data.get("external_resolved_at")
+                else None
+            ),
+        )
+        if self.knowledge_loader is not None:
+            context.knowledge_documents.extend(self.knowledge_loader(task_id))
+        return context
+
+    def _human_responses(self, task_id: int) -> list[dict[str, Any]]:
+        """Load completed structured responses when the interaction migration exists."""
+        connection = getattr(self.checkpoint_store, "connection", None)
+        if connection is None:
+            return []
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_human_interactions'"
+        ).fetchone()
+        if exists is None:
+            return []
+        return [
+            {
+                "interaction_id": row["interaction_id"],
+                "kind": row["kind"],
+                "request": json.loads(row["request_data"]),
+                "response": json.loads(row["response_data"]),
+                "actor": row["decided_by"],
+            }
+            for row in connection.execute(
+                """SELECT interaction_id, kind, request_data, response_data, decided_by
+                   FROM task_human_interactions WHERE task_id = ? AND status = 'answered'
+                   ORDER BY created_at, interaction_id""",
+                (task_id,),
+            ).fetchall()
+        ]
+
+    @staticmethod
+    def _command(value: Any) -> str | list[str] | None:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return value
+            return parsed if isinstance(parsed, list) else None
+        return None
+
+    def _project(self, project_id: int | None) -> Any:
+        return self.project_store.get(project_id) if project_id is not None else None
+
+    def _dependency(self, row: Any) -> DependencyContext:
+        dependency = self.task_store.get(row["depends_on_task_id"])
+        status = dependency["status"] if dependency is not None else "missing"
+        return DependencyContext(
+            task_id=row["depends_on_task_id"],
+            status=status,
+            dependency_type=row["dependency_type"],
+            resolved=status == "done",
+        )
+
+    def _tools(self) -> list[str]:
+        if self.tool_registry is None:
+            return []
+        return [definition.name for definition in self.tool_registry.list()]
+
+    @staticmethod
+    def _feedback(
+        events: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
+        last_plan = None
+        last_validation = None
+        reasons = []
+        for event in events:
+            payload = event.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+            if not isinstance(payload, dict):
+                continue
+            if event.get("event_type") == "task.plan.created":
+                last_plan = payload
+            elif event.get("event_type") == "task.validation.completed":
+                last_validation = payload
+            elif event.get("event_type") == "task.replanning":
+                reasons.append(payload)
+        return last_plan, last_validation, reasons

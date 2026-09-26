@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -23,8 +24,10 @@ class SecretProvider:
 class EnvironmentSecretProvider(SecretProvider):
     """Resolve secrets from environment variables."""
 
+    names: Mapping[str, str] | None = None
+
     def get(self, name: str) -> str | None:
-        return os.environ.get(name)
+        return os.environ.get((self.names or {}).get(name, name))
 
 
 @dataclass(frozen=True)
@@ -33,9 +36,14 @@ class MacOSKeychainSecretProvider(SecretProvider):
 
     service_prefix: str = "dev-harness"
     account: str | None = None
+    names: Mapping[str, str] | None = None
+
+    def _mapped_name(self, name: str) -> str:
+        return (self.names or {}).get(name, name)
 
     def _service(self, name: str) -> str:
-        return f"{self.service_prefix}/{name.lower().replace('_', '-')}"
+        mapped = self._mapped_name(name)
+        return f"{self.service_prefix}/{mapped.lower().replace('_', '-')}"
 
     def _account(self) -> str:
         return self.account or os.environ.get("USER", "")
@@ -43,22 +51,28 @@ class MacOSKeychainSecretProvider(SecretProvider):
     def get(self, name: str) -> str | None:
         if platform.system() != "Darwin":
             return None
-        result = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-a",
-                self._account(),
-                "-s",
-                self._service(name),
-                "-w",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "security",
+                    "find-generic-password",
+                    "-a",
+                    self._account(),
+                    "-s",
+                    self._service(name),
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            raise SecretError("macOS Keychain lookup failed") from error
         if result.returncode != 0:
-            return None
+            diagnostic = (result.stderr or "").casefold()
+            if "could not be found" in diagnostic or "-25300" in diagnostic:
+                return None
+            raise SecretError("macOS Keychain access failed")
         value = result.stdout.strip()
         return value or None
 
@@ -66,22 +80,25 @@ class MacOSKeychainSecretProvider(SecretProvider):
         """Create or replace a Keychain value."""
         if platform.system() != "Darwin" or not value:
             raise SecretError("macOS Keychain is required for secret rotation")
-        result = subprocess.run(
-            [
-                "security",
-                "add-generic-password",
-                "-a",
-                self._account(),
-                "-s",
-                self._service(name),
-                "-w",
-                value,
-                "-U",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "security",
+                    "add-generic-password",
+                    "-a",
+                    self._account(),
+                    "-s",
+                    self._service(name),
+                    "-U",
+                    "-w",
+                ],
+                input=f"{value}\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            raise SecretError("Keychain rotation failed") from error
         if result.returncode != 0:
             raise SecretError("Keychain rotation failed")
 
@@ -106,11 +123,16 @@ class ChainedSecretProvider(SecretProvider):
         return value
 
 
-def default_secret_provider() -> ChainedSecretProvider:
-    """Use macOS Keychain first and environment variables as fallback."""
+def default_secret_provider(
+    *,
+    service_prefix: str = "dev-harness",
+    account: str | None = None,
+    names: Mapping[str, str] | None = None,
+) -> ChainedSecretProvider:
+    """Use configured macOS Keychain entries, then mapped environment names."""
     return ChainedSecretProvider(
         providers=(
-            MacOSKeychainSecretProvider(),
-            EnvironmentSecretProvider(),
+            MacOSKeychainSecretProvider(service_prefix, account, names),
+            EnvironmentSecretProvider(names),
         )
     )

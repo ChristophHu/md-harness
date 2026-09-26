@@ -1,0 +1,3 @@
+[sqlfluff]
+dialect = sqlite
+exclude_rules = LT01,LT02,LT05,LT14,CP02,RF04

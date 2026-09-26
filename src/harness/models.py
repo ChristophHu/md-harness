@@ -25,7 +25,7 @@ class Task:
     title: str
     description: str | None = None
     task_type: str = "task"
-    status: str = "idea"
+    status: str = "created"
     priority: str = "normal"
     created_at: datetime | None = None
     updated_at: datetime | None = None

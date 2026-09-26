@@ -19,13 +19,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT,
     task_type TEXT NOT NULL DEFAULT 'task',
-    status TEXT NOT NULL DEFAULT 'idea',
+    status TEXT NOT NULL DEFAULT 'created' CHECK (status IN ('created', 'ready', 'planning', 'executing', 'validating', 'waiting', 'done', 'failed', 'cancelled')),
     priority TEXT NOT NULL DEFAULT 'normal',
     approval_status TEXT NOT NULL DEFAULT 'pending' CHECK (approval_status IN ('pending', 'approved', 'rejected', 'revoked')),
     assigned_agent TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TEXT,
+    planning_started_at TEXT,
+    validation_started_at TEXT,
+    failed_at TEXT,
     completed_at TEXT
 );
 
@@ -72,6 +75,14 @@ CREATE TABLE IF NOT EXISTS task_assignments (
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released'))
 );
 
+CREATE TABLE IF NOT EXISTS agent_task_bindings (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    profile_name TEXT NOT NULL,
+    profile_version INTEGER NOT NULL,
+    profile_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS task_approvals (
     id INTEGER PRIMARY KEY,
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -108,6 +119,19 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    next_action TEXT NOT NULL,
+    plan_version INTEGER,
+    attempt_id INTEGER,
+    reason TEXT,
+    context_data TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resumed_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_id);
@@ -119,6 +143,8 @@ CREATE INDEX IF NOT EXISTS idx_task_approvals_task ON task_approvals(task_id, cr
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_task_path_checksum
+    ON task_artifacts(task_id, path, checksum);
 
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE OF title, description, task_type, status, priority ON tasks

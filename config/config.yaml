@@ -1,7 +1,7 @@
 project:
   name: md-harness
-  specification_dir: .
-  workspace_dir: .
+  specification_dir: ..
+  workspace_dir: ..
 
 git:
   repository_name: md-harness
@@ -11,9 +11,62 @@ git:
   auto_commit: true
   commit_message_prefix: "harness"
   auto_push: false
+  policy:
+    enforce_gitflow: true
+    stable_branch: main
+    development_branch: develop
+    protected_branches:
+      - main
+      - develop
+    required_checks:
+      - ruff
+      - mypy
+      - sqlfluff
+      - pytest
+      - coverage
 
 storage:
-  database: state/harness.sqlite
+  database: ../state/harness.sqlite
+
+api:
+  host: 127.0.0.1
+  port: 8000
+
+operations:
+  stale_task_minutes: 30
+  outbox_pending_minutes: 15
+  backup_directory: ../backups
+  backup_keep: 7
+  # RPO <= 2 h requires an offsite backup at least every hour.
+  backup_interval_seconds: 3600
+  restore_drill_interval_seconds: 604800
+  recovery_limit: 25
+  auto_dispatch: false
+  launchd_label: com.mdharness.operations
+  maintenance_interval_seconds: 300
+  backup_hour: 2
+  backup_minute: 15
+  offsite:
+    # Set to ssh only after provisioning a separate host, pinned SSH host key,
+    # noninteractive account and backup_encryption_key in Keychain.
+    provider: none
+    # target: backup-user@backup-host.example
+    # directory: /srv/md-harness/backups
+    key_secret: backup_encryption_key
+    receipt_file: ../state/offsite-backup.json
+    drill_file: ../state/restore-drill.json
+    backup_max_age_minutes: 120
+    drill_max_age_days: 8
+    includes:
+      vault: ~/md-harness-vault
+      configuration: config.yaml
+  alerts:
+    provider: none
+    webhook_secret: operations_slack_webhook
+    state_file: ../state/alerts.json
+    cooldown_minutes: 60
+    escalation_minutes: 30
+    repeat_minutes: 240
 
 knowledge:
   sources:
@@ -28,14 +81,37 @@ knowledge:
 
 secrets:
   provider: keychain_then_environment
+  service_prefix: dev-harness
+  # Defaults to the current macOS user when omitted.
+  # account: christoph
   names:
     codex_api_key: CODEX_API_KEY
+    openai_api_key: OPENAI_API_KEY
     qdrant_api_key: QDRANT_API_KEY
     kanban_api_token: KANBAN_API_TOKEN
+    github_token: GITHUB_TOKEN
+    operations_slack_webhook: HARNESS_SLACK_WEBHOOK
+    backup_encryption_key: HARNESS_BACKUP_ENCRYPTION_KEY
 
 execution:
   dry_run: true
   max_retries: 2
+  max_cycles: 3
+  persistence_mode: required
+
+# Opt in only after providing an API key and testing a profile in dry-run.
+agents:
+  enabled: false
+  profiles:
+    - name: developer
+      version: 1
+      instructions: >-
+        Plan small, verifiable repository changes. Use only the listed tools
+        and never request destructive or network operations.
+      task_types: [task]
+      tools: [filesystem, git, test_runner]
+      model: gpt-6-astra
+      max_steps: 8
 
 quality:
   enabled: true

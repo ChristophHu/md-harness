@@ -1,2 +1,1 @@
 """command policy component."""
-

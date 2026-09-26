@@ -1,2 +1,1 @@
 """state machine component."""
-

@@ -133,7 +133,9 @@ class FilesystemTool(Tool):
             else:
                 shutil.copy2(source_path, destination_path)
         except OSError as error:
-            raise FilesystemError(f"could not copy {source} to {destination}") from error
+            raise FilesystemError(
+                f"could not copy {source} to {destination}"
+            ) from error
         return destination_path
 
     def move(self, source: str | Path, destination: str | Path) -> Path:
@@ -145,7 +147,9 @@ class FilesystemTool(Tool):
         try:
             return Path(shutil.move(str(source_path), str(destination_path)))
         except OSError as error:
-            raise FilesystemError(f"could not move {source} to {destination}") from error
+            raise FilesystemError(
+                f"could not move {source} to {destination}"
+            ) from error
 
     def delete(self, path: str | Path, *, recursive: bool = False) -> None:
         if not self.allow_delete:

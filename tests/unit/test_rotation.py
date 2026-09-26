@@ -26,7 +26,7 @@ def test_secret_rotation_requires_name():
 
 def test_secret_rotation_requires_timezone_aware_creation_time():
     with pytest.raises(ValueError, match="timezone-aware"):
-        SecretRotation("TOKEN", datetime(2026, 1, 1))
+        SecretRotation("TOKEN", datetime(2026, 1, 1))  # noqa: DTZ001
 
 
 def test_secret_rotation_accepts_timezone_aware_creation_time():
@@ -55,7 +55,10 @@ def test_due_is_true_after_expiry():
 def test_status_missing_takes_precedence():
     created = datetime(2026, 1, 1, tzinfo=UTC)
     rotation = SecretRotation("TOKEN", created, RotationPolicy(30))
-    assert rotation.status(present=False, now=created + timedelta(days=60)) == SecretStatus.MISSING
+    assert (
+        rotation.status(present=False, now=created + timedelta(days=60))
+        == SecretStatus.MISSING
+    )
 
 
 def test_status_valid_before_expiry_window():
@@ -68,7 +71,10 @@ def test_status_expiring_in_final_fourteen_days():
     created = datetime(2026, 1, 1, tzinfo=UTC)
     rotation = SecretRotation("TOKEN", created, RotationPolicy(30))
     assert rotation.status(now=created + timedelta(days=16)) == SecretStatus.EXPIRING
-    assert rotation.status(now=created + timedelta(days=29, hours=23)) == SecretStatus.EXPIRING
+    assert (
+        rotation.status(now=created + timedelta(days=29, hours=23))
+        == SecretStatus.EXPIRING
+    )
 
 
 def test_status_expired_at_expiry():
@@ -79,5 +85,8 @@ def test_status_expired_at_expiry():
 
 def test_status_enum_values_are_stable():
     assert {status.value for status in SecretStatus} == {
-        "valid", "expiring", "expired", "missing"
+        "valid",
+        "expiring",
+        "expired",
+        "missing",
     }

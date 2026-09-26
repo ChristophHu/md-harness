@@ -3,11 +3,108 @@ required:
   - project
   - storage
 properties:
+  api:
+    type: object
+    additionalProperties: false
+    properties:
+      host:
+        type: string
+        minLength: 1
+      port:
+        type: integer
+        minimum: 1
+        maximum: 65535
   project:
     type: object
   storage:
     type: object
+  operations:
+    type: object
+    properties:
+      stale_task_minutes:
+        type: integer
+        minimum: 1
+      outbox_pending_minutes:
+        type: integer
+        minimum: 1
+      backup_directory:
+        type: string
+      backup_keep:
+        type: integer
+        minimum: 1
+      recovery_limit:
+        type: integer
+        minimum: 1
+      auto_dispatch:
+        type: boolean
+      launchd_label:
+        type: string
+        minLength: 1
+      maintenance_interval_seconds:
+        type: integer
+        minimum: 60
+      backup_hour:
+        type: integer
+        minimum: 0
+        maximum: 23
+      backup_minute:
+        type: integer
+        minimum: 0
+        maximum: 59
+      alerts:
+        type: object
+        properties:
+          provider:
+            type: string
+            enum: [none, slack]
+          webhook_secret:
+            type: string
+            minLength: 1
+          state_file:
+            type: string
+            minLength: 1
+          cooldown_minutes:
+            type: integer
+            minimum: 1
+          escalation_minutes:
+            type: integer
+            minimum: 1
+          repeat_minutes:
+            type: integer
+            minimum: 1
   execution:
     type: object
+    properties:
+      hitl:
+        type: object
+        properties:
+          mode:
+            type: string
+            enum: [minimal, selective, interactive]
+  agents:
+    type: object
+    properties:
+      enabled:
+        type: boolean
+      profiles:
+        type: array
+        items:
+          type: object
+          required: [name, version, instructions, task_types, tools, model]
+          properties:
+            name: {type: string, minLength: 1}
+            version: {type: integer, minimum: 1}
+            instructions: {type: string, minLength: 1}
+            task_types:
+              type: array
+              items: {type: string, minLength: 1}
+              minItems: 1
+            tools:
+              type: array
+              items: {type: string, minLength: 1}
+              minItems: 1
+            model: {type: string, minLength: 1}
+            max_steps: {type: integer, minimum: 1}
+            enabled: {type: boolean}
   security:
     type: object

@@ -17,7 +17,9 @@ def test_tool_validates_timeout_and_connects(tmp_path):
 def test_initialize_and_table_exists(tmp_path):
     tool = SQLiteTool(tmp_path / "db.sqlite")
     tool.initialize("CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT)")
-    tool.initialize("CREATE TABLE IF NOT EXISTS sample (id INTEGER PRIMARY KEY, value TEXT)")
+    tool.initialize(
+        "CREATE TABLE IF NOT EXISTS sample (id INTEGER PRIMARY KEY, value TEXT)"
+    )
     assert tool.table_exists("sample")
     assert not tool.table_exists("missing")
 
@@ -27,16 +29,24 @@ def test_execute_fetch_and_parameterized_queries(tmp_path):
     tool.initialize("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, kind TEXT)")
     item_id = tool.execute("INSERT INTO items (name, kind) VALUES (?, ?)", ("one", "a"))
     assert item_id == 1
-    tool.execute("INSERT INTO items (name, kind) VALUES (:name, :kind)", {"name": "two", "kind": "b"})
+    tool.execute(
+        "INSERT INTO items (name, kind) VALUES (:name, :kind)",
+        {"name": "two", "kind": "b"},
+    )
     assert tool.fetch_one("SELECT name FROM items WHERE id = ?", (1,))["name"] == "one"
     assert tool.fetch_one("SELECT * FROM items WHERE id = ?", (99,)) is None
-    assert [row["name"] for row in tool.fetch_all("SELECT * FROM items ORDER BY id")] == ["one", "two"]
+    assert [
+        row["name"] for row in tool.fetch_all("SELECT * FROM items ORDER BY id")
+    ] == ["one", "two"]
 
 
 def test_executemany_inserts_batch(tmp_path):
     tool = SQLiteTool(tmp_path / "db.sqlite")
     tool.initialize("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-    assert tool.executemany("INSERT INTO items (name) VALUES (?)", [("one",), ("two",)]) == 2
+    assert (
+        tool.executemany("INSERT INTO items (name) VALUES (?)", [("one",), ("two",)])
+        == 2
+    )
     assert len(tool.fetch_all("SELECT * FROM items")) == 2
 
 

@@ -51,7 +51,11 @@ def test_list_non_recursive_and_recursive(tmp_path):
     fs.write_text("one.txt", "1")
     fs.write_text("nested/two.txt", "2")
     assert fs.list() == [Path("nested"), Path("one.txt")]
-    assert fs.list(recursive=True) == [Path("nested"), Path("nested/two.txt"), Path("one.txt")]
+    assert fs.list(recursive=True) == [
+        Path("nested"),
+        Path("nested/two.txt"),
+        Path("one.txt"),
+    ]
     with pytest.raises(FilesystemError, match="not a directory"):
         fs.list("one.txt")
 
@@ -114,9 +118,13 @@ def test_read_write_copy_and_move_wrap_os_errors(tmp_path):
     with patch.object(Path, "write_text", side_effect=OSError("write error")):
         with pytest.raises(FilesystemError, match="could not write"):
             fs.write_text("other.txt", "content")
-    with patch("harness.tools.filesystem.shutil.copy2", side_effect=OSError("copy error")):
+    with patch(
+        "harness.tools.filesystem.shutil.copy2", side_effect=OSError("copy error")
+    ):
         with pytest.raises(FilesystemError, match="could not copy"):
             fs.copy("file.txt", "copy.txt")
-    with patch("harness.tools.filesystem.shutil.move", side_effect=OSError("move error")):
+    with patch(
+        "harness.tools.filesystem.shutil.move", side_effect=OSError("move error")
+    ):
         with pytest.raises(FilesystemError, match="could not move"):
             fs.move("file.txt", "moved.txt")

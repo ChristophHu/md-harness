@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from harness.models import (
     Project,
@@ -21,14 +21,28 @@ def test_project_model_defaults():
 def test_task_model_defaults():
     task = Task(None, 1, None, "TASK-1", "Implement feature")
     assert task.task_type == "task"
-    assert task.status == "idea"
+    assert task.status == "created"
     assert task.priority == "normal"
     assert task.description is None
 
 
 def test_task_model_accepts_all_fields():
-    now = datetime.now()
-    task = Task(1, 2, 3, "TASK-1", "Title", "Description", "bugfix", "ready", "high", now, now, now, now)
+    now = datetime.now(UTC)
+    task = Task(
+        1,
+        2,
+        3,
+        "TASK-1",
+        "Title",
+        "Description",
+        "bugfix",
+        "ready",
+        "high",
+        now,
+        now,
+        now,
+        now,
+    )
     assert task.id == 1
     assert task.project_id == 2
     assert task.parent_id == 3

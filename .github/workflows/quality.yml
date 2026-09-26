@@ -1,0 +1,26 @@
+name: quality
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop, "feature/**", "release/**", "hotfix/**"]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - name: Configure Git identity for repository tests
+        run: |
+          git config --global user.name "md-harness CI"
+          git config --global user.email "md-harness-ci@users.noreply.github.com"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run sqlfluff lint --dialect sqlite src/harness/storage/schema.sql src/harness/storage/migrations/001_initial.sql tests/fixtures/sqlite_seed.sql
+      - run: uv run pytest --cov-fail-under=100

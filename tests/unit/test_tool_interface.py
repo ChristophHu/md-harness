@@ -1,8 +1,10 @@
-import pytest
 from pathlib import Path
+
+import pytest
 
 from harness.tools.base import (
     PermissionLevel,
+    ResourceLimits,
     Tool,
     ToolContext,
     ToolDefinition,
@@ -35,6 +37,14 @@ def test_tool_context_and_metadata():
     assert tool.definition.permission == PermissionLevel.READ
 
 
+def test_resource_limits_validate_positive_values():
+    assert ResourceLimits(max_output_bytes=1, max_changed_files=1).max_output_bytes == 1
+    with pytest.raises(ValueError, match="resource limits"):
+        ResourceLimits(max_output_bytes=0)
+    with pytest.raises(ValueError, match="resource limits"):
+        ResourceLimits(max_changed_files=0)
+
+
 def test_tool_validation_and_registry():
     registry = ToolRegistry()
     tool = EchoTool()
@@ -50,6 +60,57 @@ def test_tool_validation_and_registry():
         registry.execute("echo", message="hello", extra=True)
     with pytest.raises(ToolError, match="missing arguments"):
         registry.execute("echo")
+    with pytest.raises(ToolError, match="must be a string"):
+        registry.execute("echo", message=123)
+
+    class ListTool(Tool):
+        definition = ToolDefinition(
+            "list-tool",
+            "List arguments.",
+            PermissionLevel.READ,
+            (ToolParameter("items", "list"),),
+        )
+
+        def execute(self, **arguments):
+            return arguments
+
+    registry.register(ListTool())
+    with pytest.raises(ToolError, match="must be a list"):
+        registry.execute("list-tool", items="not-a-list")
+
+
+def test_tool_validation_rejects_types_and_unsafe_paths(tmp_path):
+    class TypedTool(Tool):
+        definition = ToolDefinition(
+            "typed",
+            "Typed arguments.",
+            PermissionLevel.READ,
+            (
+                ToolParameter("items", "list[path]"),
+                ToolParameter("enabled", "boolean"),
+                ToolParameter("limit", "number"),
+                ToolParameter("path", "path"),
+            ),
+        )
+
+        def execute(self, **arguments):
+            return arguments
+
+    registry = ToolRegistry()
+    registry.register(TypedTool())
+    valid = registry.execute(
+        "typed", items=["src/file.py"], enabled=True, limit=1, path="src"
+    )
+    assert valid["path"] == "src"
+    for arguments in (
+        {"items": "src", "enabled": True, "limit": 1, "path": "src"},
+        {"items": ["src"], "enabled": "yes", "limit": 1, "path": "src"},
+        {"items": ["src"], "enabled": True, "limit": True, "path": "src"},
+        {"items": ["../secret"], "enabled": True, "limit": 1, "path": "src"},
+        {"items": ["src"], "enabled": True, "limit": 1, "path": "../secret"},
+    ):
+        with pytest.raises(ToolError, match="must be|outside"):
+            registry.execute("typed", **arguments)
 
 
 def test_filesystem_tool_dispatches_operations(tmp_path):
@@ -58,7 +119,7 @@ def test_filesystem_tool_dispatches_operations(tmp_path):
     assert tool.execute(operation="write", path="file.txt", content="hello")
     assert tool.execute(operation="read", path="file.txt") == "hello"
     assert tool.execute(operation="exists", path="file.txt") is True
-    assert tool.execute(operation="mkdir", path="folder") .is_dir()
+    assert tool.execute(operation="mkdir", path="folder").is_dir()
     assert tool.execute(operation="list") == [Path("file.txt"), Path("folder")]
     tool.execute(operation="copy", path="file.txt", destination="copy.txt")
     tool.execute(operation="move", path="copy.txt", destination="moved.txt")
@@ -81,9 +142,19 @@ def test_git_tool_dispatches_operations(tmp_path):
 def test_sqlite_tool_dispatches_operations(tmp_path):
     tool = SQLiteTool(tmp_path / "db.sqlite")
     tool.execute(operation="initialize", sql="ignored")
-    tool.execute(operation="execute", sql="CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-    tool.execute(operation="execute", sql="INSERT INTO items (name) VALUES (?)", parameters=("one",))
-    assert tool.execute(operation="fetch_one", sql="SELECT name FROM items")["name"] == "one"
+    tool.execute(
+        operation="execute",
+        sql="CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    tool.execute(
+        operation="execute",
+        sql="INSERT INTO items (name) VALUES (?)",
+        parameters=("one",),
+    )
+    assert (
+        tool.execute(operation="fetch_one", sql="SELECT name FROM items")["name"]
+        == "one"
+    )
     assert tool.execute(operation="fetch_all", sql="SELECT * FROM items")
     assert tool.execute(operation="table_exists", table="items") is True
     tool.execute(operation="vacuum")
